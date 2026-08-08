@@ -1,0 +1,153 @@
+// SPDX-FileCopyrightText: 2026 Copyright contributors to the tango-bulk project
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
+#ifndef TANGO_BULK_PUBLISHER_H
+#define TANGO_BULK_PUBLISHER_H
+
+#include <tango-bulk/counters.h>
+#include <tango-bulk/errors.h>
+#include <tango-bulk/frame.h>
+#include <tango-bulk/limits.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace TangoBulk
+{
+
+enum class DropPolicy : std::uint32_t
+{
+    DropNewest = 0, ///< reject the frame being published (producer default)
+    DropOldest = 1, ///< delivery queue only; illegal on the producer ring
+};
+
+struct PublisherConfig
+{
+    std::string stream_name; ///< 1..64 bytes, [A-Za-z0-9_.-]
+    std::uint64_t max_frame_bytes{8ull << 20};
+    std::uint32_t ring_depth{32};
+    std::uint32_t credit_window{16}; ///< MUST be <= ring_depth
+    std::uint32_t max_sessions{4};
+    std::uint32_t publish_queue_depth{256};
+    std::uint32_t lease_ttl_ms{10'000};
+    std::uint32_t renew_interval_ms{3'333};
+    std::uint64_t pinned_memory_limit_bytes{1ull << 30};
+    DropPolicy drop_policy{DropPolicy::DropNewest};
+    std::string ucx_tls;           ///< empty => let UCX choose; tests pin
+    int engine_cpu_affinity{-1};   ///< -1 => unpinned
+    bool pad_slot_stride{true};    ///< see IMPLEMENTATION_SPEC.md 6.2
+
+    Status validate() const noexcept;
+};
+
+/// Registered producer ring.
+///
+/// One ucp_mem_map registration covers the whole ring and slots are offsets
+/// into it, so the memory-region count is 1 regardless of depth.
+class BulkSource
+{
+  public:
+    /// Move-only handle to one producer slot.  Publishing consumes the lease.
+    class Lease
+    {
+      public:
+        Lease() noexcept;
+        Lease(Lease &&) noexcept;
+        Lease &operator=(Lease &&) noexcept;
+        Lease(const Lease &) = delete;
+        Lease &operator=(const Lease &) = delete;
+        ~Lease(); ///< an un-published lease returns the slot
+
+        explicit operator bool() const noexcept;
+        void *data() const noexcept;
+        std::size_t capacity() const noexcept;
+        std::size_t index() const noexcept;
+        MemoryKind memory_kind() const noexcept;
+        void reset() noexcept;
+
+      private:
+        friend class BulkSource;
+        friend class BulkPublisher;
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
+    };
+
+    /// Non-blocking by design: an acquisition thread MUST be able to drop
+    /// rather than wait while slots are retained by a slow or dead consumer.
+    Lease try_acquire() noexcept;
+
+    std::size_t slot_count() const noexcept;
+    std::size_t slot_bytes() const noexcept;  ///< usable payload capacity per slot
+    std::size_t slot_stride() const noexcept; ///< >= slot_bytes; see 6.2
+    std::size_t retained() const noexcept;    ///< slots currently uncredited
+
+    ~BulkSource();
+    BulkSource(const BulkSource &) = delete;
+    BulkSource &operator=(const BulkSource &) = delete;
+
+  private:
+    friend class BulkPublisher;
+    BulkSource();
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+enum class PublishResult : std::uint32_t
+{
+    Accepted = 0,
+    NoSession = 1,     ///< no armed session; frame dropped, counted
+    QueueFull = 2,     ///< publish queue full; lease returned to caller
+    CreditStalled = 3, ///< credit window closed; frame dropped, counted
+    BadMetadata = 4,
+    Shutdown = 5,
+};
+
+const char *to_string(PublishResult result) noexcept;
+
+class BulkPublisher
+{
+  public:
+    explicit BulkPublisher(PublisherConfig config); ///< throws BulkException
+    ~BulkPublisher();
+    BulkPublisher(BulkPublisher &&) noexcept;
+    BulkPublisher &operator=(BulkPublisher &&) noexcept;
+    BulkPublisher(const BulkPublisher &) = delete;
+    BulkPublisher &operator=(const BulkPublisher &) = delete;
+
+    BulkSource &source() noexcept;
+
+    /// Consumes the lease on Accepted; leaves it engaged in the caller's hands
+    /// on QueueFull.  Never blocks, never throws, never allocates.
+    PublishResult publish(BulkSource::Lease &&lease, const FrameMetadata &meta) noexcept;
+
+    /// Re-declare geometry.  Opens a new epoch; see IMPLEMENTATION_SPEC.md 4.3
+    /// for the two-phase interlock.  On failure the stream keeps running on the
+    /// old epoch -- a failed re-declaration is never a silent clamp.
+    Status declare_geometry(const FrameMetadata &prototype,
+                            std::uint64_t max_frame_bytes,
+                            std::uint32_t ring_depth);
+
+    std::uint32_t generation() const noexcept;
+    std::size_t session_count() const noexcept;
+    PublisherCounters counters() const noexcept;
+
+    /// Coordination entry point: encoded bytes in, encoded bytes out.
+    ///
+    /// This is the seam that keeps Tango out of the core.  The Tango adapter is
+    /// a thin DevVarCharArray wrapper over it, and the unit tests drive the
+    /// entire session lifecycle through it with no Tango process at all.
+    std::vector<std::byte> handle_coordination(const std::byte *data,
+                                               std::size_t size) noexcept;
+
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace TangoBulk
+
+#endif // TANGO_BULK_PUBLISHER_H

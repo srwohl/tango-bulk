@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2026 Copyright contributors to the tango-bulk project
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+# tango-bulk builds against a *released, installed* cppTango package. That is a
+# hard requirement of IMPLEMENTATION_SPEC.md 1.2, not a convenience: the whole
+# point of the extraction is that this project cannot quietly depend on a patched
+# cppTango. Taking cppTango from conda-forge is the cheapest way to keep that
+# property honest on a developer machine.
+
+[workspace]
+name = "tango-bulk"
+channels = ["conda-forge"]
+# Linux only, deliberately. UCX does not support macOS and the spec forbids
+# emitting stub APIs on platforms the data plane cannot serve.
+platforms = ["linux-64"]
+requires-pixi = ">=0.55"
+
+[dependencies]
+cmake = ">=3.18"
+ninja = "*"
+cxx-compiler = "*"
+pkg-config = "*"
+cpptango = ">=10.0"
+ucx = ">=1.21"
+catch2 = ">=3.1.1"
+# TangoConfig.cmake calls find_dependency(cppzmq), and the conda cpptango
+# package ships only the runtime, so the headers have to be asked for
+# explicitly.  This is a property of the packaging, not of tango-bulk.
+cppzmq = "*"
+
+[tasks]
+_configure = { cmd = [
+    "cmake",
+    "$CMAKE_ARGS",
+    "-GNinja",
+    "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+    "-DBUILD_TESTING=ON",
+    "-DTANGO_BULK_WARNINGS_AS_ERRORS=ON",
+    "-DCMAKE_INSTALL_PREFIX=\"$CONDA_PREFIX\"",
+    "-S.",
+    "-Bbuild",
+] }
+build = { cmd = "cmake --build build", depends-on = ["_configure"] }
+test = { cmd = "ctest --test-dir build --output-on-failure", depends-on = ["build"] }
+clean = "rm -rf build"
+
+# The layering check is a plain script so CI can run it without configuring or
+# building anything.
+layering = "python3 scripts/check_layering.py"
+
+# Sanity check before benchmarking: which transports does this host actually have?
+ucx-info = "ucx_info -d"

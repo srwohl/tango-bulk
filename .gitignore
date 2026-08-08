@@ -1,0 +1,10 @@
+build/
+build-*/
+.pixi/
+pixi.lock.bak
+compile_commands.json
+.cache/
+*.o
+*.a
+*.so
+*.so.*
