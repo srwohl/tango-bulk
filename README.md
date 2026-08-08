@@ -14,10 +14,12 @@ A device server opts in by linking a library and registering four ordinary Tango
 No cppTango ABI, event implementation, public class, IDL, build option, or upstream source
 file changes.
 
-> **Status: M0 — scaffold.** The boundaries are real and enforced; there is no behaviour yet.
-> `include/tango-bulk/` carries the normative API from the specification, and the first
-> working code lands in M1 (the wire protocol) and M2 (the minimal vertical slice).
-> See [docs/EXTRACTION.md](docs/EXTRACTION.md) for exactly what exists.
+> **Status: M1 — protocol core.** The wire protocol is complete and tested: all fifteen
+> message types encode and decode at their exact byte layouts, with geometry validation,
+> CSPRNG identifiers, and the credit window. There is still no transport and no Tango
+> integration — `BulkPublisher` and `BulkSubscriber` are declarations only, and the first
+> bytes move over UCX in M2. See [docs/EXTRACTION.md](docs/EXTRACTION.md) for exactly what
+> exists and what each test is worth.
 
 ## Specification
 
@@ -90,6 +92,21 @@ python3 scripts/check_layering.py
 
 Both it and the installed-Tango guard have negative controls in the test suite. A check that
 has never been observed to fail is not a check.
+
+## Testing
+
+```sh
+pixi run test        # 110 cases
+pixi run test-asan   # the same, under -fsanitize=address,undefined
+```
+
+Run both. The truncation and bit-flip sweeps in `tests/unit/test_protocol_malformed.cpp`
+decode every message at every length from 0 upward and with every single bit of the fixed
+part flipped; their assertion is that no input walks a decoder off the end of a buffer, and
+no return value can express that. Without a sanitizer they are mostly wasted runtime.
+
+`tests/unit/golden_vectors.h` is generated. A diff of it is a protocol change and should be
+reviewed as one; `tests/unit/test_protocol_golden.cpp` documents how to regenerate it.
 
 ## Design in one paragraph
 

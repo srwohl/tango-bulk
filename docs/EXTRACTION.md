@@ -41,9 +41,9 @@ From `IMPLEMENTATION_SPEC.md` §8. "Extract" means the logic moves and gets clea
 | `src/include/tango/server/BulkSource.h` (in-tree) | extract API shape only | `include/tango-bulk/publisher.h` | done — move-only pimpl `Lease`, non-blocking `try_acquire()`; `DeviceImpl` friendship dropped |
 | `src/include/tango/client/FrameView.h` | extract, remove Tango dependency | `include/tango-bulk/frame.h` | done — see §3 |
 | `src/include/tango/internal/ucx/UcxWorker.h` | extract behind the engine | `src/ucx/context.cpp`, `src/ucx/engine.cpp` | M2 |
-| `src/ucx/BulkStreamSupplier.cpp` (`SeqWindow`) | extract, reshape to a bitmap | `src/core/credit_window.cpp` | M1 |
-| geometry epochs (`rearm_stream`, `draining_generation_`) | extract | `src/core/geometry.cpp`, `src/ucx/*_impl.cpp` | M1 (validation), M3+ (epoch machinery) |
-| `src/include/tango/internal/ucx/bulk_wire.h` | redesign as a standalone protocol | `include/tango-bulk/protocol.h`, `src/core/protocol.cpp` | M1 |
+| `src/ucx/BulkStreamSupplier.cpp` (`SeqWindow`) | extract, reshape to a bitmap | `src/core/credit_window.cpp` | **done (M1)** |
+| geometry epochs (`rearm_stream`, `draining_generation_`) | extract | `src/core/geometry.cpp`, `src/ucx/*_impl.cpp` | validation done (M1); epoch machinery M3+ |
+| `src/include/tango/internal/ucx/bulk_wire.h` | redesign as a standalone protocol | `include/tango-bulk/protocol.h`, `src/core/protocol.cpp` | **done (M1)** |
 | `src/include/tango/internal/server/BulkStreamManager.h` | reimplement as a session manager | `src/core/session_manager.cpp`, `src/ucx/publisher_impl.cpp` | M3 |
 | Tango event integration (`EventData::bulk_frame`, `ZmqEvent*` hooks, `DeviceProxy` overloads) | **retire** | — | not extracted, not referenced |
 | `src/idl_bulk/`, `BulkStreamCorrelator`, `BulkTopicCutover`, `bulk_topics.h`, `bulk_negotiation.*` | **retire** | — | not extracted, not referenced |
@@ -66,6 +66,9 @@ this repository, extracted or not.
 | `include/tango-bulk/frame.h` (`FrameView`) | `src/include/tango/client/FrameView.h` | Namespace `Tango` → `TangoBulk`; `EventData` relationship removed; `TANGO_USE_UCX` stub comment removed; added `generation()` and `endian()`; `send_time_us` → `timestamp_ns`; `dropped_before` widened to `u64`; `unsigned char` → `std::byte` |
 | `include/tango-bulk/publisher.h` (`BulkSource`, `Lease`) | `src/include/tango/server/BulkSource.h`, `experiments/ucx-bulk-spike/bulk_source.hpp` | Kept the move-only pimpl `Lease` and non-blocking `try_acquire()`; dropped the blocking `acquire()` (§5.3 forbids blocking on the data path), the `Slot*` raw-pointer API, `std::vector<bool>`, and the `DeviceImpl` friendship |
 | `cmake/FindUCX.cmake` | `experiments/ucx-bulk-spike/CMakeLists.txt` | Same pkg-config-then-manual-search strategy, promoted to a find module with an imported target and a version from `ucp_version.h` |
+| `src/core/byte_order.h` | `bulk_wire.h` (`namespace bulk_wire`) | Same byte-at-a-time `put*`/`get*` shape; `unsigned char` → `std::byte`; added `put8`/`get8` and the overflow-checked `mul_overflow`/`add_overflow` the bounds checks need |
+| `include/tango-bulk/protocol.h`, `src/core/protocol.cpp` | `bulk_wire.h` | **Redesigned, not ported.** Kept: explicit offsets, little-endian accessors, "never memcpy a struct onto the wire", magic + version + header-size rejection. Changed: 152 → 160 byte frame header; separate AM ids for `Credit` and `ProbeAck`; **`k_probe_seq` deleted**; `header_bytes` trailing-extension rule added; `dropped_before` widened to `u64`; `send_time_us` → `timestamp_ns`; the entire coordination plane is new |
+| `src/core/credit_window.cpp` | `BulkStreamSupplier::SeqWindow` | Kept the base-plus-out-of-order-ahead invariant. `std::set<std::uint64_t> credited_ahead` → a fixed `ring_depth`-bit bitmap, so there is no allocation on the data path, and moved to the subscriber, which is the side that knows which views were released |
 
 Files with no prototype ancestor (new in this repository): `include/tango-bulk/errors.h`,
 `counters.h`, `limits.h`, `subscriber.h`, `tango.h`; `src/core/enums.cpp`, `errors.cpp`;
@@ -108,6 +111,40 @@ Recorded rather than silently taken. None changes a signature in §2.
    them undefined means an attempt to use them fails at link time rather than at runtime in
    a device server. They are deliberately not stubbed to throw.
 
+6. **`DropPolicy` is declared in `frame.h`, not `publisher.h`.** §2.3 puts it in
+   `publisher.h`, but §3.5 puts it on the wire in `Open`, so `protocol.h` needs it — and
+   `protocol.h` including the publisher API would invert the dependency. It sits with the
+   other vocabulary types (`ElementType`, `MemoryKind`, `Endian`). No consumer-visible
+   change: `publisher.h` and `subscriber.h` both include `frame.h`.
+
+7. **Minor-version trailing tolerance is split by message shape.** §3.1 says a minor
+   version may append fields and that a receiver reads `min(header_bytes, its own layout)`
+   and ignores the excess; §3.9 says the envelope, fixed body, and variable fields must sum
+   to *exactly* the delivered length. For coordination messages these conflict, because only
+   the envelope carries `header_bytes` — a body has no size field of its own. Resolved as:
+
+   - Bodies with **no variable tail** (`Renew`, `RenewReply`, `Close`, `CloseReply`,
+     `Query`) tolerate trailing bytes, but only when the sender claims a minor above the one
+     implemented. At our own minor the length is exact, because there a longer body is a bug.
+   - Bodies **with** a variable tail (`Open`, `OpenReply`, `QueryReply`, `Error`) require
+     exactness always. Appending a fixed field to one of those would move the tail, so
+     reading the tail at its old offset would yield garbage. Refusing fails safe.
+
+   The data plane has no such ambiguity: every message carries its own `header_bytes`, so
+   the trailing-extension rule applies directly.
+
+8. **§3.0.2's "every message length is a multiple of 8" is read as applying to fixed
+   parts.** Every fixed part defined in §3 is in fact a multiple of 8, and a test asserts it.
+   Applying the rule to whole messages would require padding after variable-length fields,
+   which would contradict §3.9's rule that trailing unexplained bytes are malformed.
+
+9. **An unrecognised `Status` on the wire is preserved, not rejected.** Refusing to parse a
+   reply because its failure code is from a newer minor would convert "something failed,
+   code 19" into "the message was garbage". The raw value is kept and `to_string()` reports
+   `"Unknown"`. Enum *fields that describe the payload* — `ElementType`, and the geometry
+   bounds generally — are the opposite: those are validated strictly, because a receiver
+   that cannot name the element type cannot interpret the bytes.
+
 ## 5. M0 exit criteria
 
 | Criterion | Status | Evidence |
@@ -123,9 +160,55 @@ observed to fire is not a guard. `installed-tango-guard-build_tree` asserts on t
 named in the rejection, not merely on a non-zero exit, so it cannot pass by failing for an
 unrelated reason.
 
-## 6. What M0 deliberately does not contain
+## 6. M1 exit criteria
 
-No behaviour. No protocol encoder, no UCX engine, no session manager, no Tango commands.
-The milestone is about the boundary being real, and the boundary is now checked three ways:
-the include-grep, the installed-Tango guard, and the fact that `tango-bulk-tango` links and
-tests without ever compiling a UCX header.
+Pure `src/core/`: no UCX, no Tango, no threads. Everything below runs in milliseconds with
+no external resource.
+
+| Requirement (§9.2) | Status | Where |
+|---|---|---|
+| Every message in §3, encode and decode, exact byte layouts | met | `protocol.h`, `src/core/protocol.cpp` |
+| Bounds validation per §3.4 and §3.9 | met | `src/core/geometry.cpp`, `geometry_rules.h`, `protocol.cpp` |
+| CSPRNG session/stream identifiers | met | `src/core/session_id.cpp` |
+| Credit window with the bitmap | met | `src/core/credit_window.{h,cpp}` |
+| Geometry validation | met | `src/core/geometry.cpp` |
+
+| Test (§9.2) | Status | Where |
+|---|---|---|
+| Round trip, every message type | met | `test_protocol_roundtrip.cpp` |
+| Golden vectors, one committed blob per message type | met | `golden_vectors.h`, `test_protocol_golden.cpp` |
+| Truncation sweep, every length from 0 to `len-1`, under ASan | met | `test_protocol_malformed.cpp` |
+| Corruption sweep, every bit of the fixed part | met | `test_protocol_malformed.cpp` |
+| Version rules | met | `test_protocol_malformed.cpp` |
+| Bounds | met | `test_protocol_malformed.cpp`, `test_geometry.cpp` |
+| Endianness asserted against hand-written expected bytes | met | `test_protocol_layout.cpp`, `wire_helpers.h` |
+| Credit window | met | `test_credit_window.cpp` |
+
+**Exit condition — "the golden vectors and the implementation agree": met.** 110 ctest cases,
+3 914 assertions, green under both a normal build and `-fsanitize=address,undefined`.
+
+Two notes on what these tests are worth:
+
+- The golden vectors are *change detectors*. They are generated from the encoder, so they
+  cannot prove conformance on their own. `test_protocol_layout.cpp` is the conformance
+  check: every offset there was transcribed from the spec's tables, and every integer is
+  compared against a little-endian pattern computed independently in
+  `tests/unit/wire_helpers.h` rather than through the library's own accessors. The `Open`
+  vector was additionally decoded field-by-field against §3.3 and §3.5 by hand before being
+  committed.
+- The truncation and bit-flip sweeps assert "never reads past the supplied length", which no
+  return value can express. They are only worth their runtime under a sanitizer, which is why
+  `TANGO_BULK_SANITIZERS` exists and why `pixi run test-asan` is part of the workflow rather
+  than a debugging aid. Each truncation is copied into a fresh, exactly-sized buffer so a
+  one-byte overread is a heap overflow ASan can see, not a byte still inside the original
+  allocation.
+
+## 7. What M0 and M1 deliberately do not contain
+
+No transport and no Tango integration. No UCX engine, no registered memory, no session
+manager, no lease timers, no commands, no `DeviceProxy` client. `BulkPublisher`,
+`BulkSubscriber` and `BulkSource` are declarations only.
+
+The next slice is M2, the minimal vertical slice: one publisher and one subscriber in the
+same test process over a UCX loopback, `Frame` and `Credit` only, `DeliveryMode::Manual`, and
+no geometry changes, probes, leases, reconnects, relay, or RMA.

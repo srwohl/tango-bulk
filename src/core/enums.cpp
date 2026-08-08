@@ -83,6 +83,19 @@ const char *to_string(MemoryKind kind) noexcept
     return "Unknown";
 }
 
+const char *to_string(DropPolicy policy) noexcept
+{
+    switch(policy)
+    {
+    case DropPolicy::DropNewest:
+        return "DropNewest";
+    case DropPolicy::DropOldest:
+        return "DropOldest";
+    }
+
+    return "Unknown";
+}
+
 const char *to_string(PublishResult result) noexcept
 {
     switch(result)

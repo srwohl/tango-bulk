@@ -43,6 +43,14 @@ option(TANGO_BULK_BUILD_EXAMPLES "Build the example device and client" OFF)
 option(TANGO_BULK_BUILD_BENCHMARKS "Build the throughput benchmarks" OFF)
 option(TANGO_BULK_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
+# The truncation and corruption sweeps assert that no input walks a decoder off
+# the end of a buffer.  No return value can express that, so the sweeps are only
+# worth their runtime when something is watching the memory -- which makes this
+# option part of the test strategy rather than a debugging convenience.
+set(TANGO_BULK_SANITIZERS
+    ""
+    CACHE STRING "Comma-separated -fsanitize list, e.g. address,undefined")
+
 include(CTest)
 
 # ---------------------------------------------------------------------------
@@ -83,6 +91,15 @@ target_compile_options(
 
 if(TANGO_BULK_WARNINGS_AS_ERRORS)
     target_compile_options(tango-bulk-settings INTERFACE -Werror)
+endif()
+
+if(TANGO_BULK_SANITIZERS)
+    target_compile_options(
+        tango-bulk-settings INTERFACE -fsanitize=${TANGO_BULK_SANITIZERS}
+                                      -fno-omit-frame-pointer)
+    target_link_options(tango-bulk-settings INTERFACE
+                        -fsanitize=${TANGO_BULK_SANITIZERS})
+    message(STATUS "  Sanitizers      ${TANGO_BULK_SANITIZERS}")
 endif()
 
 target_compile_features(tango-bulk-settings INTERFACE cxx_std_17)

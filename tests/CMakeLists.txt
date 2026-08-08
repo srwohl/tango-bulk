@@ -13,7 +13,17 @@ include(Catch)
 
 # --- tests/unit: core only, no UCX, no Tango -------------------------------
 
-add_executable(tango-bulk-unit-tests unit/test_enums.cpp unit/test_errors.cpp)
+add_executable(
+    tango-bulk-unit-tests
+    unit/test_credit_window.cpp
+    unit/test_enums.cpp
+    unit/test_errors.cpp
+    unit/test_geometry.cpp
+    unit/test_identifiers.cpp
+    unit/test_protocol_golden.cpp
+    unit/test_protocol_layout.cpp
+    unit/test_protocol_malformed.cpp
+    unit/test_protocol_roundtrip.cpp)
 
 target_link_libraries(tango-bulk-unit-tests PRIVATE tango-bulk::core
                                                     Catch2::Catch2WithMain)

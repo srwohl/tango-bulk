@@ -19,11 +19,8 @@
 namespace TangoBulk
 {
 
-enum class DropPolicy : std::uint32_t
-{
-    DropNewest = 0, ///< reject the frame being published (producer default)
-    DropOldest = 1, ///< delivery queue only; illegal on the producer ring
-};
+// DropPolicy is declared in <tango-bulk/frame.h>, which this header includes.
+// See the note there for why it does not live here.
 
 struct PublisherConfig
 {

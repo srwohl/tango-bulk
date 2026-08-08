@@ -30,9 +30,16 @@ catch2 = ">=3.1.1"
 cppzmq = "*"
 
 [tasks]
+# CMAKE_CXX_COMPILER is pinned explicitly.  conda's $CMAKE_ARGS sets the
+# archiver, linker and strip to the conda toolchain but leaves the compiler to
+# the $CXX environment variable, so a reconfigure that does not see $CXX picks up
+# /usr/bin/g++ and links system objects with the conda ld against the conda
+# sysroot.  That fails deep in libpthread with undefined GLIBC_PRIVATE symbols,
+# which is a long way from its cause.
 _configure = { cmd = [
     "cmake",
     "$CMAKE_ARGS",
+    "-DCMAKE_CXX_COMPILER=$CXX",
     "-GNinja",
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
     "-DBUILD_TESTING=ON",
@@ -43,7 +50,25 @@ _configure = { cmd = [
 ] }
 build = { cmd = "cmake --build build", depends-on = ["_configure"] }
 test = { cmd = "ctest --test-dir build --output-on-failure", depends-on = ["build"] }
-clean = "rm -rf build"
+clean = "rm -rf build build-asan"
+
+# The sweeps in tests/unit/test_protocol_malformed.cpp only prove the
+# "never read past the supplied length" rule when a sanitizer is watching.
+_configure-asan = { cmd = [
+    "cmake",
+    "$CMAKE_ARGS",
+    "-DCMAKE_CXX_COMPILER=$CXX",
+    "-GNinja",
+    "-DCMAKE_BUILD_TYPE=Debug",
+    "-DBUILD_TESTING=ON",
+    "-DTANGO_BULK_SANITIZERS=address,undefined",
+    "-S.",
+    "-Bbuild-asan",
+] }
+test-asan = { cmd = "ctest --test-dir build-asan --output-on-failure", depends-on = [
+    "_build-asan",
+] }
+_build-asan = { cmd = "cmake --build build-asan", depends-on = ["_configure-asan"] }
 
 # The layering check is a plain script so CI can run it without configuring or
 # building anything.

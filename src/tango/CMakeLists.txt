@@ -24,11 +24,13 @@ target_link_libraries(
     PUBLIC tango-bulk::core tango-bulk::settings Tango::Tango
     PRIVATE Threads::Threads)
 
-# cppTango's public headers do not survive this project's warning set -- they
-# are not compiled with it upstream and it is not this project's business to
-# demand that they should.  Marking them SYSTEM suppresses warnings from them
-# without weakening anything applied to our own code.
-get_target_property(_tango_includes Tango::Tango INTERFACE_INCLUDE_DIRECTORIES)
-if(_tango_includes)
-    target_include_directories(tango-bulk-tango SYSTEM PUBLIC ${_tango_includes})
-endif()
+# cppTango's public headers do not survive this project's warning set, and it is
+# not this project's business to demand that they should.  No action is needed:
+# CMake already treats an IMPORTED target's interface includes as SYSTEM, so
+# Tango::Tango suppresses its own warnings.
+#
+# Re-adding them here with SYSTEM PUBLIC, as an earlier revision did, breaks
+# install(EXPORT): the conda prefix lives under .pixi/ inside this source tree,
+# and an exported target may not carry an include directory inside the source
+# directory.  The symptom is a generate-step failure that names cppTango and has
+# nothing to do with it.

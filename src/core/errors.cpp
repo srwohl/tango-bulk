@@ -45,9 +45,12 @@ const char *to_string(Status status) noexcept
         return "Internal";
     }
 
-    // Reachable only for a value that came off the wire and was not validated.
-    // Decoders reject unknown status codes; this exists so a logging path
-    // cannot be the thing that crashes.
+    // Reachable for a status that came off the wire.  Decoders deliberately do
+    // not reject an unrecognised status code: refusing to parse a reply because
+    // its failure reason is from a newer minor would turn "something went wrong,
+    // code 19" into "the message was garbage", which is strictly less useful.
+    // The value is preserved and lands here, so a logging path cannot be the
+    // thing that crashes.
     return "Unknown";
 }
 

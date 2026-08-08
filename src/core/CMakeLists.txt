@@ -9,7 +9,14 @@
 # arithmetic, and the geometry rules are the parts most worth testing
 # exhaustively and the parts least able to afford a transport to test against.
 
-add_library(tango-bulk-core enums.cpp errors.cpp)
+add_library(
+    tango-bulk-core
+    credit_window.cpp
+    enums.cpp
+    errors.cpp
+    geometry.cpp
+    protocol.cpp
+    session_id.cpp)
 add_library(tango-bulk::core ALIAS tango-bulk-core)
 
 target_include_directories(
