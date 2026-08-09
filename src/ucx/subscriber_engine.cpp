@@ -130,12 +130,11 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
 
     if(config_.delivery_mode != DeliveryMode::Manual)
     {
-        // 9.3: "no user callbacks and no dispatch thread -- DeliveryMode::Manual
-        // and poll() only".  Refusing beats silently creating the thread that
-        // the milestone says does not exist yet.
+        // No dispatch thread yet: it belongs with the callback path in M4.
+        // Refusing beats silently creating a thread that does not exist.
         throw BulkException(BulkError{Status::Internal,
-                                      "M2 implements DeliveryMode::Manual only; the dispatch "
-                                      "thread arrives with the callback path",
+                                      "DeliveryMode::Manual only; the dispatch thread arrives "
+                                      "with the callback path",
                                       "subscriber"});
     }
 
@@ -157,10 +156,18 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
         pending_[i].slot_index = i;
     }
 
-    register_frame_handler();
+    register_am_handlers();
 
+    // The engine thread starts in adopt_open_reply(), not here.
+    //
+    // 5.1 gives the worker to exactly one thread, and the endpoint to the server
+    // is created from the address in the `OpenReply` -- on whatever thread ran
+    // the Tango command.  Starting the engine only once that endpoint exists is
+    // what keeps `ucp_ep_create` from racing `ucp_worker_progress` on a
+    // UCS_THREAD_MODE_SINGLE worker, and it costs nothing: before the session
+    // opens there is no endpoint, no credit and no frame, so the loop would have
+    // had nothing to progress.
     state_.store(SubscriberState::Opening, std::memory_order_release);
-    engine_ = std::thread([this] { engine_loop(); });
 }
 
 SubscriberEngine::~SubscriberEngine()
@@ -169,6 +176,14 @@ SubscriberEngine::~SubscriberEngine()
     if(engine_.joinable())
     {
         engine_.join();
+    }
+    else
+    {
+        // Never opened, so the engine never ran and nobody has quiesced the
+        // worker.  This thread is the only one that could touch it, so it is
+        // safe to do here -- and skipping it would quarantine a worker on every
+        // failed open.
+        quiesced_.store(quiesce(), std::memory_order_release);
     }
     state_.store(SubscriberState::Closed, std::memory_order_release);
 
@@ -189,21 +204,29 @@ SubscriberEngine::~SubscriberEngine()
     // race: the ring is unmapped by the last lease, not by this destructor.
 }
 
-void SubscriberEngine::register_frame_handler()
+void SubscriberEngine::register_am_handlers()
 {
-    ucp_am_handler_param_t param;
-    std::memset(&param, 0, sizeof(param));
-    param.field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID | UCP_AM_HANDLER_PARAM_FIELD_CB |
-                       UCP_AM_HANDLER_PARAM_FIELD_ARG;
-    param.id = Protocol::k_am_id_frame;
-    param.cb = &SubscriberEngine::on_frame_am;
-    param.arg = this;
-
-    const ucs_status_t status = ucp_worker_set_am_recv_handler(worker_->get(), &param);
-    if(status != UCS_OK)
+    const auto install = [this](unsigned id, ucp_am_recv_callback_t cb, const char *what)
     {
-        throw_ucx_error("ucp_worker_set_am_recv_handler(frame)", status, "subscriber");
-    }
+        ucp_am_handler_param_t param;
+        std::memset(&param, 0, sizeof(param));
+        param.field_mask = UCP_AM_HANDLER_PARAM_FIELD_ID | UCP_AM_HANDLER_PARAM_FIELD_CB |
+                           UCP_AM_HANDLER_PARAM_FIELD_ARG;
+        param.id = id;
+        param.cb = cb;
+        param.arg = this;
+
+        const ucs_status_t status = ucp_worker_set_am_recv_handler(worker_->get(), &param);
+        if(status != UCS_OK)
+        {
+            throw_ucx_error(what, status, "subscriber");
+        }
+    };
+
+    install(Protocol::k_am_id_frame, &SubscriberEngine::on_frame_am,
+            "ucp_worker_set_am_recv_handler(frame)");
+    install(Protocol::k_am_id_probe, &SubscriberEngine::on_probe_am,
+            "ucp_worker_set_am_recv_handler(probe)");
 }
 
 std::vector<std::byte> SubscriberEngine::make_open_request(std::uint64_t correlation_id) const
@@ -211,9 +234,10 @@ std::vector<std::byte> SubscriberEngine::make_open_request(std::uint64_t correla
     Protocol::OpenRequest request;
     request.version_min = Protocol::k_version_major;
     request.version_max = Protocol::k_version_major;
-    // M2 asks only for coalescing.  Claiming probe or geometry-rearm would be
-    // claiming capabilities this side does not implement yet.
-    request.requested_caps = Protocol::k_caps_credit_coalescing;
+    // Coalescing and probe.  Geometry re-arm is left out because 4.3's
+    // two-ring interlock is not implemented, and claiming a capability this side
+    // cannot honour is worse than not having it.
+    request.requested_caps = Protocol::k_caps_credit_coalescing | Protocol::k_caps_probe;
     request.client_instance_id = Protocol::generate_client_instance_id();
     request.requested_max_frame_bytes = config_.max_frame_bytes;
     request.requested_ring_depth = config_.ring_depth;
@@ -279,9 +303,12 @@ Status SubscriberEngine::adopt_open_reply(const std::byte *data, std::size_t siz
     generation_ = reply.geometry.generation;
     granted_depth_ = reply.geometry.ring_depth;
     granted_frame_bytes_ = reply.geometry.max_frame_bytes;
+    lease_ttl_ms_ = reply.lease_ttl_ms;
+    renew_interval_ms_ = reply.renew_interval_ms;
 
     tracker_.reset(0);
 
+    // Still the only thread touching this worker: the engine has not started.
     try
     {
         endpoint_ = worker_->create_endpoint(reply.server_ucx_address.data(),
@@ -293,10 +320,75 @@ Status SubscriberEngine::adopt_open_reply(const std::byte *data, std::size_t siz
         return Status::TransportFailure;
     }
 
-    // M2 goes straight to Active.  4.1 routes through Probing, but 9.3 puts the
-    // probe out of scope; the transition it guards -- proof the ring is
-    // reachable, not merely registered -- returns in M3.
-    state_.store(SubscriberState::Active, std::memory_order_release);
+    // 4.1: `Probing` until the publisher's `Probe` is answered.  The ring is
+    // already registered and armed -- that happened in the constructor, before
+    // `Open` went out -- so what the probe adds is proof that this endpoint
+    // reaches anyone, which under the UCP_ERR_HANDLING_MODE_NONE that 6.3
+    // mandates nothing else on this side can tell us.
+    state_.store(SubscriberState::Probing, std::memory_order_release);
+    engine_ = std::thread([this] { engine_loop(); });
+    return Status::Ok;
+}
+
+std::vector<std::byte> SubscriberEngine::make_renew_request(std::uint64_t correlation_id)
+{
+    Protocol::RenewRequest request;
+    request.session_id = session_id_;
+    request.client_frames_delivered = frames_delivered_.load(std::memory_order_relaxed);
+    request.client_credits_returned = arena_ ? arena_->credits_returned() : 0;
+    request.client_state = static_cast<std::uint32_t>(state_.load(std::memory_order_acquire));
+
+    renewals_sent_.fetch_add(1, std::memory_order_relaxed);
+    return Protocol::encode(request, correlation_id);
+}
+
+Status SubscriberEngine::adopt_renew_reply(const std::byte *data, std::size_t size)
+{
+    Protocol::Envelope envelope;
+    if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
+    {
+        renewals_failed_.fetch_add(1, std::memory_order_relaxed);
+        return Status::MalformedMessage;
+    }
+
+    // 7.4: a transport-level failure of the command is a recovery hint, and so
+    // is an Error in place of the reply.  Neither is terminal on its own -- only
+    // the server saying the session is gone is.
+    if(envelope.msg_type == Protocol::CoordType::Error)
+    {
+        renewals_failed_.fetch_add(1, std::memory_order_relaxed);
+        Protocol::ErrorMessage error;
+        const Status decoded = Protocol::decode(data, size, error);
+        return decoded == Status::Ok ? error.status : Status::MalformedMessage;
+    }
+
+    Protocol::RenewReply reply;
+    if(Protocol::decode(data, size, reply) != Status::Ok)
+    {
+        renewals_failed_.fetch_add(1, std::memory_order_relaxed);
+        return Status::MalformedMessage;
+    }
+
+    if(reply.status != Status::Ok)
+    {
+        renewals_failed_.fetch_add(1, std::memory_order_relaxed);
+
+        // 3.7: SessionExpired and UnknownSession both mean this session is over
+        // and MUST NOT be treated as recoverable -- "There is no resurrection."
+        // RenewTooFrequent is the opposite: the lease is untouched and the only
+        // correct response is to renew less often.
+        if(reply.status != Status::RenewTooFrequent)
+        {
+            state_.store(SubscriberState::Failed, std::memory_order_release);
+        }
+        return reply.status;
+    }
+
+    // 3.7: the server MAY change either term at any renewal and the client MUST
+    // adopt the new value.
+    lease_ttl_ms_ = reply.lease_ttl_ms;
+    renew_interval_ms_ = reply.renew_interval_ms;
+
     return Status::Ok;
 }
 
@@ -316,7 +408,8 @@ void SubscriberEngine::engine_loop()
 
     while(running_.load(std::memory_order_acquire))
     {
-        bool worked = drain_credit_returns();
+        bool worked = send_pending_probe_ack();
+        worked |= drain_credit_returns();
         worked |= send_pending_credit();
 
         if(ucp_worker_progress(worker_->get()) != 0)
@@ -512,6 +605,79 @@ bool SubscriberEngine::send_pending_credit()
     // UCX reports it just as indirectly.
 
     credit_messages_sent_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+ucs_status_t SubscriberEngine::on_probe_am(void *arg,
+                                           const void *header,
+                                           std::size_t header_length,
+                                           void *data,
+                                           std::size_t length,
+                                           const ucp_am_recv_param_t *param) noexcept
+{
+    (void) data;
+    (void) length;
+    (void) param;
+
+    auto *self = static_cast<SubscriberEngine *>(arg);
+
+    Protocol::ProbeMessage probe;
+    if(Protocol::decode(static_cast<const std::byte *>(header), header_length, probe) != Status::Ok ||
+       probe.stream_id != self->stream_id_)
+    {
+        self->dropped_bad_header_.fetch_add(1, std::memory_order_relaxed);
+        return UCS_OK;
+    }
+
+    // 3.13: the token is echoed exactly.  It is what lets the publisher tell
+    // this session's ack from a stale one belonging to a session that has
+    // already been retired.
+    self->pending_probe_token_ = probe.probe_token;
+    self->probe_ack_pending_ = true;
+    return UCS_OK;
+}
+
+bool SubscriberEngine::send_pending_probe_ack()
+{
+    if(!probe_ack_pending_ || endpoint_ == nullptr)
+    {
+        return false;
+    }
+
+    Protocol::ProbeAckMessage ack;
+    ack.generation = generation_;
+    ack.stream_id = stream_id_;
+    ack.probe_token = pending_probe_token_;
+
+    const std::array<std::byte, Protocol::k_probe_ack_bytes> bytes = Protocol::encode(ack);
+
+    ucp_request_param_t param;
+    std::memset(&param, 0, sizeof(param));
+    param.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS;
+    param.flags = UCP_AM_SEND_FLAG_COPY_HEADER;
+
+    void *request = ucp_am_send_nbx(
+        endpoint_, Protocol::k_am_id_probe_ack, bytes.data(), bytes.size(), nullptr, 0, &param);
+
+    if(UCS_PTR_IS_ERR(request))
+    {
+        // Leave it pending: the publisher will not arm, the session expires on
+        // its lease, and nothing here has to invent a retry policy.
+        transport_errors_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    if(UCS_PTR_IS_PTR(request))
+    {
+        ucp_request_free(request);
+    }
+
+    probe_ack_pending_ = false;
+
+    // 4.1: `Probing` exits to `Active` here.  The publisher is not armed yet --
+    // it arms when this ack lands -- but from this side the handshake is done.
+    SubscriberState expected = SubscriberState::Probing;
+    state_.compare_exchange_strong(expected, SubscriberState::Active, std::memory_order_acq_rel);
     return true;
 }
 
@@ -810,6 +976,8 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
     out.delivery_queue_depth = delivery_.size();
     out.delivery_queue_high_water = delivery_high_water_.load(std::memory_order_relaxed);
     out.sessions_opened = stream_id_ != 0 ? 1u : 0u;
+    out.renewals_sent = renewals_sent_.load(std::memory_order_relaxed);
+    out.renewals_failed = renewals_failed_.load(std::memory_order_relaxed);
     out.transport_errors = transport_errors_.load(std::memory_order_relaxed);
     out.pinned_bytes = arena_->ring().mapped_bytes();
     return out;

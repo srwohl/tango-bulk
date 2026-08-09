@@ -32,6 +32,13 @@ struct PublisherConfig
     std::uint32_t publish_queue_depth{256};
     std::uint32_t lease_ttl_ms{10'000};
     std::uint32_t renew_interval_ms{3'333};
+
+    /// Accepted renewals per TTL window before `RenewTooFrequent` (3.7).
+    ///
+    /// 6.1 lists this among the configurable quantities; 2.3's struct does not
+    /// name a field for it, so this one is an addition rather than a rename.
+    /// See docs/EXTRACTION.md.
+    std::uint32_t max_renewals_per_ttl{10};
     std::uint64_t pinned_memory_limit_bytes{1ull << 30};
     DropPolicy drop_policy{DropPolicy::DropNewest};
     std::string ucx_tls;           ///< empty => let UCX choose; tests pin

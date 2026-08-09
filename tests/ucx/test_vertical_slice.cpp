@@ -2,9 +2,7 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include <ucx/subscriber_engine.h>
-
-#include <tango-bulk/publisher.h>
+#include "slice.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -14,169 +12,17 @@
 
 /// IMPLEMENTATION_SPEC.md 9.3's exit criteria, one TEST_CASE each.
 ///
-/// The list is deliberately short and deliberately closed.  This milestone is
-/// the first time the ownership rules in 5.4 and 5.5 are executed rather than
-/// written down, and the value of these cases is that each one fails for exactly
-/// one reason.  Breadth belongs in tests/unit, where it costs milliseconds and
-/// no transport; every case here starts two UCX workers and pins memory.
+/// The list is deliberately short and deliberately closed.  This is the first
+/// time the ownership rules in 5.4 and 5.5 are executed rather than written
+/// down, and the value of these cases is that each one fails for exactly one
+/// reason.  Breadth belongs in tests/unit, where it costs milliseconds and no
+/// transport; every case here starts two UCX workers and pins memory.
+///
+/// Session lifecycle -- leases, renewal, expiry -- is 9.4/M3 and lives in
+/// test_session_lifecycle.cpp.
 namespace
 {
-
-using namespace TangoBulk;
-using namespace std::chrono_literals;
-
-constexpr std::uint64_t k_frame_bytes = 256u << 10; ///< comfortably rendezvous-sized
-constexpr std::uint32_t k_ring_depth = 8;
-constexpr std::uint32_t k_credit_window = 4;
-
-PublisherConfig publisher_config()
-{
-    PublisherConfig config;
-    config.stream_name = "m2.slice";
-    config.max_frame_bytes = k_frame_bytes;
-    config.ring_depth = k_ring_depth;
-    config.credit_window = k_credit_window;
-    config.publish_queue_depth = 8;
-    return config;
-}
-
-SubscriberConfig subscriber_config()
-{
-    SubscriberConfig config;
-    config.stream_name = "m2.slice";
-    config.max_frame_bytes = k_frame_bytes;
-    config.ring_depth = k_ring_depth;
-    config.credit_window = k_credit_window;
-    config.delivery_queue_depth = 32;
-    // 9.3: Manual only.  There is no dispatch thread in M2 and asking for one
-    // is a construction error, not a silent upgrade.
-    config.delivery_mode = DeliveryMode::Manual;
-    return config;
-}
-
-/// One publisher and one subscriber, opened, in this process over UCX loopback.
-///
-/// The `Open` exchange goes straight through `handle_coordination` -- no Tango
-/// process, no DeviceProxy, no commands, which is what 9.3 means by driving the
-/// coordination plane directly.  The bytes are the real protocol bytes; only the
-/// transport carrying them is short-circuited.
-struct Slice
-{
-    BulkPublisher publisher;
-    detail::SubscriberEngine subscriber;
-
-    explicit Slice(PublisherConfig pub = publisher_config(),
-                   SubscriberConfig sub = subscriber_config()) :
-        publisher(std::move(pub)),
-        subscriber(std::move(sub))
-    {
-        const std::vector<std::byte> request = subscriber.make_open_request(1);
-        const std::vector<std::byte> reply =
-            publisher.handle_coordination(request.data(), request.size());
-
-        REQUIRE(subscriber.adopt_open_reply(reply.data(), reply.size()) == Status::Ok);
-        REQUIRE(subscriber.state() == SubscriberState::Active);
-        REQUIRE(publisher.session_count() == 1);
-    }
-
-    /// Close the session before either side is destroyed.
-    ///
-    /// Not tidiness.  Members die in reverse declaration order, so without this
-    /// the subscriber's worker and receive ring would go away while the
-    /// publisher still had frames in flight to them -- and UCX reports that as
-    /// an arbiter assertion inside endpoint destruction, a long way from the
-    /// cause.  `Close` runs 4.2's teardown in its mandated order: stop
-    /// submitting, drain outstanding operations, close the endpoint, and only
-    /// then release the slots those operations were reading from.
-    ~Slice()
-    {
-        const std::vector<std::byte> request = subscriber.make_close_request(2);
-        publisher.handle_coordination(request.data(), request.size());
-    }
-
-    Slice(const Slice &) = delete;
-    Slice &operator=(const Slice &) = delete;
-};
-
-FrameMetadata meta_for(std::uint64_t payload_bytes, std::uint64_t counter)
-{
-    FrameMetadata meta;
-    meta.element_type = ElementType::UInt8;
-    meta.rank = 1;
-    meta.shape[0] = payload_bytes;
-    meta.event_counter = counter;
-    meta.quality = 7;
-    return meta;
-}
-
-/// A pattern that depends on both the seed and the offset, so a frame delivered
-/// from the wrong slot or truncated mid-payload does not accidentally match.
-void fill(const BulkSource::Lease &lease, std::uint64_t bytes, unsigned seed)
-{
-    auto *p = static_cast<unsigned char *>(lease.data());
-    for(std::uint64_t i = 0; i < bytes; ++i)
-    {
-        p[i] = static_cast<unsigned char>((seed * 31u + static_cast<unsigned>(i)) & 0xFFu);
-    }
-}
-
-bool payload_matches(const FrameView &view, unsigned seed)
-{
-    const auto *p = reinterpret_cast<const unsigned char *>(view.data());
-    for(std::size_t i = 0; i < view.size(); ++i)
-    {
-        if(p[i] != static_cast<unsigned char>((seed * 31u + static_cast<unsigned>(i)) & 0xFFu))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-PublishResult publish_one(Slice &slice, std::uint64_t bytes, unsigned seed)
-{
-    BulkSource::Lease lease = slice.publisher.source().try_acquire();
-    REQUIRE(lease);
-    fill(lease, bytes, seed);
-    return slice.publisher.publish(std::move(lease), meta_for(bytes, seed));
-}
-
-/// Poll until `want` frames have been delivered, or the budget runs out.
-///
-/// The returned views are *retained*, which means their credits are withheld.
-/// That is the point in most of these cases; where it is not, the caller clears
-/// the vector.
-std::vector<FrameView> collect(detail::SubscriberEngine &subscriber,
-                               std::size_t want,
-                               std::chrono::milliseconds budget = 5s)
-{
-    std::vector<FrameView> views;
-    const auto deadline = std::chrono::steady_clock::now() + budget;
-
-    while(views.size() < want && std::chrono::steady_clock::now() < deadline)
-    {
-        subscriber.poll(10ms, [&views](FrameView view) { views.push_back(std::move(view)); });
-    }
-
-    return views;
-}
-
-/// Spin until `predicate` holds or the budget runs out; returns whether it held.
-template <typename Predicate>
-bool eventually(Predicate predicate, std::chrono::milliseconds budget = 5s)
-{
-    const auto deadline = std::chrono::steady_clock::now() + budget;
-    while(std::chrono::steady_clock::now() < deadline)
-    {
-        if(predicate())
-        {
-            return true;
-        }
-        std::this_thread::sleep_for(1ms);
-    }
-    return predicate();
-}
-
+using namespace TangoBulkTests;
 } // namespace
 
 TEST_CASE("A published frame arrives intact with its metadata", "[m2][slice]")
@@ -184,7 +30,7 @@ TEST_CASE("A published frame arrives intact with its metadata", "[m2][slice]")
     Slice slice;
     const std::uint64_t bytes = 4096;
 
-    REQUIRE(publish_one(slice, bytes, 0x5A) == PublishResult::Accepted);
+    REQUIRE(slice.publish(bytes, 0x5A) == PublishResult::Accepted);
 
     const std::vector<FrameView> views = collect(slice.subscriber, 1);
     REQUIRE(views.size() == 1);
@@ -214,7 +60,7 @@ TEST_CASE("The delivered payload lives in the registered receive ring", "[m2][sl
 {
     Slice slice;
 
-    REQUIRE(publish_one(slice, k_frame_bytes, 0x11) == PublishResult::Accepted);
+    REQUIRE(slice.publish(k_frame_bytes, 0x11) == PublishResult::Accepted);
 
     const std::vector<FrameView> views = collect(slice.subscriber, 1);
     REQUIRE(views.size() == 1);
@@ -245,7 +91,7 @@ TEST_CASE("Slots recycle: sequence s lands in slot s % ring_depth", "[m2][slice]
     for(std::size_t n = 0; n < total; ++n)
     {
         const auto seed = static_cast<unsigned>(n);
-        REQUIRE(publish_one(slice, bytes, seed) == PublishResult::Accepted);
+        REQUIRE(slice.publish(bytes, seed) == PublishResult::Accepted);
 
         std::vector<FrameView> views = collect(slice.subscriber, 1);
         REQUIRE(views.size() == 1);
@@ -273,7 +119,7 @@ TEST_CASE("A retained view withholds exactly one credit", "[m2][slice]")
 
     for(std::uint32_t n = 0; n < k_credit_window; ++n)
     {
-        REQUIRE(publish_one(slice, bytes, n) == PublishResult::Accepted);
+        REQUIRE(slice.publish(bytes, n) == PublishResult::Accepted);
     }
 
     std::vector<FrameView> held = collect(slice.subscriber, k_credit_window);
@@ -299,7 +145,7 @@ TEST_CASE("A retained view withholds exactly one credit", "[m2][slice]")
 
     // ...and the publisher resumes, which is the other half of the criterion:
     // the stall must be a stall, not a wedge.
-    REQUIRE(publish_one(slice, bytes, 100) == PublishResult::Accepted);
+    REQUIRE(slice.publish(bytes, 100) == PublishResult::Accepted);
 }
 
 TEST_CASE("Out-of-order release advances the ack only across the contiguous prefix",
@@ -310,7 +156,7 @@ TEST_CASE("Out-of-order release advances the ack only across the contiguous pref
 
     for(std::uint32_t n = 0; n < k_credit_window; ++n)
     {
-        REQUIRE(publish_one(slice, bytes, n) == PublishResult::Accepted);
+        REQUIRE(slice.publish(bytes, n) == PublishResult::Accepted);
     }
 
     std::vector<FrameView> held = collect(slice.subscriber, k_credit_window);
@@ -463,7 +309,7 @@ TEST_CASE("Views outlive the subscriber that delivered them", "[m2][slice]")
 
         for(std::uint32_t n = 0; n < 2; ++n)
         {
-            REQUIRE(publish_one(slice, bytes, n) == PublishResult::Accepted);
+            REQUIRE(slice.publish(bytes, n) == PublishResult::Accepted);
         }
 
         held = collect(slice.subscriber, 2);

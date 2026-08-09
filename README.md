@@ -14,18 +14,22 @@ A device server opts in by linking a library and registering four ordinary Tango
 No cppTango ABI, event implementation, public class, IDL, build option, or upstream source
 file changes.
 
-> **Status: M2 — the minimal vertical slice.** Bytes now move over UCX. A publisher and a
-> subscriber in one process carry a frame end to end — registered producer lease → engine
-> thread → self-contained frame → registered consumer slot → `FrameView` → credit on release
-> — with the payload landing in the registered receive ring without a copy. All eight of
-> §9.3's exit criteria pass, under a normal `-Werror` build and under
-> `-fsanitize=address,undefined`.
+> **Status: M3 — session lifecycle and fault containment.** Bytes move over UCX and sessions
+> now have a lifetime. A bounded table of clients each holds an expiring lease with its own
+> credit window and sequence space; a frame fans out to all of them and its producer slot
+> comes back only when every one has credited it. `Probe`/`ProbeAck` arms a session before it
+> can be sent to, `Renew` extends it, `Close` is idempotent, and a client that simply vanishes
+> has its pinned slots reclaimed on the lease deadline — with the stream still serving
+> everybody else, and a restarted client able to open a new session without restarting the
+> device server. The M2 vertical slice passes unchanged on top of all of it. Green under a
+> normal `-Werror` build, under `-fsanitize=address,undefined`, and under
+> `-fsanitize=thread`.
 >
-> Deliberately not here yet: no Tango integration and no session lifecycle. No commands, no
-> `DeviceProxy`, no session manager, lease timers, expiry, geometry epochs, probe, reconnect,
-> relay, RMA, or dispatch thread — `DeliveryMode::Manual` and `poll()` only. `BulkSubscriber`
-> is still a declaration; the transport engine behind it is `detail::SubscriberEngine`.
-> Session leases land in M3, the stock-Tango command adapter in M4. See
+> Deliberately not here yet: no Tango integration. No commands, no `DeviceProxy`, no
+> `BulkQuery`, geometry epochs, reconnect, relay, RMA, dispatch thread, or renew timer —
+> `DeliveryMode::Manual` and `poll()` only, and the coordination plane is driven as encoded
+> bytes by the caller. `BulkSubscriber` is still a declaration; the transport engine behind it
+> is `detail::SubscriberEngine`. The stock-Tango command adapter is M4. See
 > [docs/EXTRACTION.md](docs/EXTRACTION.md) for exactly what exists, which deviations from the
 > spec were taken deliberately, and what each test is worth.
 
@@ -104,7 +108,7 @@ has never been observed to fail is not a check.
 ## Testing
 
 ```sh
-pixi run test        # 110 cases
+pixi run test        # 127 cases
 pixi run test-asan   # the same, under -fsanitize=address,undefined
 ```
 
@@ -115,6 +119,16 @@ no return value can express that. Without a sanitizer they are mostly wasted run
 
 `tests/unit/golden_vectors.h` is generated. A diff of it is a protocol change and should be
 reviewed as one; `tests/unit/test_protocol_golden.cpp` documents how to regenerate it.
+
+The session table is worth a race detector too, since every transition in the server state
+machine is a handshake between a Tango command thread and the engine thread. There is no pixi
+task because it needs ASLR disabled on recent kernels:
+
+```sh
+cmake -S . -B build-tsan -GNinja -DBUILD_TESTING=ON -DTANGO_BULK_SANITIZERS=thread
+cmake --build build-tsan --target tango-bulk-ucx-tests
+setarch -R ./build-tsan/tests/tango-bulk-ucx-tests
+```
 
 ## Design in one paragraph
 

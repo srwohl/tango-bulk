@@ -130,6 +130,15 @@ Status PublisherConfig::validate() const noexcept
         return Status::RenewTooFrequent;
     }
 
+    // 3.7's rate limit.  Below two, a client that renews on schedule and once
+    // more after a lost reply would be refused; above the cap it stops being a
+    // limit.
+    if(max_renewals_per_ttl < k_min_renewals_per_ttl ||
+       max_renewals_per_ttl > k_max_renewals_per_ttl)
+    {
+        return Status::RenewTooFrequent;
+    }
+
     // 6.1: DropOldest is illegal on the producer ring.  A slot already handed to
     // UCX cannot be reclaimed, so offering the option would be offering
     // corruption -- silently, and only under load.

@@ -22,7 +22,7 @@
 #include <thread>
 #include <vector>
 
-/// The receiving half of the M2 vertical slice.
+/// The receiving half of the transport, below `BulkSubscriber`.
 ///
 /// This is deliberately **not** `BulkSubscriber`.  2.4 gives that class a
 /// `Tango::DeviceProxy &` constructor parameter, and 1.1 forbids `src/ucx/` from
@@ -124,17 +124,45 @@ class SubscriberEngine
 
     /// Encoded `Open`, to be carried to the publisher by whatever the caller
     /// has -- a Tango command in M4, a direct `handle_coordination` call in the
-    /// M2 tests.
+    /// tests here.
     ///
     /// By the time this returns, the receive ring is allocated, registered and
     /// armed: 4.1's `Opening` entry action, in that order, because the publisher
     /// may send the first frame the instant it replies.
     std::vector<std::byte> make_open_request(std::uint64_t correlation_id) const;
 
-    /// Adopt an `OpenReply`: stream id, granted geometry, endpoint to the server.
+    /// Adopt an `OpenReply`: stream id, granted geometry, endpoint to the
+    /// server.  Starts the engine thread and leaves the state in `Probing`; the
+    /// publisher's `Probe` moves it to `Active` (4.1).
     Status adopt_open_reply(const std::byte *data, std::size_t size);
 
+    /// 3.7's lease renewal, as a pair of byte-level steps.
+    ///
+    /// There is no renew *timer* here.  5.1 puts one on the subscriber's control
+    /// thread, but that thread's other job is calling `DeviceProxy`, and there
+    /// is no proxy until M4 -- so M3 exposes the two ends and lets the caller
+    /// drive them, exactly as it does for `Open` and `Close`.
+    std::vector<std::byte> make_renew_request(std::uint64_t correlation_id);
+
+    /// Adopt a `RenewReply`.  `SessionExpired` and `UnknownSession` are terminal
+    /// for this session (3.7: "There is no resurrection"); the state goes to
+    /// `Failed` and the caller must open a new one.
+    Status adopt_renew_reply(const std::byte *data, std::size_t size);
+
     std::vector<std::byte> make_close_request(std::uint64_t correlation_id) const;
+
+    /// The lease terms the server granted, as they stand after the last reply.
+    /// M4's renew timer reads these; 3.7 lets the server change them at any
+    /// renewal and requires the client to adopt the new values.
+    std::uint32_t lease_ttl_ms() const noexcept
+    {
+        return lease_ttl_ms_;
+    }
+
+    std::uint32_t renew_interval_ms() const noexcept
+    {
+        return renew_interval_ms_;
+    }
 
     /// Manual delivery (9.3 allows no other kind in M2): invokes `cb` on the
     /// CALLING thread and returns how many frames it dispatched.
@@ -181,9 +209,16 @@ class SubscriberEngine
     struct Pending;
 
     void engine_loop();
-    void register_frame_handler();
+    void register_am_handlers();
     bool drain_credit_returns();
     bool send_pending_credit();
+
+    /// 4.1's `Probing` exit: answer the publisher's `Probe` and become `Active`.
+    ///
+    /// Sent from the loop rather than from the AM callback that received the
+    /// probe, for the same reason credit is: a callback runs inside
+    /// `ucp_worker_progress`, and this engine does not re-enter UCX from there.
+    bool send_pending_probe_ack();
 
     /// Bring the worker to a state where destroying it is safe, whatever the
     /// peer did.  Engine thread, after the loop has stopped.  Returns false if
@@ -207,6 +242,13 @@ class SubscriberEngine
                                  void *user_data) noexcept;
 
     static void on_credit_sent(void *request, ucs_status_t status, void *user_data) noexcept;
+
+    static ucs_status_t on_probe_am(void *arg,
+                                    const void *header,
+                                    std::size_t header_length,
+                                    void *data,
+                                    std::size_t length,
+                                    const ucp_am_recv_param_t *param) noexcept;
 
     ucs_status_t handle_frame(const std::byte *header,
                               std::size_t header_length,
@@ -232,6 +274,11 @@ class SubscriberEngine
     /// inside `ucp_worker_progress`.
     std::size_t rndv_inflight_{0};
 
+    /// A `Probe` received and not yet answered.  Written by the probe AM
+    /// handler, cleared by the loop that sends the ack; both are the engine.
+    std::uint64_t pending_probe_token_{0};
+    bool probe_ack_pending_{false};
+
     std::thread engine_;
     std::atomic<bool> running_{true};
 
@@ -246,6 +293,11 @@ class SubscriberEngine
     std::uint32_t generation_{0};
     std::uint32_t granted_depth_{0};
     std::uint64_t granted_frame_bytes_{0};
+    std::uint32_t lease_ttl_ms_{0};
+    std::uint32_t renew_interval_ms_{0};
+
+    std::atomic<std::uint64_t> renewals_sent_{0};
+    std::atomic<std::uint64_t> renewals_failed_{0};
 
     std::atomic<std::uint64_t> frames_received_{0};
     std::atomic<std::uint64_t> frames_delivered_{0};
