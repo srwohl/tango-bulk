@@ -425,7 +425,7 @@ struct BulkPublisher::Impl
     explicit Impl(PublisherConfig cfg) :
         config(std::move(cfg)),
         context(config.ucx_tls),
-        worker(context),
+        worker(std::make_unique<UcxWorker>(context)),
         ring(context,
              config.max_frame_bytes,
              config.ring_depth,
@@ -462,6 +462,22 @@ struct BulkPublisher::Impl
         {
             engine.join();
         }
+
+        // Destroy the worker here, explicitly, while everything its completion
+        // callbacks touch is still alive.
+        //
+        // `ucp_worker_destroy` does not merely drop outstanding sends: it purges
+        // them by *invoking their completion callbacks*
+        // (`uct_rc_txqp_purge_outstanding`, with `UCS_ERR_CANCELED`).  Ours
+        // reaches into the session table and the counters, and members are
+        // destroyed in reverse declaration order -- so leaving this to the
+        // implicit destructor calls back into a freed `Session`.
+        //
+        // Only reachable on a transport where a send can still be outstanding at
+        // this point.  Over `cma` every send completes synchronously and the
+        // purge list is always empty, which is why it took an rc_verbs run to
+        // surface.  It is not an rc quirk: it is the ordinary RDMA case.
+        worker.reset();
     }
 
     // -- engine thread ------------------------------------------------------
@@ -478,7 +494,7 @@ struct BulkPublisher::Impl
             param.cb = cb;
             param.arg = this;
 
-            const ucs_status_t status = ucp_worker_set_am_recv_handler(worker.get(), &param);
+            const ucs_status_t status = ucp_worker_set_am_recv_handler(worker->get(), &param);
             if(status != UCS_OK)
             {
                 detail::throw_ucx_error(what, status, "publisher");
@@ -527,7 +543,7 @@ struct BulkPublisher::Impl
             }
             --until_sweep;
 
-            if(ucp_worker_progress(worker.get()) != 0)
+            if(ucp_worker_progress(worker->get()) != 0)
             {
                 worked = true;
             }
@@ -566,7 +582,7 @@ struct BulkPublisher::Impl
         {
             try
             {
-                task->ep = worker.create_endpoint(task->address, task->address_size);
+                task->ep = worker->create_endpoint(task->address, task->address_size);
                 task->ok = true;
             }
             catch(const BulkException &)
@@ -1088,14 +1104,14 @@ struct BulkPublisher::Impl
             ucp_request_param_t flush_param;
             std::memset(&flush_param, 0, sizeof(flush_param));
             flush_param.op_attr_mask = 0;
-            await_request(worker.get(), ucp_ep_flush_nbx(session.ep, &flush_param));
+            await_request(worker->get(), ucp_ep_flush_nbx(session.ep, &flush_param));
 
             // 3. Close the endpoint, forcing after the bounded wait.
             ucp_request_param_t close_param;
             std::memset(&close_param, 0, sizeof(close_param));
             close_param.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS;
             close_param.flags = UCP_EP_CLOSE_FLAG_FORCE;
-            await_request(worker.get(), ucp_ep_close_nbx(session.ep, &close_param));
+            await_request(worker->get(), ucp_ep_close_nbx(session.ep, &close_param));
             session.ep = nullptr;
 
             // 3b. Collect the completions the force-close just produced.
@@ -1115,7 +1131,7 @@ struct BulkPublisher::Impl
             const auto deadline = std::chrono::steady_clock::now() + k_teardown_budget;
             while(session.sends_inflight > 0 && std::chrono::steady_clock::now() < deadline)
             {
-                ucp_worker_progress(worker.get());
+                ucp_worker_progress(worker->get());
             }
         }
 
@@ -1238,7 +1254,9 @@ struct BulkPublisher::Impl
 
     PublisherConfig config;
     UcxContext context;
-    UcxWorker worker;
+
+    /// By pointer so ~Impl can destroy it before any other member.
+    std::unique_ptr<UcxWorker> worker;
     RegisteredRing ring;
 
     BulkSource source;
@@ -1630,7 +1648,7 @@ std::vector<std::byte> BulkPublisher::Impl::handle_open(const std::byte *data,
     reply.transport_selected = Protocol::Transport::ActiveMessage;
     reply.server_epoch_id = server_epoch_id;
     reply.geometry = geometry;
-    reply.server_ucx_address = worker.address();
+    reply.server_ucx_address = worker->address();
 
     return Protocol::encode(reply, correlation_id);
 }

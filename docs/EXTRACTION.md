@@ -299,6 +299,25 @@ The following arrived with M2.
     `SessionExpired` and `UnknownSession` move the subscriber to `Failed`. MVP_PLAN.md puts
     "negotiate, renew, close, and reopen sessions" in M4's client.
 
+22. **The publisher destroys its `ucp_worker` explicitly, before any other member.**
+    `ucp_worker_destroy` does not merely abandon outstanding sends — it purges them by
+    *invoking their completion callbacks* (`uct_rc_txqp_purge_outstanding`, status
+    `UCS_ERR_CANCELED`). M3 gave `on_send_complete` a `Session *` as its `user_data` so each
+    session could count its own in-flight sends, and members are destroyed in reverse
+    declaration order, so the implicit destructor freed the session table and *then* destroyed
+    the worker. The purge called back into freed memory.
+
+    `worker` is therefore a `unique_ptr` reset at the top of `~Impl`, after the engine join.
+    The general rule it encodes: a UCX handle must be destroyed before anything its callbacks
+    can touch, and relying on declaration order to arrange that is not good enough for an
+    invariant this sharp.
+
+    **This is not reachable over `cma` or `sm`**, where every send completes synchronously and
+    the purge list is always empty — which is why M2, M3, ASan, TSan and a 20-run soak all
+    passed over it. It took running the suite over `rc_verbs` to surface, and it is the
+    ordinary RDMA case rather than a Soft-RoCE artefact.
+
+
 ## 5. M0 exit criteria
 
 | Criterion | Status | Evidence |
@@ -440,6 +459,20 @@ transition in §4.2 is a handshake between a Tango command thread and the engine
 the write-once claim in deviation 19 is the kind of mistake only a race detector or a very
 unlucky user finds. It is not yet a `pixi` task — it needs `setarch -R` on this kernel — so it
 is run deliberately rather than by default.
+
+**The suite also runs over `rc_verbs`**, on a Soft-RoCE device (`modprobe rdma_rxe`) rather
+than on RDMA hardware. This is a correctness configuration, never a performance one: rxe is
+kernel software and its timings mean nothing. What it supplies that `cma` and `sm` cannot is
+*asynchrony* — a send genuinely stays posted to a queue pair instead of completing inside the
+call — and that alone found deviation 22, a use-after-free that every other configuration in
+this repository passed cleanly. Run it with:
+
+```sh
+UCX_TLS=rc_verbs,ud_verbs ./build/tests/tango-bulk-ucx-tests
+```
+
+`ud_verbs` is not optional: `rc_verbs` is connection-oriented and has no way to complete the
+address-based wireup handshake on its own.
 
 Cases that wait on a lease use the shortest TTL §6.1 permits, 1 000 ms, so the timing is real
 rather than mocked. That costs the suite about five seconds and is the price of testing a
