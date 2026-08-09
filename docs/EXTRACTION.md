@@ -37,10 +37,10 @@ From `IMPLEMENTATION_SPEC.md` §8. "Extract" means the logic moves and gets clea
 
 | Prototype component | Action | Target | Status |
 |---|---|---|---|
-| `experiments/ucx-bulk-spike/bulk_source.hpp` | extract and clean | `src/ucx/registered_ring.cpp`, `include/tango-bulk/publisher.h` | API shape landed (M0); implementation M2 |
+| `experiments/ucx-bulk-spike/bulk_source.hpp` | extract and clean | `src/ucx/registered_ring.cpp`, `include/tango-bulk/publisher.h` | **done (M2)** — one `ucp_mem_map`, §6.2 stride padding |
 | `src/include/tango/server/BulkSource.h` (in-tree) | extract API shape only | `include/tango-bulk/publisher.h` | done — move-only pimpl `Lease`, non-blocking `try_acquire()`; `DeviceImpl` friendship dropped |
 | `src/include/tango/client/FrameView.h` | extract, remove Tango dependency | `include/tango-bulk/frame.h` | done — see §3 |
-| `src/include/tango/internal/ucx/UcxWorker.h` | extract behind the engine | `src/ucx/context.cpp`, `src/ucx/engine.cpp` | M2 |
+| `src/include/tango/internal/ucx/UcxWorker.h` | extract behind the engine | `src/ucx/ucx_context.{h,cpp}`, `publisher_impl.cpp`, `subscriber_engine.{h,cpp}` | **done (M2)** — context/worker RAII, `max_am_header` checked at construction |
 | `src/ucx/BulkStreamSupplier.cpp` (`SeqWindow`) | extract, reshape to a bitmap | `src/core/credit_window.cpp` | **done (M1)** |
 | geometry epochs (`rearm_stream`, `draining_generation_`) | extract | `src/core/geometry.cpp`, `src/ucx/*_impl.cpp` | validation done (M1); epoch machinery M3+ |
 | `src/include/tango/internal/ucx/bulk_wire.h` | redesign as a standalone protocol | `include/tango-bulk/protocol.h`, `src/core/protocol.cpp` | **done (M1)** |
@@ -48,7 +48,7 @@ From `IMPLEMENTATION_SPEC.md` §8. "Extract" means the logic moves and gets clea
 | Tango event integration (`EventData::bulk_frame`, `ZmqEvent*` hooks, `DeviceProxy` overloads) | **retire** | — | not extracted, not referenced |
 | `src/idl_bulk/`, `BulkStreamCorrelator`, `BulkTopicCutover`, `bulk_topics.h`, `bulk_negotiation.*` | **retire** | — | not extracted, not referenced |
 | `TANGO_USE_UCX`, `configure/ucx.cmake` | **retire** | — | not extracted; cppTango gains no build option |
-| `tests/catch2_unit_bulk_*.cpp` (12 files) | mine for cases, do not port | `tests/unit/`, `tests/ucx/` | M1/M2 |
+| `tests/catch2_unit_bulk_*.cpp` (12 files) | mine for cases, do not port | `tests/unit/`, `tests/ucx/` | **done (M1/M2)** — `tests/ucx/test_vertical_slice.cpp` holds §9.3's eight criteria |
 | `experiments/ucx-bulk-spike/*` | extract as the benchmark | `benchmarks/` | M2+; the spike keeps running unchanged on hardware in parallel |
 
 Two things the map deliberately does not do: it does not preserve the prototype's
@@ -95,6 +95,13 @@ Recorded rather than silently taken. None changes a signature in §2.
    layer, and they meet at an abstract interface declared in `src/core/`. The alternative —
    putting `BulkSubscriber` in the UCX layer — would require that layer to see `DeviceProxy`,
    which the dependency table forbids.
+
+   **M2 executed the first half of that plan.** The transport engine is
+   `detail::SubscriberEngine` in `src/ucx/subscriber_engine.{h,cpp}`, and `BulkSubscriber`
+   remains a declaration. The M2 tests drive the coordination plane by hand against the
+   engine, which is exactly what §9.3 asks for ("no Tango process, no `DeviceProxy`, no
+   commands"). `BulkSubscriber` becomes a shell over the engine in M4, when there is a
+   `DeviceProxy` to carry coordination.
 
 3. **`FrameView::Fields` is public, not private.** §2.2 shows it private with
    `detail::ReceiveSlotLease` as the only friend. It is public here because the receive path
@@ -144,6 +151,76 @@ Recorded rather than silently taken. None changes a signature in §2.
    `"Unknown"`. Enum *fields that describe the payload* — `ElementType`, and the geometry
    bounds generally — are the opposite: those are validated strictly, because a receiver
    that cannot name the element type cannot interpret the bytes.
+
+The following arrived with M2.
+
+10. **A session is armed on `Open`, not on `ProbeAck`.** §4.2 says arm-before-send is
+    mandatory and that the publisher **MUST NOT** submit a frame to a session in `Open` —
+    but §9.3 puts the probe explicitly out of scope, so there is no `ProbeAck` to arm on.
+    M2 therefore arms at `Open`, which is a deliberate weakening of a MUST and is commented
+    at the site. What the interlock protects against — landing a frame in a ring that is not
+    yet registered — is still covered here, because §4.1's `Opening` entry action registers
+    and arms the receive ring *before* `Open` goes out. The probe restores the general case
+    in M3.
+
+11. **One session per publisher; `Renew` and `Query` return `Error{Internal}`.** §9.3 puts
+    leases, renewal and expiry out of scope, so there is nothing for `Renew` to extend. The
+    handlers exist and answer `"not implemented before M3"` rather than being absent, so a
+    peer that sends one gets a protocol-legal reply instead of a dropped message. `Close`
+    consequently stops the whole publisher engine rather than transitioning one session to
+    `Expiring`; M3 replaces that.
+
+12. **The consumer has a teardown order, and §4.2 does not give it one.** §4.2 fixes the
+    publisher's `Expiring` order and says it MUST NOT be reordered. Nothing states the
+    mirror obligation for the subscriber, which is harder: its outstanding work is
+    *receives*, and a rendezvous receive is a get issued against the peer's buffer, so it
+    sits on an endpoint UCX created internally and that this code can neither name nor
+    close. `ucp_worker_destroy` with such an operation still queued is not an error code but
+    `ucs_fatal_error` — the process aborts inside UCX.
+
+    `SubscriberEngine::quiesce()` therefore runs, on the engine thread after the loop stops:
+    bounded drain of in-flight receives → best-effort `ucp_request_cancel` of the remainder
+    → close our own endpoint, bounded then forced → `ucp_worker_flush_nbx`. The bounded
+    drain is the load-bearing step; the original code progressed the worker only while the
+    *close* request was in progress, which with `UCP_EP_CLOSE_FLAG_FORCE` is barely at all.
+
+    Two consequences worth stating plainly. The cancel is genuinely best-effort: UCX 1.22
+    documents `ucp_request_cancel`'s peer-independence for send and tag-receive requests and
+    says nothing about an AM receive, and the M2 suite never reaches that path, so it is
+    unverified. And if `quiesce()` cannot prove the worker safe, the destructor deliberately
+    **leaks** it rather than destroying it — a stranded worker is a far better outcome for a
+    device server than a fatal error raised by a client's disappearance. The publisher gained
+    the symmetric fix: it now progresses after its force-close to collect the send
+    completions that force produced, without which those requests are never freed.
+
+    This is the M2 shape of "either end may hang up abruptly". §6.3 mandates
+    `UCP_ERR_HANDLING_MODE_NONE` and says session leases provide liveness, so none of this
+    may rely on UCX detecting peer failure — it is all local reclaim. M3's lease expiry is
+    what supplies the detection.
+
+13. **The lease control block owns its pool.** `PoolAllocator` holds a
+    `shared_ptr<LeasePool>` rather than a raw pointer. `allocate_shared` stores a copy of the
+    allocator *inside* the control block, so the pool is the storage its own owner lives in;
+    and on the receive path the lease also holds the arena alive, and the arena owned the
+    pool. Releasing the last `FrameView` therefore ran `_M_dispose()` → destroy lease →
+    release arena → destroy pool, and then `_M_release()` carried on reading the control
+    block whose ground had just gone. ASan reported it as a heap-use-after-free in
+    `_M_release()`; it is invisible without one, which is the argument for §9.3's last
+    criterion existing at all.
+
+14. **`publish()` does admission control on the application thread.** It compares
+    `admitted - credited` against `credit_window` itself, so it can answer `CreditStalled`
+    to its caller synchronously — §2.3 requires that answer from `publish()`, and the engine
+    thread is not there to give it. `CreditWindow` in `src/core/` remains the authority for
+    what is actually on the wire; the app-thread counter is an admission gate in front of it,
+    never a second source of truth.
+
+15. **Lease and control-block pools exist because §2.1 forbids data-path allocation.**
+    A `shared_ptr` control block per delivered frame is an allocation, and §5.5 makes that
+    refcount the credit interlock — the two are only compatible because the number of live
+    leases is bounded by construction at `ring_depth`. Hence `LeasePool` plus a class-level
+    `operator new` on `Lease::Impl`. `LeasePool::overflows()` is public so the bound can be
+    observed rather than assumed.
 
 ## 5. M0 exit criteria
 
@@ -203,12 +280,56 @@ Two notes on what these tests are worth:
   one-byte overread is a heap overflow ASan can see, not a byte still inside the original
   allocation.
 
-## 7. What M0 and M1 deliberately do not contain
+## 7. M2 exit criteria
 
-No transport and no Tango integration. No UCX engine, no registered memory, no session
-manager, no lease timers, no commands, no `DeviceProxy` client. `BulkPublisher`,
-`BulkSubscriber` and `BulkSource` are declarations only.
+One publisher and one subscriber in the same test process over a UCX loopback: registered
+producer lease → engine thread → self-contained frame → registered consumer slot →
+`FrameView` → credit on release. All eight criteria live in `tests/ucx/test_vertical_slice.cpp`.
 
-The next slice is M2, the minimal vertical slice: one publisher and one subscriber in the
-same test process over a UCX loopback, `Frame` and `Credit` only, `DeliveryMode::Manual`, and
-no geometry changes, probes, leases, reconnects, relay, or RMA.
+| Criterion (§9.3) | Status | Test |
+|---|---|---|
+| **Single frame** — bytes arrive intact; `FrameView` fields match the published `FrameMetadata` | met | `A published frame arrives intact with its metadata` |
+| **Zero copy** — payload address lies inside the registered receive ring, no copy of payload size, by instrumentation not inspection | met | `The delivered payload lives in the registered receive ring` |
+| **Wraparound** — `4 × ring_depth` frames reuse every slot; slot `i` holds sequence `s` iff `s % ring_depth == i` | met | `Slots recycle: sequence s lands in slot s % ring_depth` |
+| **Lifetime under retention** — holding a view withholds exactly one credit; publisher stalls at `credit_window` and resumes on release | met | `A retained view withholds exactly one credit` |
+| **Out-of-order release** — `ack_sequence` advances only across the contiguous prefix | met | `Out-of-order release advances the ack only across the contiguous prefix` |
+| **Credit exhaustion** — `publish()` returns `CreditStalled`, `dropped_credit_stalled` increments, nothing blocks, no slot reused | met | `With every view retained, publish reports CreditStalled and never blocks` |
+| **Lease return** — `QueueFull` on a full publish queue **and the caller still holds a usable lease** | met | `A full publish queue returns QueueFull and leaves the lease usable` |
+| **ASan/UBSan clean** — whole suite under sanitizers, including teardown with views still outstanding | met | `Views outlive the subscriber that delivered them`; `pixi run test-asan` |
+
+**Exit condition met.** 118 ctest cases green under both a normal `-Werror` build and
+`-fsanitize=address,undefined`: 3 914 assertions in `tango-bulk-unit-tests`, 380 in
+`tango-bulk-ucx-tests`, 10 in `tango-bulk-tango-tests`.
+
+The zero-copy criterion is asserted two ways, because a pointer inside the ring does not by
+itself prove nothing was staged: `ring_contains()` is the address half and `bytes_copied()`
+the registration half, counting bytes that went through the eager path. For a
+rendezvous-sized frame it must stay at zero.
+
+Three defects found by running the criteria rather than by reading the code, all recorded
+here because each failure mode was reported a long way from its cause:
+
+- A **double free** of the `ucp_am_send_nbx` request — freed at the call site *and* in the
+  completion callback. UCX surfaced it as `arbiter.c:36 Assertion
+  'ucs_arbiter_group_is_empty(group)' failed` during endpoint teardown.
+- The **consumer never drained its in-flight rendezvous receives** before destroying its
+  worker, which produced the same arbiter assertion from a different direction (deviation 12).
+- A **heap-use-after-free** in the lease control block, found only under ASan (deviation 13).
+
+**One assumption carried forward, not a settled result.** The producer lease rule is built
+to §5.4 exactly as written: release is credit-driven, and local send completion frees the
+header context only — never the slot. That is what makes the rule hold uniformly across AM,
+RMA and the batched-flush variants. But §9.4's **P0-10** flush-amortization track has not
+run on hardware, and §10 lists this contract among the things that could still move. Treat
+`on_send_complete` not releasing the slot as an assumption under test, not as decided.
+
+## 8. What M0–M2 deliberately do not contain
+
+No Tango integration and no session lifecycle. No commands, no `DeviceProxy` client, no
+session manager, no lease timers or expiry, no geometry epochs, no probe, no reconnect, no
+relay, no RMA, no dispatch thread. `BulkSubscriber` is a declaration only; the transport
+engine behind it is `detail::SubscriberEngine` (deviation 2).
+
+The next slice is M3, session leases: renewal, expiry, the `Expiring` teardown of §4.2 as a
+per-session transition rather than a whole-publisher event, and more than one session at a
+time.

@@ -11,10 +11,14 @@
 
 add_library(
     tango-bulk-core
+    config.cpp
     credit_window.cpp
     enums.cpp
     errors.cpp
+    frame_view.cpp
     geometry.cpp
+    lease_pool.cpp
+    pinned_budget.cpp
     protocol.cpp
     session_id.cpp)
 add_library(tango-bulk::core ALIAS tango-bulk-core)

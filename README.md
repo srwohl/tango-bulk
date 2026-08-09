@@ -14,12 +14,20 @@ A device server opts in by linking a library and registering four ordinary Tango
 No cppTango ABI, event implementation, public class, IDL, build option, or upstream source
 file changes.
 
-> **Status: M1 — protocol core.** The wire protocol is complete and tested: all fifteen
-> message types encode and decode at their exact byte layouts, with geometry validation,
-> CSPRNG identifiers, and the credit window. There is still no transport and no Tango
-> integration — `BulkPublisher` and `BulkSubscriber` are declarations only, and the first
-> bytes move over UCX in M2. See [docs/EXTRACTION.md](docs/EXTRACTION.md) for exactly what
-> exists and what each test is worth.
+> **Status: M2 — the minimal vertical slice.** Bytes now move over UCX. A publisher and a
+> subscriber in one process carry a frame end to end — registered producer lease → engine
+> thread → self-contained frame → registered consumer slot → `FrameView` → credit on release
+> — with the payload landing in the registered receive ring without a copy. All eight of
+> §9.3's exit criteria pass, under a normal `-Werror` build and under
+> `-fsanitize=address,undefined`.
+>
+> Deliberately not here yet: no Tango integration and no session lifecycle. No commands, no
+> `DeviceProxy`, no session manager, lease timers, expiry, geometry epochs, probe, reconnect,
+> relay, RMA, or dispatch thread — `DeliveryMode::Manual` and `poll()` only. `BulkSubscriber`
+> is still a declaration; the transport engine behind it is `detail::SubscriberEngine`.
+> Session leases land in M3, the stock-Tango command adapter in M4. See
+> [docs/EXTRACTION.md](docs/EXTRACTION.md) for exactly what exists, which deviations from the
+> spec were taken deliberately, and what each test is worth.
 
 ## Specification
 

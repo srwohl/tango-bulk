@@ -8,7 +8,13 @@
 # is private to the engine, and is never returned by any accessor -- see
 # IMPLEMENTATION_SPEC.md 5.1.
 
-add_library(tango-bulk-ucx ucx_support.cpp)
+add_library(
+    tango-bulk-ucx
+    publisher_impl.cpp
+    registered_ring.cpp
+    subscriber_engine.cpp
+    ucx_context.cpp
+    ucx_support.cpp)
 add_library(tango-bulk::ucx ALIAS tango-bulk-ucx)
 
 target_include_directories(
