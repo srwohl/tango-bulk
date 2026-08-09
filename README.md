@@ -183,6 +183,76 @@ See [benchmarks/README.md](benchmarks/README.md) for the two-machine invocation 
 spike flags this deliberately does not have. Results go in
 [docs/THROUGHPUT.md](docs/THROUGHPUT.md).
 
+### What the numbers say so far
+
+On one host over shared memory / CMA, at `ring_depth` 32: **~5 GiB/s**, flat from 256 KiB to
+8 MiB frames, with **zero staged-copy bytes** at every size and no dropped frames.
+
+Two results there are worth more than the headline figure. Staged-copy bytes staying at zero
+is §9.3's zero-copy criterion holding on a real two-process session rather than in a unit
+test. And the rate being *flat* across a 32× size range means per-frame overhead — the credit
+round trip, the header encode, the session-table walk, the engine loop — costs nothing
+measurable; throughput is also flat as `credit_window` goes from 16 to 128, so the window is
+not the limiter either.
+
+**The absolute number is bounded by cache residency, not by this library, and it does not
+predict RDMA.** Over CMA the transfer is `process_vm_readv` — a single-threaded CPU copy that
+moves every payload byte twice. Throughput therefore decays monotonically with ring depth,
+with the knee exactly where the two rings stop fitting in this host's 18 MB L3:
+
+| Ring depth | Working set / side | Median (1 MiB frames) |
+|---|---|---|
+| 2 | 2 MiB | 10.91 GiB/s |
+| 8 | 8 MiB | 8.18 GiB/s |
+| 16 | 16 MiB | 4.10 GiB/s |
+| 32 | 32 MiB | 2.95 GiB/s |
+
+This is also why `ucx_perftest -t tag_bw` reports 18.0 GiB/s at 1 MiB on the same host and
+transport: it reuses a **single** buffer, so it measures the cache-resident top of that curve.
+At ring depth 2 — comparable working set — this library reaches 10.9 GiB/s. Comparing perftest
+against a realistic pinned ring is a category error. A deep ring is not overhead to optimise
+away; it is what lets a detector absorb a burst, and it is why §6.1 defaults to 32.
+
+On real hardware the DMA engine reads the publisher's ring and writes the subscriber's ring
+without a CPU copy and without occupying either cache, so the whole effect above is an
+artefact of the transport. `docs/THROUGHPUT.md` records the arithmetic, the four hypotheses
+ruled out by measurement, and the one bug this hunt found in the benchmark itself.
+
+### What is still missing for a real two-machine test
+
+Nothing in the library or the benchmark blocks it — `--role publisher` / `--role subscriber`
+with `--host` already works across hosts, and the coordination bytes travel over ordinary TCP.
+Two things that could have blocked it turn out not to: `RLIMIT_MEMLOCK` is read at startup and
+warned about before UCX can fail opaquely (`src/core/pinned_budget.cpp`), and a `rc_verbs`
+worker address is 72 bytes against §3.9's 4096-byte cap, so even a multi-rail host has room.
+
+What you have to supply:
+
+- **Two hosts with RDMA NICs and a link between them** — RoCE or InfiniBand. Without that UCX
+  falls back to `tcp` and the result describes TCP, not the design.
+- **The coordination port reachable** through any firewall (`--port`, default 18515).
+- **`RLIMIT_MEMLOCK` above `ring_depth × max_frame_bytes`** on both hosts — 256 MiB at the
+  8 MiB × 32 default. `ulimit -l` before blaming UCX.
+- **`UCX_NET_DEVICES`** if a host has more than one NIC, and `--tls` to pin the transport, so
+  a run cannot silently select a different path than the one being measured.
+
+What is missing in *this* repository, and what each gap costs:
+
+| Gap | Consequence |
+|---|---|
+| No remote orchestration — `pixi run bench` is a local pair only | Run the two roles by hand in two shells; there is no ssh runner |
+| Each role reports its own numbers | No combined report; collect from both terminals |
+| `--iters` only, no `--duration` | Cannot express "stream for 60 s", which is what a hardware soak wants |
+| No latency measurement at all | §9.4's **P0-7** (latency) cannot be answered; only aggregate rate is reported |
+| No CPU-time reporting | MVP_PLAN's M5 release gate asks for a throughput **and CPU** budget; the CPU half is unmeasured |
+| `engine_cpu_affinity` is declared in §2.3/§2.4 and read nowhere | The engine thread cannot be pinned, so **P0-11** (affinity, NUMA, one engine per rail) is out of reach — and it matters most exactly where it is missing, on a host whose NIC hangs off one socket |
+| No endpoint-error-mode knob | §6.3 allows `UCP_ERR_HANDLING_MODE_PEER` by configuration; **P0-14** asks whether it changes `rc`/`dc` selection, and there is no way to ask |
+| No RMA path (§3.2 Path B) | **P0-10** flush amortization remains unanswerable at any transport — see docs/THROUGHPUT.md |
+
+The first three are benchmark ergonomics and cheap. `engine_cpu_affinity` is a small fix that
+is currently a silently inert public field, which is worse than an absent one. The last is
+architectural and the spec places it well past M4.
+
 ## Design in one paragraph
 
 A publisher owns a registered ring of frame slots. The producer takes a slot with a
