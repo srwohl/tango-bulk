@@ -57,6 +57,7 @@ struct Options
     std::uint32_t credit_window{16};
     std::string tls;
     bool verify{false};
+    std::string fill{"each"};
     std::uint64_t corrupt_every{0};
     std::string stream{"bulk.bench"};
 };
@@ -75,6 +76,14 @@ void usage()
         "  --credit-window <n>    frames outstanding, <= ring-depth (16)\n"
         "  --tls <list>           pin UCX_TLS, e.g. rc_verbs,ud_verbs (unset)\n"
         "  --verify               checksum every payload; costs real bandwidth\n"
+        "  --fill each|once       each: regenerate the payload per frame (default),\n"
+        "                         which is honest but puts ~0.3 ms per 8 MiB of\n"
+        "                         pattern generation on the critical path. once:\n"
+        "                         fill every slot at startup and publish without\n"
+        "                         touching it again, which is both closer to a\n"
+        "                         detector DMA-ing into a slot and the only way to\n"
+        "                         get a transport number with no generation in it.\n"
+        "                         Implies no --verify.\n"
         "  --corrupt-every <n>    publisher: damage every nth frame before publish.\n"
         "                         The negative control for --verify: without it a\n"
         "                         checker that always passes looks identical to one\n"
@@ -121,6 +130,7 @@ Options parse(int argc, char **argv)
         else if(arg == "--credit-window") { options.credit_window = static_cast<std::uint32_t>(std::stoul(value(i))); }
         else if(arg == "--tls") { options.tls = value(i); }
         else if(arg == "--verify") { options.verify = true; }
+        else if(arg == "--fill") { options.fill = value(i); }
         else if(arg == "--corrupt-every") { options.corrupt_every = std::stoull(value(i)); }
         else if(arg == "--stream") { options.stream = value(i); }
         else { fail("unknown option " + arg); }
@@ -132,36 +142,81 @@ Options parse(int argc, char **argv)
         fail("--role must be publisher or subscriber");
     }
 
+    if(options.fill != "each" && options.fill != "once")
+    {
+        fail("--fill must be each or once");
+    }
+
+    // A slot filled once carries the same bytes every time it is reused, so a
+    // frame's identity is not in its payload and there is nothing to check
+    // against. Refusing beats reporting "0 mismatched" from a vacuous compare.
+    if(options.fill == "once" && options.verify)
+    {
+        fail("--fill once cannot be verified: the payload does not identify the frame");
+    }
+
     return options;
 }
 
-/// A pattern that depends on the frame index and the offset, so a payload
-/// delivered from the wrong slot, torn across a slot reuse, or truncated
-/// mid-transfer does not accidentally match.
-inline unsigned char pattern_byte(std::uint64_t frame, std::uint64_t offset) noexcept
+/// A pattern keyed on both the frame index and the position within the frame, so
+/// a payload delivered from the wrong slot, torn across a slot reuse, or
+/// truncated mid-transfer does not accidentally match.
+///
+/// Written a 64-bit word at a time, and that is not micro-optimisation.  The
+/// first version of this was a scalar byte loop, which ran at 5.9 GiB/s and so
+/// accounted for more than half of every measurement -- the benchmark was
+/// reporting a number about its own pattern generator.  This runs at ~25 GiB/s.
+/// It is still on the critical path, which is why `generation_seconds` below is
+/// measured and reported rather than hoped to be small.
+inline std::uint64_t pattern_word(std::uint64_t frame, std::uint64_t index) noexcept
 {
-    return static_cast<unsigned char>((frame * 2'654'435'761ull + offset * 31ull) & 0xFFull);
+    return (frame * 2'654'435'761ull) ^ (index * 0x9E37'79B9'7F4A'7C15ull);
 }
 
 void fill_pattern(void *data, std::uint64_t bytes, std::uint64_t frame) noexcept
 {
-    auto *p = static_cast<unsigned char *>(data);
-    for(std::uint64_t i = 0; i < bytes; ++i)
+    auto *words = static_cast<std::uint64_t *>(data);
+    const std::uint64_t whole = bytes / sizeof(std::uint64_t);
+
+    for(std::uint64_t j = 0; j < whole; ++j)
     {
-        p[i] = pattern_byte(frame, i);
+        words[j] = pattern_word(frame, j);
+    }
+
+    // Sizes are usually a multiple of 8, but a tail that was never written would
+    // be a hole the verifier could not see.
+    const std::uint64_t tail = bytes % sizeof(std::uint64_t);
+    if(tail != 0)
+    {
+        const std::uint64_t last = pattern_word(frame, whole);
+        std::memcpy(static_cast<unsigned char *>(data) + whole * sizeof(std::uint64_t), &last, tail);
     }
 }
 
 bool pattern_matches(const void *data, std::uint64_t bytes, std::uint64_t frame) noexcept
 {
-    const auto *p = static_cast<const unsigned char *>(data);
-    for(std::uint64_t i = 0; i < bytes; ++i)
+    const auto *words = static_cast<const std::uint64_t *>(data);
+    const std::uint64_t whole = bytes / sizeof(std::uint64_t);
+
+    for(std::uint64_t j = 0; j < whole; ++j)
     {
-        if(p[i] != pattern_byte(frame, i))
+        if(words[j] != pattern_word(frame, j))
         {
             return false;
         }
     }
+
+    const std::uint64_t tail = bytes % sizeof(std::uint64_t);
+    if(tail != 0)
+    {
+        const std::uint64_t last = pattern_word(frame, whole);
+        if(std::memcmp(static_cast<const unsigned char *>(data) + whole * sizeof(std::uint64_t),
+                       &last, tail) != 0)
+        {
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -222,10 +277,34 @@ int run_publisher(const Options &options)
         fail("session never armed: no ProbeAck within 10 s");
     }
 
+    if(options.fill == "once")
+    {
+        // Every slot gets its bytes before the clock starts, and the publish loop
+        // never touches a payload again. This is both the only way to get a rate
+        // with no pattern generation in it, and the closer analogue of a detector
+        // whose DMA engine put the frame there.
+        std::vector<BulkSource::Lease> all;
+        for(std::uint32_t i = 0; i < options.ring_depth; ++i)
+        {
+            BulkSource::Lease lease = publisher.source().try_acquire();
+            if(!lease)
+            {
+                fail("could not acquire every slot to pre-fill it");
+            }
+            fill_pattern(lease.data(), options.size, i);
+            all.push_back(std::move(lease));
+        }
+        // Destroying them returns every slot to the free list with its bytes
+        // intact: 5.4 says an unpublished lease releases its slot, not that it
+        // scrubs it.
+        all.clear();
+    }
+
     const std::uint64_t total = options.warmup + options.iters;
     std::uint64_t published = 0;
     std::uint64_t stalled = 0;
     std::uint64_t queue_full = 0;
+    double generation_seconds = 0.0;
     Clock::time_point start{};
 
     while(published < total)
@@ -252,7 +331,15 @@ int run_publisher(const Options &options)
             continue;
         }
 
-        fill_pattern(lease.data(), options.size, published);
+        if(options.fill == "each")
+        {
+            // Timed separately and reported, because this is the benchmark's own
+            // cost and not the library's. A harness that hides it reports its own
+            // memory bandwidth as a transport result.
+            const auto fill_start = Clock::now();
+            fill_pattern(lease.data(), options.size, published);
+            generation_seconds += std::chrono::duration<double>(Clock::now() - fill_start).count();
+        }
 
         if(options.corrupt_every != 0 && published % options.corrupt_every == 0)
         {
@@ -318,13 +405,28 @@ int run_publisher(const Options &options)
                     counters.frames_credited, total);
     }
     report_rate("publisher", options.iters, options.size, seconds);
+
+    // The measured rate includes whatever the loop spent generating payloads, so
+    // it is a floor on the harness rather than a statement about the transport.
+    // Both are printed: the difference is the correction, and stating it is what
+    // stops it being rediscovered later as a mystery.
+    if(options.fill == "each" && generation_seconds > 0.0)
+    {
+        const double share = 100.0 * generation_seconds / seconds;
+        std::printf("            payload generation %.3f s of %.3f s (%.0f%%)\n",
+                    generation_seconds, seconds, share);
+        report_rate("  ex-gen", options.iters, options.size,
+                    seconds > generation_seconds ? seconds - generation_seconds : seconds);
+    }
+
     std::printf("            submitted %" PRIu64 "  credited %" PRIu64 "  credit-stalled %" PRIu64
-                "  queue-full %" PRIu64 "  transport-errors %" PRIu64 "\n",
+                "  queue-full %" PRIu64 "  transport-errors %" PRIu64 "  fill %s\n",
                 counters.frames_submitted,
                 counters.frames_credited,
                 stalled,
                 queue_full,
-                counters.transport_errors);
+                counters.transport_errors,
+                options.fill.c_str());
 
     const std::vector<std::byte> close_request = oob.recv();
     oob.send(publisher.handle_coordination(close_request.data(), close_request.size()));
@@ -390,7 +492,7 @@ int run_subscriber(const Options &options)
                         {
                             ++short_frames;
                         }
-                        else if(options.verify &&
+                        else if(options.verify && options.fill == "each" &&
                                 !pattern_matches(view.data(), view.size(), view.event_counter()))
                         {
                             ++mismatched;

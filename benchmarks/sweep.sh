@@ -66,7 +66,8 @@ for size in $SIZES; do
         --stream bulk.sweep $TLS_ARG $EXTRA
 
     wait "$publisher" || echo "  (publisher exited non-zero)"
-    grep -E "^publisher +[0-9]|INCOMPLETE|^ +submitted" "/tmp/tbsweep.$port"
+    grep -E "^publisher +[0-9]|^ +ex-gen +[0-9]|payload generation|INCOMPLETE|^ +submitted" \
+        "/tmp/tbsweep.$port"
     rm -f "/tmp/tbsweep.$port"
     echo
 done

@@ -1,0 +1,51 @@
+# command: for depth in 2 4 8 16 32 64; do  (5 repetitions each)
+#              tango-bulk-bench --size 1048576 --iters 400 --warmup 60 \
+#                  --ring-depth $depth --credit-window min($depth,16) --fill once
+#          done
+# host:    Linux 7.0.0-28-generic x86_64, Intel Core Ultra 5 135H (14C/18T, 18 MB L3)
+# ucx:     1.22.0 (conda-forge); UCX_TLS unset -> self/sysv/posix/cma
+#
+# WHY THIS SWEEP EXISTS
+#
+# Throughput at a fixed frame size decays monotonically with ring depth, and the
+# knee is where the two rings stop fitting in L3. Over CMA the transfer is a
+# single-threaded CPU copy (process_vm_readv), so the rate is bounded by how fast
+# one core can copy -- which depends on whether source and destination are
+# cache-resident. It is not bounded by anything in this library.
+#
+# ucx_perftest reuses a single buffer and therefore reports the cache-resident
+# figure. That is why it looks 3-4x faster than a realistic pinned ring, and why
+# comparing the two directly is a category error.
+#
+# 5 repetitions per point because a laptop under sustained load is noisy: the
+# spread at small depths is wide and the absolute values drift downward across a
+# long sweep as the package heats. The trend is the result; the individual
+# numbers are not precise.
+#
+# ring  set/side   median   best    worst    (GiB/s)
+#    2     2 MiB    10.91   13.40    8.63
+#    4     4 MiB    11.50   12.15   10.66
+#    8     8 MiB     8.18    8.90    5.17      <- 8 MiB x 2 sides ~= 16 MiB ~ L3
+#   16    16 MiB     4.10    6.11    3.27      <- past L3, now DRAM-bound
+#   32    32 MiB     2.95    3.10    2.70
+#   64    64 MiB     3.08    3.28    2.86
+#
+# ucx_perftest -t tag_bw on the same host, same transport, for reference:
+#   1 MiB   19347 MB/s = 18.0 GiB/s   (one buffer, cache-resident)
+#   8 MiB   11258 MB/s = 10.5 GiB/s   (16 MiB working set, ~L3 sized)
+#
+# ARITHMETIC CHECK
+#
+# A CMA copy moves each payload byte twice (one read, one write) on one thread.
+#   DRAM-resident:  3 GiB/s payload  =  6.4 GB/s traffic  -- single-core memcpy range
+#   cache-resident: 11 GiB/s payload = 23.6 GB/s traffic  -- L3 bandwidth range
+# Both ends of the curve land where a single-threaded copy should. Nothing here is
+# unexplained, and nothing here is a property of the bulk path.
+#
+# WHAT THIS DOES NOT SAY
+#
+# On a real NIC the DMA engine reads the publisher's ring and writes the
+# subscriber's ring without a CPU copy and without occupying either cache. The
+# whole effect above is an artefact of CMA being a CPU copy, so none of it
+# predicts RDMA behaviour -- in either direction. A deep ring is what a detector
+# needs to absorb bursts, and on hardware it should not cost throughput this way.
