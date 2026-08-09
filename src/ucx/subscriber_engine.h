@@ -5,6 +5,7 @@
 #ifndef TANGO_BULK_SRC_UCX_SUBSCRIBER_ENGINE_H
 #define TANGO_BULK_SRC_UCX_SUBSCRIBER_ENGINE_H
 
+#include <ucx/locality.h>
 #include <ucx/registered_ring.h>
 #include <ucx/ucx_context.h>
 
@@ -205,6 +206,12 @@ class SubscriberEngine
         return bytes_copied_.load(std::memory_order_relaxed);
     }
 
+    /// Observed placement, valid once the state reaches `Active`.
+    const Locality &locality() const noexcept
+    {
+        return locality_;
+    }
+
   private:
     struct Pending;
 
@@ -291,6 +298,10 @@ class SubscriberEngine
     Protocol::StreamId stream_id_{0};
     Protocol::SessionId session_id_{};
     std::uint32_t generation_{0};
+    /// Where this subscriber's ring, NIC and engine landed.  Engine thread
+    /// writes it when the probe is answered; read for diagnostics only.
+    Locality locality_;
+
     std::uint32_t granted_depth_{0};
     std::uint64_t granted_frame_bytes_{0};
     std::uint32_t lease_ttl_ms_{0};

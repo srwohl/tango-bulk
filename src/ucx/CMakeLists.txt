@@ -10,7 +10,9 @@
 
 add_library(
     tango-bulk-ucx
+    locality.cpp
     publisher_impl.cpp
+    registered_memory.cpp
     registered_ring.cpp
     subscriber_engine.cpp
     ucx_context.cpp

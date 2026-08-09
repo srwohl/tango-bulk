@@ -15,6 +15,7 @@ include(Catch)
 
 add_executable(
     tango-bulk-unit-tests
+    unit/test_cpu_topology.cpp
     unit/test_credit_window.cpp
     unit/test_enums.cpp
     unit/test_errors.cpp

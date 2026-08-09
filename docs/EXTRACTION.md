@@ -369,6 +369,74 @@ The following arrived with M2.
     has never been observed to fail is not a verifier.
 
 
+25. **`engine_cpu_affinity` was a public field that nothing read; it works now, and the
+    placement it produces is observable.** §2.3 and §2.4 both declare
+    `int engine_cpu_affinity{-1}`, and through M3 no code referenced either. Setting it
+    returned `Status::Ok`, constructed cleanly, ran cleanly, and did nothing.
+
+    That is a worse failure than an unimplemented feature, and the difference is worth
+    stating: every other unimplemented thing here refuses in the caller's face —
+    `DeliveryMode::DispatchThread` throws, `declare_geometry()` returns `Internal`, `Query`
+    answers "not implemented before M4". A silent no-op on a field whose *only* purpose is to
+    influence measurements means a benchmark can be attributed to a configuration that was
+    never in effect. It is the same shape as `FINDINGS.md`'s warning that a missing flush
+    "shows up as a *faster* result".
+
+    Both engines now bind their own thread in `engine_loop()`, `-1` still means "leave it
+    alone", and a refusal is a warning rather than a failure — a restrictive cpuset or a
+    container can legitimately say no, and a device server must not fail to start because it
+    could not optimise itself. `validate()` rejects anything below `-1`, so a typo stops
+    reading as success.
+
+    **Placement is where the real risk was.** Pinning the thread does not move the ring:
+    `ucp_mem_map` faults and NUMA-places the pages during construction, on whatever thread
+    constructed the publisher, by first touch. Implementing only the thread half would have
+    produced thread affinity with the memory still on the far socket — measurable, plausible,
+    and wrong. So `src/ucx/locality.h` reports what actually happened: the transport and
+    device from `ucp_ep_query`, the NIC's node from `ucs_numa_node_of_device`, the ring's node
+    from one `get_mempolicy` syscall, the engine's CPU and node, and a verdict.
+
+    The verdict has three states, not two, and that was a correction made after the first
+    version reported `coherent=no` on every single-socket host: `SingleNode` (one node, nothing
+    to place), `Local`, `Split`, `Unknown`. Only `Split` warns. `Unknown` is the honest answer
+    for a software device such as Soft-RoCE's `rxe0`, which has no PCI parent and therefore no
+    NUMA node at all, and warning about it would train an operator to filter out the one
+    message that matters.
+
+    No `libnuma` and no `hwloc`: UCX links neither and answers the device-side questions from
+    its own sysfs walk, so adding either would cost the "stock packages only" property for
+    nothing.
+
+26. **`RegisteredMemory` split out of `RegisteredRing`, ahead of needing it.** A ring does two
+    unrelated jobs — acquire registered memory, and carve it into slots — and every foreseeable
+    change is to the first. §6.3 already names two acquisition modes (`UCP_MEM_MAP_ALLOCATE`
+    for a library-owned ring, `UCP_MEM_MAP_PARAM_FIELD_ADDRESS` for "the normal detector case"
+    of adopting a vendor ring), and dual-socket placement adds a third: allocate on a chosen
+    node, then register what we allocated.
+
+    All three differ only in how the base pointer and `ucp_mem_h` come to exist and who frees
+    them. None changes slot arithmetic, `contains()`, or a single call site in either engine.
+    So each is a `static` factory on a value type and nothing else — which is the whole point
+    of doing the split before the second mode exists rather than during it.
+
+    Only `ucx_allocated()` is implemented. The other two are named in a comment and
+    deliberately **not** declared: a declared factory that always throws advertises a
+    capability that is not there, which is the mistake in deviation 25 wearing different
+    clothes. A missing factory is a compile error at the call site, which is the loudest
+    failure available.
+
+    The mutual exclusion worth recording, because it is an easy trap: `UCP_MEM_MAP_ALLOCATE`
+    and a supplied address are not composable. With `ALLOCATE` set, UCX picks the address and
+    any address passed is a hint it may ignore — so allocating with `numa_alloc_onnode` and
+    *then* setting `ALLOCATE` registers UCX's memory and leaks the caller's. The `on_node()`
+    and `adopted()` factories must not set that flag.
+
+    What is deliberately absent: any rail-assignment policy. §10 defers "how a stream is
+    assigned to a rail (static, round-robin, NUMA-derived)" to M5 "with hardware in hand", so
+    building one now would be inventing exactly what the spec says not to invent yet. This
+    milestone observes; M5 decides.
+
+
 ## 5. M0 exit criteria
 
 | Criterion | Status | Evidence |

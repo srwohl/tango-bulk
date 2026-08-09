@@ -2,10 +2,12 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
+#include <ucx/locality.h>
 #include <ucx/registered_ring.h>
 #include <ucx/ucx_context.h>
 
 #include <core/bounded_queue.h>
+#include <core/cpu_topology.h>
 #include <core/credit_window.h>
 #include <core/lease_pool.h>
 
@@ -17,6 +19,7 @@
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -39,8 +42,12 @@ namespace TangoBulk
 namespace
 {
 
+using detail::allowed_cpu_count;
+using detail::bind_thread_to_cpu;
 using detail::BoundedQueue;
 using detail::CreditWindow;
+using detail::Locality;
+using detail::observe;
 using detail::LeasePool;
 using detail::RegisteredRing;
 using detail::UcxContext;
@@ -521,6 +528,24 @@ struct BulkPublisher::Impl
     /// flow.  Recorded in docs/EXTRACTION.md as a deliberate deviation.
     void engine_loop()
     {
+        // 2.3's engine_cpu_affinity, applied here and nowhere else: the thread has
+        // to bind itself, and this is the first thing it owns.  -1 means "leave it
+        // alone", which is the default because numactl, taskset, systemd's
+        // CPUAffinity= and a Slurm cpu-bind may all have placed this process
+        // already, and a library that pins itself anyway fights the deployment.
+        //
+        // A refusal is reported, not fatal.  A restrictive cpuset or a container
+        // can legitimately say no, and a device server must not fail to start
+        // because it could not optimise itself.
+        if(bind_thread_to_cpu(config.engine_cpu_affinity) != Status::Ok)
+        {
+            std::fprintf(stderr,
+                         "tango-bulk: warning: publisher could not pin its engine thread to "
+                         "CPU %d (%zu CPUs allowed); running unpinned.\n",
+                         config.engine_cpu_affinity,
+                         allowed_cpu_count());
+        }
+
         unsigned idle = 0;
         unsigned until_sweep = 0;
 
@@ -978,6 +1003,12 @@ struct BulkPublisher::Impl
             // current publish count rather than at zero.
             session->processed_ordinal = admitted.load(std::memory_order_acquire);
             refresh_gauges();
+
+            // Armed is the first moment the endpoint has settled on a transport
+            // and device, so it is the earliest this can be asked.  On the engine
+            // thread, which is the only thread whose CPU is worth sampling.
+            locality = observe(session->ep, ring.memory().base());
+            detail::report(locality, "publisher");
         }
     }
 
@@ -1290,6 +1321,10 @@ struct BulkPublisher::Impl
     std::mutex connect_mutex;
     std::condition_variable connect_done;
     std::vector<ConnectTask *> connect_queue;
+
+    /// Where this publisher's ring, NIC and engine actually landed.  Engine
+    /// thread writes it at arm; read for diagnostics only.
+    Locality locality;
 
     /// Serialises the coordination plane against itself.  Two Tango command
     /// threads may arrive at once; the engine never takes this lock on the frame

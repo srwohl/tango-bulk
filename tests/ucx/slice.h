@@ -7,6 +7,8 @@
 
 #include <ucx/subscriber_engine.h>
 
+#include <core/cpu_topology.h>
+
 #include <tango-bulk/publisher.h>
 
 #include <catch2/catch_test_macros.hpp>

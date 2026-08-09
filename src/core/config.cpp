@@ -139,6 +139,15 @@ Status PublisherConfig::validate() const noexcept
         return Status::RenewTooFrequent;
     }
 
+
+    // A negative value other than -1 is not "unpinned", it is a typo. Rejecting
+    // it is the difference between a field that is off and a field that is
+    // ignored -- see docs/EXTRACTION.md on engine_cpu_affinity.
+    if(engine_cpu_affinity < -1)
+    {
+        return Status::MalformedMessage;
+    }
+
     // 6.1: DropOldest is illegal on the producer ring.  A slot already handed to
     // UCX cannot be reclaimed, so offering the option would be offering
     // corruption -- silently, and only under load.
@@ -162,6 +171,15 @@ Status SubscriberConfig::validate() const noexcept
     if(delivery_queue_depth < k_min_delivery_queue || delivery_queue_depth > k_max_delivery_queue)
     {
         return Status::DepthTooLarge;
+    }
+
+
+    // A negative value other than -1 is not "unpinned", it is a typo. Rejecting
+    // it is the difference between a field that is off and a field that is
+    // ignored -- see docs/EXTRACTION.md on engine_cpu_affinity.
+    if(engine_cpu_affinity < -1)
+    {
+        return Status::MalformedMessage;
     }
 
     // Both drop policies are legal here: the delivery queue holds views the

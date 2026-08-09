@@ -401,3 +401,44 @@ TEST_CASE("A publisher admits no more sessions than it was configured for", "[m3
     close(publisher, b.session_id);
     close(publisher, c.session_id);
 }
+
+TEST_CASE("engine_cpu_affinity pins the engine, and the placement report proves it",
+          "[m3][placement]")
+{
+    // The regression guard for docs/EXTRACTION.md deviation 25. Before it,
+    // `engine_cpu_affinity` was a public field in 2.4 that nothing read: setting
+    // it returned Ok, constructed cleanly, ran cleanly, and did nothing. What
+    // makes that a bug rather than an omission is that no measurement could tell
+    // -- so this asserts the observable consequence, not the call.
+    const std::size_t cpus = detail::allowed_cpu_count();
+    if(cpus < 2)
+    {
+        SUCCEED("needs at least two permitted CPUs to tell pinned from unpinned");
+        return;
+    }
+
+    SubscriberConfig sub = subscriber_config();
+    sub.engine_cpu_affinity = 1;
+
+    BulkPublisher publisher(publisher_config());
+    detail::SubscriberEngine subscriber(sub);
+    open_session(publisher, subscriber);
+
+    const detail::Locality &where = subscriber.locality();
+
+    CHECK(where.engine_cpu == 1);
+
+    // The rest of the report has to be populated too, or a future change could
+    // satisfy the line above while the observation quietly stopped working.
+    CHECK_FALSE(where.transport.empty());
+    CHECK_FALSE(where.device.empty());
+    CHECK(where.host_nodes >= 1);
+
+    // Deliberately not asserted: which NUMA node anything is on, or that the
+    // placement is Local. Both depend on the host, and a test that demanded a
+    // particular topology would fail on the dual-socket machine this work is for.
+    CHECK(detail::to_string(where.placement()) != nullptr);
+
+    const std::vector<std::byte> request = subscriber.make_close_request(2);
+    publisher.handle_coordination(request.data(), request.size());
+}

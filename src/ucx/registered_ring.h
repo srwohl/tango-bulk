@@ -5,6 +5,7 @@
 #ifndef TANGO_BULK_SRC_UCX_REGISTERED_RING_H
 #define TANGO_BULK_SRC_UCX_REGISTERED_RING_H
 
+#include <ucx/registered_memory.h>
 #include <ucx/ucx_context.h>
 
 #include <cstddef>
@@ -17,6 +18,13 @@
 /// That matters on real hardware: registration is expensive, MR table entries
 /// are finite, and a per-slot registration would put a per-frame lookup on the
 /// data path for no benefit.
+///
+/// This class is now *only* slot geometry. Acquiring and owning the registered
+/// bytes belongs to `RegisteredMemory`, because that is the half every future
+/// change touches -- vendor-ring adoption (6.3) and NUMA-node placement both
+/// change where the region comes from and neither changes any of the arithmetic
+/// below. Keeping them apart is what makes those additions a new factory rather
+/// than a new parameter on this constructor and on both engines.
 namespace TangoBulk::detail
 {
 
@@ -32,8 +40,8 @@ class RegisteredRing
                    bool pad_stride,
                    std::uint64_t pinned_limit);
 
-    ~RegisteredRing();
-
+    /// No destructor: `RegisteredMemory` unmaps the region and returns its
+    /// pinned-budget reservation. Nothing else here owns anything.
     RegisteredRing(const RegisteredRing &) = delete;
     RegisteredRing &operator=(const RegisteredRing &) = delete;
 
@@ -59,7 +67,14 @@ class RegisteredRing
 
     std::uint64_t mapped_bytes() const noexcept
     {
-        return mapped_bytes_;
+        return memory_.bytes();
+    }
+
+    /// The registered region itself, for the placement report and for anything
+    /// that needs the `ucp_mem_h` rather than an offset into it.
+    const RegisteredMemory &memory() const noexcept
+    {
+        return memory_;
     }
 
     /// Whether `p` points inside this registered region.
@@ -79,14 +94,11 @@ class RegisteredRing
     static std::size_t compute_stride(std::uint64_t slot_bytes, bool pad) noexcept;
 
   private:
-    ucp_context_h context_{nullptr};
-    ucp_mem_h memh_{nullptr};
-    std::byte *base_{nullptr};
+    RegisteredMemory memory_;
+    std::byte *base_{nullptr}; ///< memory_.base(), cached: slot() is on the data path
     std::size_t slot_bytes_{0};
     std::size_t stride_{0};
     std::size_t depth_{0};
-    std::uint64_t mapped_bytes_{0};
-    bool reserved_{false};
 };
 
 } // namespace TangoBulk::detail

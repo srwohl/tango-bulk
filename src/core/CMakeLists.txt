@@ -12,6 +12,7 @@
 add_library(
     tango-bulk-core
     config.cpp
+    cpu_topology.cpp
     credit_window.cpp
     enums.cpp
     errors.cpp

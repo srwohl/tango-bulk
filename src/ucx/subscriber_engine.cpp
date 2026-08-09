@@ -4,7 +4,12 @@
 
 #include <ucx/subscriber_engine.h>
 
+#include <ucx/locality.h>
+
+#include <core/cpu_topology.h>
+
 #include <cassert>
+#include <cstdio>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -404,6 +409,18 @@ std::vector<std::byte> SubscriberEngine::make_close_request(std::uint64_t correl
 
 void SubscriberEngine::engine_loop()
 {
+    // 2.4's engine_cpu_affinity.  Same contract as the publisher's: -1 leaves the
+    // thread alone so a launcher-level placement is never fought, and a refusal is
+    // reported rather than fatal.
+    if(bind_thread_to_cpu(config_.engine_cpu_affinity) != Status::Ok)
+    {
+        std::fprintf(stderr,
+                     "tango-bulk: warning: subscriber could not pin its engine thread to "
+                     "CPU %d (%zu CPUs allowed); running unpinned.\n",
+                     config_.engine_cpu_affinity,
+                     allowed_cpu_count());
+    }
+
     unsigned idle = 0;
 
     while(running_.load(std::memory_order_acquire))
@@ -673,6 +690,12 @@ bool SubscriberEngine::send_pending_probe_ack()
     }
 
     probe_ack_pending_ = false;
+
+    // The endpoint has settled on a transport and device by now, and this runs on
+    // the engine thread, so it is both the earliest and the only correct place to
+    // sample where this subscriber landed.
+    locality_ = observe(endpoint_, arena_->ring().memory().base());
+    detail::report(locality_, "subscriber");
 
     // 4.1: `Probing` exits to `Active` here.  The publisher is not armed yet --
     // it arms when this ack lands -- but from this side the handshake is done.
