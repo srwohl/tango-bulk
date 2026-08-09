@@ -33,43 +33,107 @@ invocation.
 
 ## Single host, shared memory / CMA
 
-The library's own overhead and the correctness of the zero-copy path. **Not** a
-network result: both processes are on one machine, so UCX selects `cma` and the
-payload moves by `process_vm_readv`. Treat these as a floor on what the library
-costs, not as a transport measurement.
+**Read the section after this one before quoting any number here.** Over CMA the
+transfer is a single-threaded CPU copy, so these figures are bounded by one core's
+copy bandwidth and by cache residency — not by anything in this library, and not
+in a way that predicts RDMA.
 
-Raw output: [`../benchmarks/sweeps/2026-08-09-shm-cma.txt`](../benchmarks/sweeps/2026-08-09-shm-cma.txt)
+`--fill once`, so no payload generation is on the critical path. Median of three
+runs; a laptop under sustained load drifts downward as the package heats, so the
+spread is reported rather than hidden.
 
-| Frame | Frames | Subscriber | Publisher | Credit coalescing | Staged-copy bytes |
-|---|---|---|---|---|---|
-| 256 KiB | 400 | 3.285 GiB/s | 3.225 GiB/s | 1.2× | 0 |
-| 1 MiB | 400 | 3.142 GiB/s | 3.129 GiB/s | 1.0× | 0 |
-| 4 MiB | 400 | 3.123 GiB/s | 3.116 GiB/s | 1.0× | 0 |
-| 8 MiB | 400 | 3.277 GiB/s | 3.269 GiB/s | 1.0× | 0 |
+| Frame | Ring set / side | Median | Best | Worst |
+|---|---|---|---|---|
+| 256 KiB | 8 MiB | 5.90 GiB/s | 7.25 | 5.19 |
+| 1 MiB | 32 MiB | 5.05 GiB/s | 5.13 | 4.69 |
+| 4 MiB | 128 MiB | 5.31 GiB/s | 5.42 | 5.12 |
+| 8 MiB | 256 MiB | 5.24 GiB/s | 5.31 | 5.13 |
 
 ```text
 Date            2026-08-09
-Host            Linux 7.0.0-28-generic x86_64, Intel Core Ultra 5 135H
+Host            Linux 7.0.0-28-generic x86_64, Intel Core Ultra 5 135H (14C/18T, 18 MB L3)
 UCX             1.22.0 (conda-forge)
 UCX_TLS         unset -- UCX selected self/sysv/posix/cma
-Geometry        ring_depth 32, credit_window 16, iters 400, warmup 50
+Geometry        ring_depth 32, credit_window 16, iters 300, warmup 50, --fill once
 RLIMIT_MEMLOCK  1 975 696 KiB (~1.9 GiB), above the 256 MiB pinned at 8 MiB × 32
 Build           RelWithDebInfo, -Werror
 ```
 
-`credit-stalled 0`, `queue-full 0`, `transport-errors 0` and no dropped frames of
-any kind at every size.
+`credit-stalled` aside (a property of the benchmark's pacing, see below), no
+dropped frames of any kind and no transport errors at any size.
 
-Two things worth reading off this table rather than the headline number:
+Two results that do hold regardless of transport:
 
 - **Staged-copy bytes are zero at every size.** `bytes_copied()` counts payload
   that went through an eager staging copy, so a rendezvous-sized frame must leave
-  it at zero. This is §9.3's zero-copy criterion asserted on a two-process
-  session rather than in a unit test.
-- **Coalescing is 1.0× above 256 KiB**, and only rises when frames get small
-  enough that several are released between progress iterations. §3.12's
-  cumulative credit is what makes that ratio free when it happens; it is not a
-  tuning knob and a value of 1.0 is not a problem.
+  it at zero. This is §9.3's zero-copy criterion asserted on a two-process session
+  rather than in a unit test.
+- **Per-frame overhead is negligible across a 32× size range.** The rate is
+  effectively flat from 256 KiB to 8 MiB, which means the credit round trip, the
+  header encode, the session-table walk and the engine loop cost nothing
+  measurable per frame. The window is not the limiter either: throughput is flat
+  from `credit_window` 16 through 128.
+
+### The number is bounded by cache residency, not by this library
+
+Raw output: [`../benchmarks/sweeps/2026-08-09-ring-depth-cache.txt`](../benchmarks/sweeps/2026-08-09-ring-depth-cache.txt)
+
+At a fixed 1 MiB frame, throughput decays monotonically with ring depth, and the
+knee is exactly where the two rings stop fitting in this host's 18 MB L3. Five
+repetitions per point:
+
+| Ring depth | Working set / side | Median | Best | Worst |
+|---|---|---|---|---|
+| 2 | 2 MiB | 10.91 GiB/s | 13.40 | 8.63 |
+| 4 | 4 MiB | 11.50 GiB/s | 12.15 | 10.66 |
+| 8 | 8 MiB | 8.18 GiB/s | 8.90 | 5.17 |
+| 16 | 16 MiB | 4.10 GiB/s | 6.11 | 3.27 |
+| 32 | 32 MiB | 2.95 GiB/s | 3.10 | 2.70 |
+| 64 | 64 MiB | 3.08 GiB/s | 3.28 | 2.86 |
+
+`process_vm_readv` moves every payload byte twice — one read, one write — on a
+single thread, so the ceiling is one core's copy bandwidth against whichever level
+of the hierarchy the data lives in:
+
+```text
+DRAM-resident    3 GiB/s payload =  6.4 GB/s traffic   single-core memcpy range
+cache-resident  11 GiB/s payload = 23.6 GB/s traffic   L3 bandwidth range
+```
+
+Both ends land where a single-threaded copy should. Nothing is unexplained.
+
+### Why `ucx_perftest` looks three times faster
+
+On this host, same transport:
+
+| | `ucx_perftest -t tag_bw` | this library, ring 32 |
+|---|---|---|
+| 1 MiB | 19 347 MB/s = **18.0 GiB/s** | 5.05 GiB/s |
+| 8 MiB | 11 258 MB/s = **10.5 GiB/s** | 5.24 GiB/s |
+
+`ucx_perftest` reuses a **single** buffer, so its working set is cache-resident
+and it reports the top of the curve above. At ring depth 2 — a comparable working
+set — this library reaches 10.9 GiB/s median. Comparing perftest against a
+realistic pinned ring is a category error, and the 8 MiB row shows perftest
+falling toward the same place once its own working set reaches L3.
+
+A deep ring is not overhead to be optimised away: it is what lets a detector
+absorb a burst without dropping frames, and it is the reason §6.1 defaults
+`ring_depth` to 32.
+
+### Ruled out, each by measurement rather than argument
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Credit window too small to hide the round trip | window 16 → 32 → 64 → 128 | flat, 4.9–5.7 GiB/s |
+| `poll()`'s 50 µs idle sleep stalls the consumer | replaced with `yield()` | no change |
+| §6.2 slot-stride cache-set aliasing | power-of-two sizes vs +4 KiB | no effect at 4 or 8 MiB |
+| Benchmark's own payload generation | timed separately, then `--fill once` | **was** 54% of the measurement; fixed |
+
+The last one was real: `fill_pattern` began as a scalar byte loop at 5.9 GiB/s,
+so the first committed figures were mostly a statement about the harness. The
+flatness across frame size was the clue — a transport-bound curve rises with size
+as fixed overhead amortises.
 
 ## Single host, `rc_verbs` over Soft-RoCE
 
@@ -103,7 +167,8 @@ is lost (the frame was never assigned a sequence, and the next pass re-sends the
 same index; 220 of 220 were submitted and credited), but each refusal wastes a
 `memset` of the slot. It is a property of the benchmark's pacing, not of the
 library, and it is the reason the loop retries rather than counting a refusal as
-progress.
+progress. `--fill once` makes it more pronounced still, because the loop then has
+no per-frame work at all to slow it down.
 
 ## Not measured here
 
@@ -115,6 +180,11 @@ progress.
   the RMA path this library does not implement. It cannot be answered by this
   benchmark at any transport, and §10 still lists the §5.4 ownership contract
   among the things it could move. See `docs/EXTRACTION.md` §8.
+
+  One thing the sweeps above *do* bear on it: credit-based release shows no
+  measurable per-frame cost, and widening `credit_window` from 16 to 128 changes
+  nothing. So if batched flush later turns out to be required, the sizing headroom
+  to absorb it appears to be there. That is an encouraging sign, not a result.
 - **Two rails, CPU affinity, NUMA placement** (P0-11) and **`ucp_worker_fence`
   versus flush ordering** (P0-12). Both need hardware.
 - **Latency distribution.** The benchmark reports aggregate rate only. A
