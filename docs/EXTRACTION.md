@@ -25,10 +25,27 @@ Everything extracted comes from the cppTango prototype worktree at:
 ~2 020 lines of modification across 36 tracked files plus ~6 000 untracked lines. All spec
 references of the form `src/...` or `experiments/...` are relative to that worktree at `REV`.
 
-The normative contract is `cppTango/docs/bulk-stream/IMPLEMENTATION_SPEC.md`, with
-`DESIGN.md`, `MVP_PLAN.md`, `FINDINGS.md`, `THROUGHPUT.md`, and `M5_TEST_GUIDE.md` as
-companions. Where this repository and those documents disagree, the spec wins and this
-repository is wrong.
+### The contract was vendored at M3
+
+`IMPLEMENTATION_SPEC.md` and `MVP_PLAN.md` were copied into `docs/` from
+`cppTango/docs/bulk-stream/` at `REV` above and are **canonical here** from that point on.
+Their bodies are byte-identical to what was vendored, under a provenance header, so a diff
+against the source of record stays meaningful.
+
+The precedence rule inverted when that happened. Through M3 it read "where this repository and
+the spec disagree, the spec wins and this repository is wrong". It now reads: this repository
+owns the contract, and a change to `docs/IMPLEMENTATION_SPEC.md` is a deliberate commit to be
+reviewed as a contract change. The spec still supersedes `MVP_PLAN.md` on any point of detail.
+
+Not vendored, and still in the cppTango tree: `DESIGN.md` (architectural rationale, settled),
+`FINDINGS.md` (prototype-era hardware notes) and `M5_TEST_GUIDE.md` (needed at M5, not before).
+Links to them from the vendored documents do not resolve here. `THROUGHPUT.md` was deliberately
+**not** carried over — its figures came from `experiments/ucx-bulk-spike/`, which hand-rolled
+its own ring and protocol, so they describe code this repository does not contain.
+`docs/THROUGHPUT.md` is new and holds numbers produced by `benchmarks/` against the shipping
+library.
+
+Nothing in this repository requires a cppTango source tree to build, test, or measure.
 
 ## 2. Extraction map status
 
@@ -49,7 +66,7 @@ From `IMPLEMENTATION_SPEC.md` §8. "Extract" means the logic moves and gets clea
 | `src/idl_bulk/`, `BulkStreamCorrelator`, `BulkTopicCutover`, `bulk_topics.h`, `bulk_negotiation.*` | **retire** | — | not extracted, not referenced |
 | `TANGO_USE_UCX`, `configure/ucx.cmake` | **retire** | — | not extracted; cppTango gains no build option |
 | `tests/catch2_unit_bulk_*.cpp` (12 files) | mine for cases, do not port | `tests/unit/`, `tests/ucx/` | **done (M1/M2/M3)** — `test_vertical_slice.cpp` holds §9.3's eight criteria, `test_session_lifecycle.cpp` M3's |
-| `experiments/ucx-bulk-spike/*` | extract as the benchmark | `benchmarks/` | M2+; the spike keeps running unchanged on hardware in parallel |
+| `experiments/ucx-bulk-spike/*` | extract as the benchmark | `benchmarks/` | **done (M3)** — rewritten on the shipping API, not ported (deviation 23) |
 
 Two things the map deliberately does not do: it does not preserve the prototype's
 `AttributeValue_5` metadata derivation (metadata now comes from `FrameMetadata`), and it
@@ -316,6 +333,40 @@ The following arrived with M2.
     the purge list is always empty — which is why M2, M3, ASan, TSan and a 20-run soak all
     passed over it. It took running the suite over `rc_verbs` to surface, and it is the
     ordinary RDMA case rather than a Soft-RoCE artefact.
+
+
+23. **The benchmark was rewritten on the shipping API, not ported.** §8's map says "extract as
+    the benchmark", and `experiments/ucx-bulk-spike/` is 2 455 lines of which almost none
+    survives: `bulk_source.hpp` was already extracted into `registered_ring.cpp` at M2, the
+    negotiation is now `handle_coordination()`, and both data paths are now the library's. What
+    remains is `benchmarks/bulk_bench.cpp` driving `BulkPublisher` and `SubscriberEngine`
+    directly, plus `oob.h` — a length-prefixed TCP blob channel standing in for the Tango
+    command that carries coordination bytes in M4.
+
+    The point of the rewrite is that a number from it is a number about the shipping code.
+    Extracting the spike would have kept a second implementation of the data path alive, and a
+    benchmark measuring code nobody runs is worse than no benchmark.
+
+    Six spike flags are therefore absent rather than stubbed, because a flag that silently does
+    nothing is worse than a missing one: `--transport rma` and `--flush-every` (§3.2 Path B,
+    unimplemented), `--no-register`, `--progress-thread`, `--err-handling` and
+    `--prefix-bytes`. `benchmarks/README.md` tabulates why each is gone.
+
+    `zmq_baseline.cpp` was dropped. It was the comparison that justified starting the project,
+    not one that guides it, §8 retires the Tango event integration wholesale, and
+    `M5_TEST_GUIDE.md` does not ask for it. It remains in cppTango's history if a number is
+    ever wanted.
+
+24. **`--corrupt-every` is the verifier's negative control.** `FINDINGS.md` made a
+    receiver-side checksum plus "flush removed ⇒ checksums fail" a blocking prerequisite for
+    the RMA path, on the grounds that a missing flush shows up as a *faster* result — the one
+    failure mode that argues for shipping the broken thing. That specific control is an RMA
+    question this library cannot yet ask, but the general argument applies to any verification
+    claim, so `--verify` ships with a way to make it fail: `--corrupt-every N` damages one byte
+    of every *n*th frame, and the run is expected to report exactly `iters / n` mismatches.
+
+    Observed: 9 of 72 at `N=8` over CMA, 22 of 220 at `N=10` over `rc_verbs`. A verifier that
+    has never been observed to fail is not a verifier.
 
 
 ## 5. M0 exit criteria

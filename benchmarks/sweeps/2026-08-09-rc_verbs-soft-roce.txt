@@ -1,0 +1,26 @@
+# command: TLS=rc_verbs,ud_verbs SIZES=262144 ITERS=200 RING_DEPTH=16 \
+#          CREDIT_WINDOW=8 EXTRA=--verify pixi run bench
+# host:    Linux 7.0.0-28-generic x86_64, Intel Core Ultra 5 135H
+# device:  rxe0 -- Soft-RoCE (rdma_rxe) over wlp0s20f3, NOT RDMA hardware
+# ucx:     1.22.0 (conda-forge)
+#
+# A CORRECTNESS run. rdma_rxe is kernel software doing the copies a NIC
+# would do, so these timings describe the emulation and nothing else. Its
+# value is that a send genuinely stays posted to a queue pair here, which
+# is the only local way to exercise that path.
+
+# 2026-08-09T12:53:57Z  Linux 7.0.0-28-generic x86_64
+# ring_depth=16 credit_window=8 iters=200 warmup=20
+# UCX_TLS=rc_verbs,ud_verbs extra='--verify'
+--- 262144 B ---
+subscriber  ring 16 x 262144 B  window 8  pinned 4.0 MiB  verify on
+subscriber       200 frames     0.049 GiB    0.058 s     0.847 GiB/s      3468.8 frames/s
+            dropped: queue-full 0  bad-header 0  oversize 0  duplicate-seq 0  stale-epoch 0
+            credits 220 in 219 messages (1.0x coalescing)  staged-copy bytes 0
+            verified 220 frames: 0 mismatched, 0 wrong size
+publisher        200 frames     0.049 GiB    0.059 s     0.831 GiB/s      3405.0 frames/s
+            submitted 220  credited 220  credit-stalled 145  queue-full 0  transport-errors 0
+
+# --- negative control: same run with --corrupt-every 10 ---
+# Expect exactly 22 of 220 frames reported mismatched.
+            verified 220 frames: 22 mismatched, 0 wrong size

@@ -44,6 +44,7 @@ _configure = { cmd = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
     "-DBUILD_TESTING=ON",
     "-DTANGO_BULK_WARNINGS_AS_ERRORS=ON",
+    "-DTANGO_BULK_BUILD_BENCHMARKS=ON",
     "-DCMAKE_INSTALL_PREFIX=\"$CONDA_PREFIX\"",
     "-S.",
     "-Bbuild",
@@ -62,6 +63,7 @@ _configure-asan = { cmd = [
     "-DCMAKE_BUILD_TYPE=Debug",
     "-DBUILD_TESTING=ON",
     "-DTANGO_BULK_SANITIZERS=address,undefined",
+    "-DTANGO_BULK_BUILD_BENCHMARKS=ON",
     "-S.",
     "-Bbuild-asan",
 ] }
@@ -76,3 +78,23 @@ layering = "python3 scripts/check_layering.py"
 
 # Sanity check before benchmarking: which transports does this host actually have?
 ucx-info = "ucx_info -d"
+
+# The UCX suite over a real verbs transport.
+#
+# Everything else in this repository runs over shared memory or CMA, where a send
+# completes inside the call.  rc_verbs is the first configuration where a send
+# genuinely stays posted to a queue pair, and that difference alone found a
+# use-after-free that -Werror, ASan, TSan and a 20-run soak all passed over
+# (docs/EXTRACTION.md deviation 22).  It needs a verbs device: either RDMA
+# hardware or Soft-RoCE, which any recent kernel can provide:
+#
+#     sudo modprobe rdma_rxe
+#     sudo rdma link add rxe0 type rxe netdev <iface>
+#
+# Skips with a message rather than failing when no device is present, so it is
+# safe to put in CI before the hardware is.
+test-rdma = { cmd = "scripts/run_rdma_tests.sh", depends-on = ["build"] }
+
+# Two-process throughput and payload verification over the real library.
+# See benchmarks/README.md; results belong in docs/THROUGHPUT.md.
+bench = { cmd = "benchmarks/sweep.sh", depends-on = ["build"] }

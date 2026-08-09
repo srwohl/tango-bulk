@@ -1,0 +1,39 @@
+# command: SIZES="262144 1048576 4194304 8388608" ITERS=400 pixi run bench
+# host:    Linux 7.0.0-28-generic x86_64, Intel Core Ultra 5 135H
+# ucx:     1.22.0 (conda-forge); UCX_TLS unset, UCX selected self/sysv/posix/cma
+# build:   RelWithDebInfo, -Werror; RLIMIT_MEMLOCK 1975696 KiB
+#
+# Single host: both processes local, so this is shared memory / CMA and is
+# NOT a network result. Recorded as the floor on what the library costs.
+
+# 2026-08-09T12:53:38Z  Linux 7.0.0-28-generic x86_64
+# ring_depth=32 credit_window=16 iters=400 warmup=50
+# UCX_TLS=<unset, UCX chooses> extra=''
+--- 262144 B ---
+subscriber  ring 32 x 262144 B  window 16  pinned 8.0 MiB  verify off
+subscriber       400 frames     0.098 GiB    0.030 s     3.285 GiB/s     13454.7 frames/s
+            dropped: queue-full 0  bad-header 0  oversize 0  duplicate-seq 0  stale-epoch 0
+            credits 450 in 363 messages (1.2x coalescing)  staged-copy bytes 0
+publisher        400 frames     0.098 GiB    0.030 s     3.225 GiB/s     13207.7 frames/s
+            submitted 450  credited 450  credit-stalled 0  queue-full 0  transport-errors 0
+--- 1048576 B ---
+subscriber  ring 32 x 1048576 B  window 16  pinned 32.0 MiB  verify off
+subscriber       400 frames     0.391 GiB    0.124 s     3.142 GiB/s      3217.8 frames/s
+            dropped: queue-full 0  bad-header 0  oversize 0  duplicate-seq 0  stale-epoch 0
+            credits 450 in 448 messages (1.0x coalescing)  staged-copy bytes 0
+publisher        400 frames     0.391 GiB    0.125 s     3.129 GiB/s      3204.4 frames/s
+            submitted 450  credited 450  credit-stalled 0  queue-full 0  transport-errors 0
+--- 4194304 B ---
+subscriber  ring 32 x 4194304 B  window 16  pinned 128.0 MiB  verify off
+subscriber       400 frames     1.562 GiB    0.500 s     3.123 GiB/s       799.5 frames/s
+            dropped: queue-full 0  bad-header 0  oversize 0  duplicate-seq 0  stale-epoch 0
+            credits 450 in 450 messages (1.0x coalescing)  staged-copy bytes 0
+publisher        400 frames     1.562 GiB    0.501 s     3.116 GiB/s       797.7 frames/s
+            submitted 450  credited 450  credit-stalled 0  queue-full 0  transport-errors 0
+--- 8388608 B ---
+subscriber  ring 32 x 8388608 B  window 16  pinned 256.0 MiB  verify off
+subscriber       400 frames     3.125 GiB    0.954 s     3.277 GiB/s       419.4 frames/s
+            dropped: queue-full 0  bad-header 0  oversize 0  duplicate-seq 0  stale-epoch 0
+            credits 450 in 450 messages (1.0x coalescing)  staged-copy bytes 0
+publisher        400 frames     3.125 GiB    0.956 s     3.269 GiB/s       418.5 frames/s
+            submitted 450  credited 450  credit-stalled 0  queue-full 0  transport-errors 0

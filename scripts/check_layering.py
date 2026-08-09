@@ -100,6 +100,15 @@ RULES: tuple[Rule, ...] = (
         paths=("tests/ucx",),
         forbidden=NO_TANGO,
     ),
+    # The benchmark links tango-bulk-ucx and inherits its rule.  This is not
+    # bookkeeping: the whole point of the benchmark is that it runs on a machine
+    # with a NIC and no Tango database, and a stray tango/* include would take
+    # that away without breaking any test.
+    Rule(
+        name="benchmarks",
+        paths=("benchmarks",),
+        forbidden=NO_TANGO,
+    ),
 )
 
 

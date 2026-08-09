@@ -32,13 +32,23 @@ file changes.
 > is `detail::SubscriberEngine`. The stock-Tango command adapter is M4. See
 > [docs/EXTRACTION.md](docs/EXTRACTION.md) for exactly what exists, which deviations from the
 > spec were taken deliberately, and what each test is worth.
+>
+> The repository is self-contained: the normative spec, the plan, the benchmark and the
+> results all live here, and no cppTango source tree is needed to build, test or measure it.
 
 ## Specification
 
-The normative contract is `IMPLEMENTATION_SPEC.md` in the cppTango repository under
-`docs/bulk-stream/`: exact API, byte-level wire protocol, state machines, threading model,
-resource limits, and the extraction map. It supersedes `DESIGN.md` and `MVP_PLAN.md` on any
-point of detail. Where this repository disagrees with the spec, this repository is wrong.
+The normative contract is [docs/IMPLEMENTATION_SPEC.md](docs/IMPLEMENTATION_SPEC.md): exact
+API, byte-level wire protocol, state machines, threading model, resource limits, and the
+extraction map. [docs/MVP_PLAN.md](docs/MVP_PLAN.md) says in what order to build it. The spec
+supersedes the plan on any point of detail.
+
+Both were vendored from the cppTango bulk-stream prototype and are **canonical here** from
+that point on; the `REV` they came from is recorded in their headers and in
+[docs/EXTRACTION.md](docs/EXTRACTION.md). This repository owns the contract, so a change to
+the spec is a deliberate commit to be reviewed as a contract change — not, as it was through
+M3, an error in this repository to be corrected. Nothing in this repository requires a
+cppTango source tree to be present.
 
 ## Building
 
@@ -72,6 +82,7 @@ If you need to develop against an unreleased cppTango, install it to a prefix fi
 ## Layout
 
 ```text
+docs/                   the normative spec, the plan, results, provenance
 include/tango-bulk/     public API; the only headers a consumer sees
 src/core/               protocol, credit arithmetic, geometry.  libstdc++ only
 src/ucx/                the engine and registered memory.  ucp/* allowed
@@ -79,7 +90,8 @@ src/tango/              commands and DeviceProxy glue.  tango/* allowed
 tests/unit/             core only; no UCX device, no Tango database
 tests/ucx/              loopback UCX; no Tango process
 tests/tango/            stock-cppTango device fixture
-scripts/check_layering.py
+benchmarks/             two-process throughput and payload verification
+scripts/                layering check, verbs test runner
 ```
 
 ### The layering is enforced, not advisory
@@ -129,6 +141,47 @@ cmake -S . -B build-tsan -GNinja -DBUILD_TESTING=ON -DTANGO_BULK_SANITIZERS=thre
 cmake --build build-tsan --target tango-bulk-ucx-tests
 setarch -R ./build-tsan/tests/tango-bulk-ucx-tests
 ```
+
+### Run it over a verbs transport too
+
+```sh
+pixi run test-rdma   # UCX_TLS=rc_verbs,ud_verbs; skips if no device
+```
+
+Everything above runs over shared memory or CMA, where a send completes inside the call and
+the transport never has anything outstanding. `rc_verbs` is the first configuration where a
+send genuinely stays posted to a queue pair, and that difference alone found a use-after-free
+in publisher teardown that `-Werror`, ASan, TSan and a 20-run soak all passed over — see
+deviation 22. A configuration that finds a bug nothing else can should not depend on someone
+remembering to try it.
+
+It needs a verbs device, which does **not** mean it needs RDMA hardware. Soft-RoCE is enough
+for the semantics, and any recent kernel has it:
+
+```sh
+sudo modprobe rdma_rxe
+sudo rdma link add rxe0 type rxe netdev <iface>
+```
+
+Correct but slow: use it for correctness and never for throughput. `pixi run ucx-info` shows
+what a host actually offers.
+
+## Benchmarks
+
+```sh
+pixi run bench   # both roles locally, sweeping frame size
+```
+
+`benchmarks/tango-bulk-bench` moves frames between two processes through the same
+`BulkPublisher` and `SubscriberEngine` a device server links — nothing in the data path is
+reimplemented for the benchmark's convenience, which is what makes a number from it worth
+recording. `--verify` checks every payload against a position-dependent pattern, and
+`--corrupt-every N` is its negative control, because a checker that always passes is
+indistinguishable from one that works.
+
+See [benchmarks/README.md](benchmarks/README.md) for the two-machine invocation and for the
+spike flags this deliberately does not have. Results go in
+[docs/THROUGHPUT.md](docs/THROUGHPUT.md).
 
 ## Design in one paragraph
 
