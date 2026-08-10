@@ -45,6 +45,21 @@ RegisteredRing::RegisteredRing(UcxContext &context,
     // RegisteredMemory's, and this class is the arithmetic over it.
 }
 
+RegisteredRing::RegisteredRing(UcxContext &context,
+                               std::uint64_t slot_bytes,
+                               std::uint32_t depth,
+                               std::shared_ptr<void> receive_buffer,
+                               std::uint64_t receive_buffer_bytes,
+                               MemoryKind memory_kind) :
+    memory_(RegisteredMemory::adopted(
+        context, std::move(receive_buffer), receive_buffer_bytes, memory_kind)),
+    base_(memory_.base()),
+    slot_bytes_(static_cast<std::size_t>(slot_bytes)),
+    stride_(compute_stride(slot_bytes, false)),
+    depth_(depth)
+{
+}
+
 bool RegisteredRing::contains(const void *p) const noexcept
 {
     return memory_.contains(p);

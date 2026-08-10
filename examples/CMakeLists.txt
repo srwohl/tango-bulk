@@ -29,3 +29,22 @@ target_link_libraries(tango-bulk-example-preview PRIVATE tango-bulk::tango)
 
 add_executable(tango-bulk-example-client example_client/example_client.cpp)
 target_link_libraries(tango-bulk-example-client PRIVATE tango-bulk::tango)
+
+# GPUDirect is an optional example dependency, not a library dependency. The
+# subscriber accepts caller-owned accelerator memory without including CUDA.
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    add_executable(tango-bulk-example-cuda-client
+                   example_cuda_client/example_cuda_client.cpp)
+    target_include_directories(tango-bulk-example-cuda-client
+                               SYSTEM PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    if(CUDAToolkit_BIN_DIR STREQUAL "/usr/bin")
+        # A Conda compiler uses a sysroot and CMake otherwise drops /usr/include
+        # as an "implicit" host path, even though this system CUDA installation
+        # lives there.
+        target_compile_options(tango-bulk-example-cuda-client
+                               PRIVATE -idirafter/usr/include)
+    endif()
+    target_link_libraries(tango-bulk-example-cuda-client
+                          PRIVATE tango-bulk::tango CUDA::cudart)
+endif()

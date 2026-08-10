@@ -382,6 +382,7 @@ struct BulkPublisher::Impl
         Protocol::StreamId stream_id{0};
         std::uint64_t probe_token{0};
         Protocol::GeometryBlock geometry{};
+        MemoryKind receive_memory_kind{MemoryKind::Host};
 
         std::atomic<SessionState> state{SessionState::Unknown};
         std::atomic<std::uint64_t> deadline_ms{0};
@@ -780,6 +781,15 @@ struct BulkPublisher::Impl
         param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
         param.cb.send = &Impl::on_send_complete;
         param.user_data = &session;
+
+        // An accelerator receive buffer cannot be the destination of the eager
+        // fallback's host memcpy. Force rendezvous so UCX transfers directly
+        // into the registered device pointer.
+        if(session.receive_memory_kind != MemoryKind::Host)
+        {
+            param.op_attr_mask |= UCP_OP_ATTR_FIELD_FLAGS;
+            param.flags = UCP_AM_SEND_FLAG_RNDV;
+        }
 
         void *request = ucp_am_send_nbx(session.ep,
                                         Protocol::k_am_id_frame,
@@ -1676,6 +1686,7 @@ std::vector<std::byte> BulkPublisher::Impl::handle_open(const std::byte *data,
         session->stream_id = Protocol::generate_stream_id();
         session->probe_token = Protocol::generate_probe_token();
         session->geometry = geometry;
+        session->receive_memory_kind = request.requested_memory_kind;
         session->ep = endpoint;
         session->probe_sent = false;
         session->deadline_ms.store(now + config.lease_ttl_ms, std::memory_order_relaxed);

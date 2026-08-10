@@ -85,6 +85,49 @@ RegisteredMemory RegisteredMemory::ucx_allocated(UcxContext &context,
     return memory;
 }
 
+RegisteredMemory RegisteredMemory::adopted(UcxContext &context,
+                                           std::shared_ptr<void> owner,
+                                           std::uint64_t bytes,
+                                           MemoryKind memory_kind)
+{
+    RegisteredMemory memory;
+    memory.context_ = context.get();
+    memory.bytes_ = bytes;
+    memory.owner_ = std::move(owner);
+
+    ucs_memory_type_t ucx_memory_type = UCS_MEMORY_TYPE_HOST;
+    switch(memory_kind)
+    {
+    case MemoryKind::Host:
+        ucx_memory_type = UCS_MEMORY_TYPE_HOST;
+        break;
+    case MemoryKind::Cuda:
+        ucx_memory_type = UCS_MEMORY_TYPE_CUDA;
+        break;
+    case MemoryKind::Rocm:
+        ucx_memory_type = UCS_MEMORY_TYPE_ROCM;
+        break;
+    }
+
+    ucp_mem_map_params_t params;
+    std::memset(&params, 0, sizeof(params));
+    params.field_mask = UCP_MEM_MAP_PARAM_FIELD_ADDRESS | UCP_MEM_MAP_PARAM_FIELD_LENGTH |
+                        UCP_MEM_MAP_PARAM_FIELD_MEMORY_TYPE;
+    params.address = memory.owner_.get();
+    params.length = bytes;
+    params.memory_type = ucx_memory_type;
+
+    const ucs_status_t status = ucp_mem_map(memory.context_, &params, &memory.memh_);
+    if(status != UCS_OK)
+    {
+        memory.release();
+        throw_ucx_error("ucp_mem_map(adopted receive buffer)", status, "subscriber");
+    }
+
+    memory.base_ = static_cast<std::byte *>(memory.owner_.get());
+    return memory;
+}
+
 void RegisteredMemory::release() noexcept
 {
     if(memh_ != nullptr)
@@ -100,6 +143,7 @@ void RegisteredMemory::release() noexcept
     }
 
     base_ = nullptr;
+    owner_.reset();
 }
 
 RegisteredMemory::~RegisteredMemory()
@@ -112,7 +156,8 @@ RegisteredMemory::RegisteredMemory(RegisteredMemory &&other) noexcept :
     memh_(other.memh_),
     base_(other.base_),
     bytes_(other.bytes_),
-    reserved_(other.reserved_)
+    reserved_(other.reserved_),
+    owner_(std::move(other.owner_))
 {
     other.memh_ = nullptr;
     other.base_ = nullptr;
@@ -130,6 +175,7 @@ RegisteredMemory &RegisteredMemory::operator=(RegisteredMemory &&other) noexcept
         base_ = other.base_;
         bytes_ = other.bytes_;
         reserved_ = other.reserved_;
+        owner_ = std::move(other.owner_);
 
         other.memh_ = nullptr;
         other.base_ = nullptr;

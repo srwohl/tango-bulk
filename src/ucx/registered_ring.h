@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 /// A ring of frame slots inside **one** registered region.
 ///
@@ -40,10 +41,18 @@ class RegisteredRing
                    bool pad_stride,
                    std::uint64_t pinned_limit);
 
+    RegisteredRing(UcxContext &context,
+                   std::uint64_t slot_bytes,
+                   std::uint32_t depth,
+                   std::shared_ptr<void> receive_buffer,
+                   std::uint64_t receive_buffer_bytes,
+                   MemoryKind memory_kind);
+
     /// No destructor: `RegisteredMemory` unmaps the region and returns its
     /// pinned-budget reservation. Nothing else here owns anything.
     RegisteredRing(const RegisteredRing &) = delete;
     RegisteredRing &operator=(const RegisteredRing &) = delete;
+    RegisteredRing(RegisteredRing &&) noexcept = default;
 
     std::byte *slot(std::size_t index) const noexcept
     {

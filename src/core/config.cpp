@@ -182,6 +182,29 @@ Status SubscriberConfig::validate() const noexcept
         return Status::MalformedMessage;
     }
 
+    const bool has_receive_buffer = static_cast<bool>(receive_buffer);
+    if(has_receive_buffer != (receive_buffer_bytes != 0))
+    {
+        return Status::MalformedMessage;
+    }
+
+    if(!has_receive_buffer && receive_memory_kind != MemoryKind::Host)
+    {
+        return Status::MalformedMessage;
+    }
+
+    if(receive_memory_kind != MemoryKind::Host && receive_memory_kind != MemoryKind::Cuda &&
+       receive_memory_kind != MemoryKind::Rocm)
+    {
+        return Status::MalformedMessage;
+    }
+
+    if(has_receive_buffer &&
+       receive_buffer_bytes < max_frame_bytes * static_cast<std::uint64_t>(ring_depth))
+    {
+        return Status::ResourceExhausted;
+    }
+
     // Both drop policies are legal here: the delivery queue holds views the
     // application has not taken yet, and dropping the oldest of those is a
     // choice about which frames matter, not a memory-safety question.

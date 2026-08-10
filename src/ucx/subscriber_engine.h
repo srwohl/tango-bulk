@@ -58,7 +58,10 @@ class ReceiveArena : public CreditSink
     ReceiveArena(std::shared_ptr<UcxContext> context,
                  std::uint64_t slot_bytes,
                  std::uint32_t depth,
-                 std::uint64_t pinned_limit);
+                 std::uint64_t pinned_limit,
+                 std::shared_ptr<void> receive_buffer,
+                 std::uint64_t receive_buffer_bytes,
+                 MemoryKind memory_kind);
 
     /// 5.5: called from the lease destructor, on any thread.  Pushes and
     /// nothing else -- no blocking, no allocation, no UCX.

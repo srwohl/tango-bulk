@@ -61,13 +61,22 @@ void quarantine(std::unique_ptr<UcxWorker> worker, std::shared_ptr<UcxContext> c
 ReceiveArena::ReceiveArena(std::shared_ptr<UcxContext> context,
                            std::uint64_t slot_bytes,
                            std::uint32_t depth,
-                           std::uint64_t pinned_limit) :
+                           std::uint64_t pinned_limit,
+                           std::shared_ptr<void> receive_buffer,
+                           std::uint64_t receive_buffer_bytes,
+                           MemoryKind memory_kind) :
     context_(std::move(context)),
     // The receive ring never pads its stride: 6.2's extra page exists to break
     // cache-set aliasing on the *copy* the receiver would otherwise do, and this
     // path lands the payload in the slot directly.  It is the publisher's ring
     // that pays that tax.
-    ring_(*context_, slot_bytes, depth, false, pinned_limit),
+    ring_(receive_buffer ? RegisteredRing(*context_,
+                                          slot_bytes,
+                                          depth,
+                                          std::move(receive_buffer),
+                                          receive_buffer_bytes,
+                                          memory_kind)
+                         : RegisteredRing(*context_, slot_bytes, depth, false, pinned_limit)),
     slots_(depth),
     credit_returns_(static_cast<std::size_t>(depth) * 2),
     lease_pool_(std::make_shared<LeasePool>(static_cast<std::size_t>(depth) + 8))
@@ -149,7 +158,10 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
     arena_ = std::make_shared<ReceiveArena>(context_,
                                             config_.max_frame_bytes,
                                             config_.ring_depth,
-                                            config_.pinned_memory_limit_bytes);
+                                            config_.pinned_memory_limit_bytes,
+                                            config_.receive_buffer,
+                                            config_.receive_buffer_bytes,
+                                            config_.receive_memory_kind);
     sink_ = arena_;
 
     for(std::size_t i = 0; i < pending_.size(); ++i)
@@ -244,7 +256,7 @@ std::vector<std::byte> SubscriberEngine::make_open_request(std::uint64_t correla
     request.requested_max_frame_bytes = config_.max_frame_bytes;
     request.requested_ring_depth = config_.ring_depth;
     request.requested_credit_window = config_.credit_window;
-    request.requested_memory_kind = MemoryKind::Host;
+    request.requested_memory_kind = config_.receive_memory_kind;
     request.requested_transport = Protocol::Transport::ActiveMessage;
     request.drop_policy = config_.drop_policy;
     request.stream_name = config_.stream_name;
@@ -799,7 +811,9 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
     slot.fields.rank = frame.rank;
     slot.fields.quality = frame.quality;
     slot.fields.generation = frame.generation;
-    slot.fields.memory_kind = frame.memory_kind;
+    // FrameView describes the memory the application receives, not the
+    // publisher's source allocation. They differ for GPUDirect receives.
+    slot.fields.memory_kind = config_.receive_memory_kind;
     slot.fields.endian = frame.endian;
 
     if((param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) != 0)

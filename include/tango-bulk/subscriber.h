@@ -79,6 +79,15 @@ struct SubscriberConfig
     std::string ucx_tls;
     int engine_cpu_affinity{-1};
 
+    /// Optional caller-owned receive ring. When null, the subscriber allocates
+    /// its usual host ring. For CUDA/ROCm, supply a shared_ptr whose get() is the
+    /// device pointer and whose deleter releases it. The allocation must contain
+    /// at least max_frame_bytes * ring_depth bytes. Shared ownership keeps it
+    /// alive until every FrameView has been released, even after stop().
+    std::shared_ptr<void> receive_buffer;
+    std::uint64_t receive_buffer_bytes{0};
+    MemoryKind receive_memory_kind{MemoryKind::Host};
+
     Status validate() const noexcept;
 };
 
