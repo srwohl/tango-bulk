@@ -46,6 +46,14 @@ constexpr std::uint64_t k_width = 2048;
 constexpr std::uint64_t k_height = 2048;
 constexpr std::uint64_t k_frame_bytes = k_width * k_height * 2; ///< 8 MiB of u16
 
+enum class ConfigurationAttribute
+{
+    FrameWidth,
+    FrameHeight,
+    FrameRate,
+    FillPayload
+};
+
 class ExampleDetector : public TANGO_BASE_CLASS
 {
   public:
@@ -91,7 +99,7 @@ class ExampleDetector : public TANGO_BASE_CLASS
         acquisition_ = std::thread([this] { acquire(); });
 
         set_state(Tango::RUNNING);
-        set_status("publishing the 'image' bulk stream");
+        set_status("publishing the 'image' bulk stream; set frameRate to 0 for maximum speed");
     }
 
     void delete_device() override
@@ -113,6 +121,76 @@ class ExampleDetector : public TANGO_BASE_CLASS
         publisher_.reset();
     }
 
+    void read_configuration(Tango::Attribute &attribute, ConfigurationAttribute which)
+    {
+        switch(which)
+        {
+        case ConfigurationAttribute::FrameWidth:
+            width_read_ = static_cast<Tango::DevULong>(frame_width_.load());
+            attribute.set_value(&width_read_);
+            break;
+        case ConfigurationAttribute::FrameHeight:
+            height_read_ = static_cast<Tango::DevULong>(frame_height_.load());
+            attribute.set_value(&height_read_);
+            break;
+        case ConfigurationAttribute::FrameRate:
+            rate_read_ = frame_rate_.load();
+            attribute.set_value(&rate_read_);
+            break;
+        case ConfigurationAttribute::FillPayload:
+            fill_read_ = fill_payload_.load();
+            attribute.set_value(&fill_read_);
+            break;
+        }
+    }
+
+    void write_configuration(Tango::WAttribute &attribute, ConfigurationAttribute which)
+    {
+        if(which == ConfigurationAttribute::FrameRate)
+        {
+            Tango::DevDouble value;
+            attribute.get_write_value(value);
+            if(value < 0.0)
+            {
+                Tango::Except::throw_exception("InvalidFrameRate",
+                                               "frameRate must be >= 0; 0 means unlimited",
+                                               "ExampleDetector::write_configuration");
+            }
+            frame_rate_.store(value);
+            return;
+        }
+
+        if(which == ConfigurationAttribute::FillPayload)
+        {
+            Tango::DevBoolean value;
+            attribute.get_write_value(value);
+            fill_payload_.store(value);
+            return;
+        }
+
+        Tango::DevULong value;
+        attribute.get_write_value(value);
+        const std::uint64_t other = which == ConfigurationAttribute::FrameWidth
+                                        ? frame_height_.load()
+                                        : frame_width_.load();
+        if(value == 0 || static_cast<std::uint64_t>(value) > k_frame_bytes / 2 / other)
+        {
+            Tango::Except::throw_exception(
+                "InvalidFrameGeometry",
+                "frameWidth * frameHeight * sizeof(uint16_t) must be between 1 byte and 8 MiB",
+                "ExampleDetector::write_configuration");
+        }
+
+        if(which == ConfigurationAttribute::FrameWidth)
+        {
+            frame_width_.store(value);
+        }
+        else
+        {
+            frame_height_.store(value);
+        }
+    }
+
   private:
     /// Stand-in for a detector's acquisition loop.
     ///
@@ -126,6 +204,7 @@ class ExampleDetector : public TANGO_BASE_CLASS
         using namespace std::chrono_literals;
 
         std::uint64_t frame = 0;
+        auto next_frame = std::chrono::steady_clock::now();
 
         while(acquiring_)
         {
@@ -138,14 +217,23 @@ class ExampleDetector : public TANGO_BASE_CLASS
                 continue;
             }
 
-            // The DMA target a real driver would hand to its hardware.
-            std::memset(lease.data(), static_cast<int>(frame & 0xFF), k_frame_bytes);
+            const std::uint64_t width = frame_width_.load();
+            const std::uint64_t height = frame_height_.load();
+            const std::uint64_t frame_bytes = width * height * 2;
+
+            // The DMA target a real driver would hand to its hardware.  Turning
+            // fillPayload off is useful for measuring transport throughput
+            // without making memset the benchmark's limiting operation.
+            if(fill_payload_.load())
+            {
+                std::memset(lease.data(), static_cast<int>(frame & 0xFF), frame_bytes);
+            }
 
             FrameMetadata meta;
             meta.element_type = ElementType::UInt16;
             meta.rank = 2;
-            meta.shape[0] = k_height;
-            meta.shape[1] = k_width;
+            meta.shape[0] = height;
+            meta.shape[1] = width;
             meta.event_counter = frame;
 
             // Left at 0 so the library stamps it at publish.  A real detector
@@ -163,13 +251,66 @@ class ExampleDetector : public TANGO_BASE_CLASS
                 ++frame;
             }
 
-            std::this_thread::sleep_for(10ms); // ~100 Hz
+            const double rate = frame_rate_.load();
+            if(rate > 0.0)
+            {
+                const auto period = std::chrono::duration<double>(1.0 / rate);
+                next_frame += std::chrono::duration_cast<std::chrono::steady_clock::duration>(period);
+                const auto now = std::chrono::steady_clock::now();
+                if(next_frame > now)
+                {
+                    std::this_thread::sleep_until(next_frame);
+                }
+                else
+                {
+                    // Do not accumulate an ever-growing scheduling debt when
+                    // the requested rate is higher than the machine can sustain.
+                    next_frame = now;
+                }
+            }
+            else
+            {
+                next_frame = std::chrono::steady_clock::now();
+            }
         }
     }
 
     std::unique_ptr<BulkPublisher> publisher_;
     std::thread acquisition_;
     std::atomic<bool> acquiring_{false};
+
+    std::atomic<std::uint64_t> frame_width_{k_width};
+    std::atomic<std::uint64_t> frame_height_{k_height};
+    std::atomic<double> frame_rate_{100.0};
+    std::atomic<bool> fill_payload_{true};
+
+    Tango::DevULong width_read_{static_cast<Tango::DevULong>(k_width)};
+    Tango::DevULong height_read_{static_cast<Tango::DevULong>(k_height)};
+    Tango::DevDouble rate_read_{100.0};
+    Tango::DevBoolean fill_read_{true};
+};
+
+class ConfigurationAttr : public Tango::Attr
+{
+  public:
+    ConfigurationAttr(const char *attribute_name, long data_type, ConfigurationAttribute which) :
+        Tango::Attr(attribute_name, data_type, Tango::READ_WRITE),
+        which_(which)
+    {
+    }
+
+    void read(Tango::DeviceImpl *device, Tango::Attribute &attribute) override
+    {
+        static_cast<ExampleDetector *>(device)->read_configuration(attribute, which_);
+    }
+
+    void write(Tango::DeviceImpl *device, Tango::WAttribute &attribute) override
+    {
+        static_cast<ExampleDetector *>(device)->write_configuration(attribute, which_);
+    }
+
+  private:
+    ConfigurationAttribute which_;
 };
 
 class ExampleDetectorClass : public Tango::DeviceClass
@@ -190,6 +331,18 @@ class ExampleDetectorClass : public Tango::DeviceClass
         // CommandNames::with_prefix("Xyz") is the way out.
         install_bulk_commands(*this);
         // -----------------------------------------------------------------
+    }
+
+    void attribute_factory(std::vector<Tango::Attr *> &attributes) override
+    {
+        attributes.push_back(new ConfigurationAttr(
+            "frameWidth", Tango::DEV_ULONG, ConfigurationAttribute::FrameWidth));
+        attributes.push_back(new ConfigurationAttr(
+            "frameHeight", Tango::DEV_ULONG, ConfigurationAttribute::FrameHeight));
+        attributes.push_back(new ConfigurationAttr(
+            "frameRate", Tango::DEV_DOUBLE, ConfigurationAttribute::FrameRate));
+        attributes.push_back(new ConfigurationAttr(
+            "fillPayload", Tango::DEV_BOOLEAN, ConfigurationAttribute::FillPayload));
     }
 
     void device_factory(const Tango::DevVarStringArray *devices) override

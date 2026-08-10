@@ -121,9 +121,6 @@ bench = { cmd = "benchmarks/sweep.sh", depends-on = ["build"] }
 # deliberately no tasks for the servers themselves: a device server is what a
 # user of this library writes and launches, and hiding that behind a task would
 # hide the only part of the setup that is theirs.
-#
-# Port 11000, not the customary 10000, so a real local Tango installation and
-# this demo can coexist.
 db = { cmd = "PyDatabaseds --logging_level=2 2", env = { PYTANGO_DATABASE_NAME = "demo-tango.db" } }
 
 # Registers the two example servers.  Idempotent: --add-server overwrites the
@@ -142,4 +139,15 @@ db-clean = "rm -f demo-tango.db"
 [activation.env]
 # Every terminal in this environment -- the database, tango_admin, the example
 # servers started by hand -- has to agree on where the database is.
+#
+# The host half does more than name the database.  PyDatabaseds takes no endpoint
+# argument: it builds "giop:tcp:<host>:<port>" out of TANGO_HOST and hands that
+# to omniORB, so this name is also the interface the database *binds*.
+# "localhost" therefore binds loopback and nothing else -- correct for a demo on
+# one machine, unreachable from a second one.  For a client on another host,
+# change "localhost" here to this machine's own name and check with
+# `ss -ltnp | grep :11000` that it is no longer listening on ::1 alone.
+#
+# Port 11000, not the customary 10000, so a real local Tango installation and
+# this demo can coexist.
 TANGO_HOST = "localhost:11000"

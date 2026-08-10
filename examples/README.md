@@ -80,7 +80,7 @@ part you write and launch yourself, and the argument that matters is `demo`, the
 matches the registration above.
 
 ```sh
-export TANGO_HOST=localhost:11000     # already set inside `pixi shell`
+echo $TANGO_HOST                      # pixi sets it: <hostname>:11000
 
 ./build/examples/tango-bulk-example-device demo
 ./build/examples/tango-bulk-example-preview demo
@@ -91,8 +91,32 @@ Note what is gone compared with the `-nodb` form: no `-dlist`, no `-ORBendPoint`
 takes a plain device name. The database supplies all three.
 
 If a server exits with *device not defined in the database*, the instance name and the registration
-disagree; `tango_admin --check-device bulk/example/1` says which of the two is wrong. Port 11000 is
-used rather than the customary 10000 so that an existing local Tango installation keeps working.
+disagree; `tango_admin --check-device bulk/example/1` says which of the two is wrong.
+
+### About `TANGO_HOST`
+
+Port 11000 rather than the customary 10000, so an existing local Tango installation keeps working.
+
+The host half matters more than it looks. PyDatabaseds takes no endpoint argument — it builds one
+from `TANGO_HOST` and hands it to omniORB, so that name is also the interface the database *binds*.
+`TANGO_HOST=localhost:11000` binds loopback and nothing else:
+
+```console
+$ ss -ltnp | grep :11000
+LISTEN 0 128  [::1]:11000  [::]:*  users:(("PyDatabaseds",pid=1167360,fd=13))
+```
+
+That is correct for a demo on one machine, and unreachable from a second one. To run the client
+elsewhere, put this machine's own name in `TANGO_HOST` — edit it in `pixi.toml`, or override it in
+both terminals before starting anything:
+
+```sh
+export TANGO_HOST=$(hostname):11000
+```
+
+Then check `ss -ltnp | grep :11000` again: the database should no longer be listening on `::1`
+alone. Export the same value on the client machine. The bulk data plane makes its own connection and
+never goes through the database, so this only affects finding the device.
 
 Nothing in the extension depends on which of the two you use. The bulk data plane never goes through
 the database, and the coordination plane is three ordinary commands.
