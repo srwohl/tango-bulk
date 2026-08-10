@@ -98,6 +98,24 @@ server: an executable/instance pair, the class it exports, and the devices of th
 
 Re-running `db-setup` is harmless — `--add-server` replaces the entry.
 
+Configure the HDF5 device in the database before starting it. `Hdf5File` is required; the
+remaining properties are optional:
+
+```sh
+tango_admin --add-property bulk/hdf5/1 Hdf5File \
+    /ufs/bl31/controls/phantom/cb1_image/scan_0071/cb1_image0000.hdf5
+tango_admin --add-property bulk/hdf5/1 CacheMiB 512
+
+# Optional for a non-NeXus file or to override the acquisition timing:
+tango_admin --add-property bulk/hdf5/1 Hdf5Dataset \
+    /entry_0000/instrument/Areascan/data
+tango_admin --add-property bulk/hdf5/1 FrameRate 100
+```
+
+When `Hdf5Dataset` is absent, the server follows the NeXus `default` and `signal` attributes. When
+`FrameRate` is absent, it uses `exposure_time + latency_time`, falling back to 100 Hz. `CacheMiB`
+defaults to 512.
+
 Now start the servers by hand. There is no pixi task for them on purpose: a device server is the
 part you write and launch yourself, and the argument that matters is `demo`, the instance name that
 matches the registration above.
@@ -106,14 +124,17 @@ matches the registration above.
 echo $TANGO_HOST                      # pixi sets it: <hostname>:11000
 
 ./build/examples/tango-bulk-example-device demo
-./build/examples/tango-bulk-example-hdf5-device demo \
-    --hdf5-file /path/to/cb1_image0000.hdf5 --cache-mib 512
+./build/examples/tango-bulk-example-hdf5-device demo
 ./build/examples/tango-bulk-example-preview demo
 ./build/examples/tango-bulk-example-client bulk/example/1
 ```
 
 Note what is gone compared with the `-nodb` form: no `-dlist`, no `-ORBendPoint`, and the client
 takes a plain device name. The database supplies all three.
+
+If startup says it cannot connect to the Tango database, check that `TANGO_HOST` names the running
+database and that it is reachable. This happens before the device reads `Hdf5File` and is unrelated
+to HDF5 configuration.
 
 If a server exits with *device not defined in the database*, the instance name and the registration
 disagree; `tango_admin --check-device bulk/example/1` says which of the two is wrong.

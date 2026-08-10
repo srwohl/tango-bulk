@@ -35,6 +35,9 @@ struct Options
     std::string dataset;
     std::uint64_t cache_mib{512};
     std::optional<double> frame_rate;
+    bool file_from_command_line{false};
+    bool dataset_from_command_line{false};
+    bool cache_from_command_line{false};
 };
 
 Options options;
@@ -81,24 +84,29 @@ std::vector<char *> parse_options(int argc, char *argv[])
         {
             std::cout
                 << "HDF5 replay options:\n"
-                << "  --hdf5-file PATH       input NeXus/HDF5 file (required)\n"
+                << "  --hdf5-file PATH       override Hdf5File (mainly for -nodb)\n"
                 << "  --hdf5-dataset PATH    image stack; default follows NeXus default/signal\n"
                 << "  --cache-mib N          RAM used for whole cached frames (default 512)\n"
-                << "  --frame-rate HZ        replay rate; 0 is unlimited (default: file timing or 100)\n";
+                << "  --frame-rate HZ        replay rate; 0 is unlimited (default: file timing or 100)\n"
+                << "Database mode reads Hdf5File, Hdf5Dataset, CacheMiB, and FrameRate\n"
+                << "from device properties; command-line values take precedence.\n";
             std::exit(0);
         }
         if(argument == "--hdf5-file" || argument.rfind("--hdf5-file=", 0) == 0)
         {
             options.file = option_value(argument, "--hdf5-file", i, argc, argv);
+            options.file_from_command_line = true;
         }
         else if(argument == "--hdf5-dataset" || argument.rfind("--hdf5-dataset=", 0) == 0)
         {
             options.dataset = option_value(argument, "--hdf5-dataset", i, argc, argv);
+            options.dataset_from_command_line = true;
         }
         else if(argument == "--cache-mib" || argument.rfind("--cache-mib=", 0) == 0)
         {
             const std::string value = option_value(argument, "--cache-mib", i, argc, argv);
             options.cache_mib = std::stoull(value);
+            options.cache_from_command_line = true;
             if(options.cache_mib == 0)
             {
                 throw std::runtime_error("--cache-mib must be greater than zero");
@@ -120,10 +128,6 @@ std::vector<char *> parse_options(int argc, char *argv[])
         }
     }
 
-    if(options.file.empty())
-    {
-        throw std::runtime_error("--hdf5-file is required (use --hdf5-help for replay options)");
-    }
     return tango_arguments;
 }
 
@@ -384,8 +388,9 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
     void init_device() override
     {
         H5::Exception::dontPrint();
-        replay_ = std::make_unique<ReplayBuffer>(options);
-        frame_rate_.store(options.frame_rate.value_or(replay_->suggested_rate()));
+        configuration_ = read_configuration();
+        replay_ = std::make_unique<ReplayBuffer>(configuration_);
+        frame_rate_.store(configuration_.frame_rate.value_or(replay_->suggested_rate()));
         frame_width_read_ = replay_->frame_shape().back();
         frame_height_read_ = replay_->frame_shape().size() > 1
                                  ? replay_->frame_shape()[replay_->frame_shape().size() - 2]
@@ -413,7 +418,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         running_ = true;
         replay_thread_ = std::thread([this] { replay_loop(); });
         set_state(Tango::RUNNING);
-        set_status("replaying " + options.file + ":" + replay_->dataset_path() + "; " +
+        set_status("replaying " + configuration_.file + ":" + replay_->dataset_path() + "; " +
                    std::to_string(replay_->frame_count()) + " frames, " +
                    std::to_string(replay_->cached_capacity()) + " cached");
     }
@@ -465,6 +470,50 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
     }
 
   private:
+    Options read_configuration()
+    {
+        Options result = options;
+        if(Tango::Util::instance()->use_db())
+        {
+            Tango::DbData properties;
+            properties.emplace_back("Hdf5File");
+            properties.emplace_back("Hdf5Dataset");
+            properties.emplace_back("CacheMiB");
+            properties.emplace_back("FrameRate");
+            get_db_device()->get_property(properties);
+
+            if(!result.file_from_command_line && !properties[0].is_empty())
+                properties[0] >> result.file;
+            if(!result.dataset_from_command_line && !properties[1].is_empty())
+                properties[1] >> result.dataset;
+            if(!result.cache_from_command_line && !properties[2].is_empty())
+            {
+                Tango::DevULong64 value = 0;
+                if(!(properties[2] >> value))
+                    throw std::runtime_error("device property CacheMiB is not an unsigned integer");
+                result.cache_mib = value;
+            }
+            if(!result.frame_rate && !properties[3].is_empty())
+            {
+                double value = 0.0;
+                if(!(properties[3] >> value))
+                    throw std::runtime_error("device property FrameRate is not numeric");
+                result.frame_rate = value;
+            }
+        }
+
+        if(result.file.empty())
+        {
+            throw std::runtime_error(
+                "Hdf5File device property is required (or use --hdf5-file in -nodb mode)");
+        }
+        if(result.cache_mib == 0)
+            throw std::runtime_error("device property CacheMiB must be greater than zero");
+        if(result.frame_rate && (!std::isfinite(*result.frame_rate) || *result.frame_rate < 0.0))
+            throw std::runtime_error("device property FrameRate must be finite and >= 0");
+        return result;
+    }
+
     void replay_loop()
     {
         using namespace std::chrono_literals;
@@ -530,6 +579,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         }
     }
 
+    Options configuration_;
     std::unique_ptr<ReplayBuffer> replay_;
     std::unique_ptr<BulkPublisher> publisher_;
     std::thread replay_thread_;
