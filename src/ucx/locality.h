@@ -61,8 +61,20 @@ struct Locality
 
     /// UCX's names for what this endpoint chose. Empty if the endpoint could not
     /// be queried, which is normal before a session is armed.
+    ///
+    /// `transport` and `device` describe the **first** lane. `devices` lists every
+    /// lane, comma-separated, and `rails` counts them.
+    ///
+    /// Reporting only the first lane was a real defect, not a tidying-up: on a host
+    /// with two active 25 GbE ports this printed `device=mlx5_2:1` while rendezvous
+    /// was striping each frame across `mlx5_2` and `mlx5_3`. Measured against one
+    /// port the library looked like it was leaving half the fabric unused; it was
+    /// in fact at 96% of the aggregate. A placement report that cannot show the
+    /// second rail turns a correct result into a bug hunt.
     std::string transport;
     std::string device;
+    std::string devices;
+    unsigned rails{0};
 
     int memory_node{-1}; ///< NUMA node the registered ring's pages sit on
     int device_node{-1}; ///< NUMA node the NIC sits on

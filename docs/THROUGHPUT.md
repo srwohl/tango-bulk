@@ -170,11 +170,77 @@ library, and it is the reason the loop retries rather than counting a refusal as
 progress. `--fill once` makes it more pronounced still, because the loop then has
 no per-frame work at all to slow it down.
 
+## Two hosts, RDMA hardware, two rails
+
+The first figures on this page measured against a real NIC rather than shared
+memory or emulation, and the first that are bounded by a wire instead of by a
+CPU copy.
+
+| | Payload | Of one rail | Of both |
+|---|---|---|---|
+| `ib_write_bw`, 16 QP, one rail | 24.51 Gb/s | 100% | |
+| `ucx_perftest tag_bw`, one rail | 23.4 Gb/s | 95% | |
+| **this library, `rc_verbs`, two rails** | **47.9 Gb/s** = 5.580 GiB/s | | **96%** |
+| aggregate line rate | 49.0 Gb/s | | |
+
+```text
+Date            2026-08-10
+Hosts           hpcnode072 (publisher) -> hpcnode073 (subscriber)
+                48 cores, 512 GB, a single NUMA node -- confirmed from sysfs
+UCX             1.19.0, system /lib64, --enable-mt --with-verbs --with-mlx5
+UCX_TLS         rc_verbs,ud_verbs
+Fabric          RoCE over Ethernet. mlx5_2 + mlx5_3 ACTIVE at 25 GbE each;
+                mlx5_0 + mlx5_1 DOWN. Aggregate 50 Gb/s.
+Geometry        ring_depth 32, frame 1 MiB, credit_window 16, iters 10000,
+                --fill once, verify off
+Baselines       scripts/fabric-baseline.sh, pinned to one rail by UCX_NET_DEVICES
+```
+
+Ten-thousand-frame runs landed at 5.115 and 5.580 GiB/s; two-thousand-frame runs
+at 5.183 and 5.294, with a first-run outlier of 4.091 that did not recur. The
+~9% spread is engine placement: `engine_cpu` was observed at 6, 9, 12, 13, 15, 18,
+19 and 35 across runs, and `ucx_perftest` warned `CPU affinity is not set` on the
+same hosts. Nothing here is pinned, and at 96% of line rate there is not much
+left for pinning to recover.
+
+### Read the rail count before comparing anything
+
+The baselines above are pinned to **one** rail by `UCX_NET_DEVICES`; the library
+runs are not. UCX stripes a rendezvous transfer across up to `UCX_MAX_RNDV_RAILS`
+devices, 2 by default, so the library used both active ports and the baselines
+used one. Comparing them directly makes the library look like it is achieving
+twice a NIC's line rate, or — reading the same numbers the other way, which is
+what happened — like it is leaving half the fabric unused.
+
+`UCX_MAX_RNDV_RAILS=4` is not headroom on these hosts: only two ports are up.
+
+This is the reason `Locality` reports `rails=` and `devices=`. It previously named
+only the first lane, printing `device=mlx5_2:1` for a session striping across
+`mlx5_2` and `mlx5_3` — a placement report that cannot show the second rail turns
+a correct result into a bug hunt.
+
+### What `ud_verbs` costs, and why
+
+| Transport | Payload | Staged-copy bytes |
+|---|---|---|
+| `rc_verbs,ud_verbs` | 5.580 GiB/s | 0 |
+| `ud_verbs` only | 1.744 GiB/s | 2 202 009 600 |
+
+UD has no rendezvous path, so every byte went through an eager staging copy and
+throughput fell to 15 Gb/s — below the wire, and the only number on this page that
+is. This is the zero-copy criterion of §9.3 shown to be transport-conditional
+rather than always true: the same session, the same geometry, the same code, and
+`bytes_copied()` moving from zero to the entire payload when the transport cannot
+offer rendezvous.
+
 ## Not measured here
 
-- **RDMA hardware.** Every figure above is either shared memory or software
-  emulation. Nothing on this page is evidence about a real NIC, and no scaling
-  claim should be made from it.
+- **RDMA hardware beyond 25 GbE RoCE.** The two-rail section is a real NIC; the
+  CMA and Soft-RoCE sections above it are not, and remain evidence about a CPU copy
+  and a kernel emulation respectively. No scaling claim should cross between them —
+  in particular, the cache-residency curve that dominates the CMA figures has no
+  bearing on the RDMA ones, where the NIC DMAs and the CPU never touches a payload.
+  Nothing here says anything about 100 GbE, InfiniBand, or more than two rails.
 - **§9.4 P0-10, flush amortization.** The K sweep asks what a `ucp_ep_flush_nbx`
   costs when amortized over K frames, which is a question about §3.2's Path B —
   the RMA path this library does not implement. It cannot be answered by this
@@ -185,7 +251,12 @@ no per-frame work at all to slow it down.
   measurable per-frame cost, and widening `credit_window` from 16 to 128 changes
   nothing. So if batched flush later turns out to be required, the sizing headroom
   to absorb it appears to be there. That is an encouraging sign, not a result.
-- **Two rails, CPU affinity, NUMA placement** (P0-11) and **`ucp_worker_fence`
-  versus flush ordering** (P0-12). Both need hardware.
+- **NUMA placement** (part of P0-11). The two-rail section above is real hardware,
+  but both hosts have a single NUMA node, so `Split` placement has still never been
+  observed and the warning path in `locality.cpp` remains untested against a
+  machine that could trip it. Two rails is now measured; CPU affinity is measured
+  only as a source of variance, not as a control — nothing above was pinned.
+- **`ucp_worker_fence` versus flush ordering** (P0-12). Needs hardware, and the
+  RDMA hosts above are the first place it could be answered.
 - **Latency distribution.** The benchmark reports aggregate rate only. A
   percentile-level answer needs per-frame timestamps and a different harness.

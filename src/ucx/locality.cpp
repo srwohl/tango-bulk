@@ -8,6 +8,7 @@
 
 #include <ucs/memory/numa.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -107,6 +108,14 @@ std::string Locality::to_string() const
     out.reserve(160);
     out += "transport=" + (transport.empty() ? std::string("?") : transport) + ";";
     out += "device=" + (device.empty() ? std::string("?") : device) + ";";
+    // `nic_node` describes `device`, the first lane, so the rail count sits next
+    // to it: a reader who sees rails=2 knows the node number covers one of two,
+    // and a reader who sees rails=1 knows the report is complete.
+    out += "rails=" + (rails == 0 ? std::string("?") : std::to_string(rails)) + ";";
+    if(rails > 1)
+    {
+        out += "devices=" + devices + ";";
+    }
     out += "ring_node=" + number(memory_node) + ";";
     out += "nic_node=" + number(device_node) + ";";
     out += "engine_cpu=" + number(engine_cpu) + ";";
@@ -129,9 +138,12 @@ Locality observe(ucp_ep_h endpoint, const void *ring) noexcept
 
     if(endpoint != nullptr)
     {
-        // One entry is enough: with a single rail there is one lane that carries
-        // frames, and multi-rail selection is M5's question, not this report's.
-        std::array<ucp_transport_entry_t, 4> entries{};
+        // Every lane, not just the first. UCX stripes a rendezvous transfer over
+        // up to UCX_MAX_RNDV_RAILS devices (2 by default), so on a multi-port host
+        // the first entry names one of several NICs actually carrying the frame.
+        // 8 is past any rail count this library expects to meet; UCX writes back
+        // how many it filled.
+        std::array<ucp_transport_entry_t, 8> entries{};
 
         ucp_ep_attr_t attr;
         std::memset(&attr, 0, sizeof(attr));
@@ -140,16 +152,36 @@ Locality observe(ucp_ep_h endpoint, const void *ring) noexcept
         attr.transports.num_entries = static_cast<unsigned>(entries.size());
         attr.transports.entry_size = sizeof(ucp_transport_entry_t);
 
-        if(ucp_ep_query(endpoint, &attr) == UCS_OK && attr.transports.num_entries > 0)
+        if(ucp_ep_query(endpoint, &attr) == UCS_OK)
         {
-            const ucp_transport_entry_t &first = entries[0];
-            if(first.transport_name != nullptr)
+            locality.rails = std::min(attr.transports.num_entries,
+                                      static_cast<unsigned>(entries.size()));
+
+            for(unsigned i = 0; i < locality.rails; ++i)
             {
-                locality.transport = first.transport_name;
+                const ucp_transport_entry_t &entry = entries[i];
+                if(entry.device_name == nullptr)
+                {
+                    continue;
+                }
+                if(!locality.devices.empty())
+                {
+                    locality.devices += ",";
+                }
+                locality.devices += entry.device_name;
             }
-            if(first.device_name != nullptr)
+
+            if(locality.rails > 0)
             {
-                locality.device = first.device_name;
+                const ucp_transport_entry_t &first = entries[0];
+                if(first.transport_name != nullptr)
+                {
+                    locality.transport = first.transport_name;
+                }
+                if(first.device_name != nullptr)
+                {
+                    locality.device = first.device_name;
+                }
             }
         }
     }
@@ -176,8 +208,10 @@ void report(const Locality &locality, const char *origin) noexcept
     // Keyed on device plus verdict, so a fan-out publisher opening four sessions
     // over one NIC says this once, and a genuinely different placement still gets
     // its own line.
+    // Keyed on the whole rail set rather than the first lane, so a session that
+    // lands on a different set of NICs still gets its own line.
     const std::string key =
-        std::string(origin) + "/" + locality.device + "/" + to_string(verdict);
+        std::string(origin) + "/" + locality.devices + "/" + to_string(verdict);
 
     {
         const std::lock_guard<std::mutex> lock(mutex);
