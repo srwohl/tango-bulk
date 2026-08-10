@@ -29,6 +29,19 @@ catch2 = ">=3.1.1"
 # explicitly.  This is a property of the packaging, not of tango-bulk.
 cppzmq = "*"
 
+# The demo database.  PyDatabaseds is a pure-Python Tango database server backed
+# by SQLite, so the examples get a real database without MySQL, a service, or
+# root.  It is a demo convenience only: nothing in src/ or in the library's tests
+# needs a database.
+python = ">=3.11"
+pytango = ">=10.0"
+# The conda cpptango package ships libraries only, so tango_admin -- the tool the
+# registration step is written against -- comes from its own package.
+tango-admin = "*"
+
+[pypi-dependencies]
+pytango-db = "*"
+
 [tasks]
 # CMAKE_CXX_COMPILER is pinned explicitly.  conda's $CMAKE_ARGS sets the
 # archiver, linker and strip to the conda toolchain but leaves the compiler to
@@ -100,3 +113,33 @@ test-rdma = { cmd = "scripts/run_rdma_tests.sh", depends-on = ["build"] }
 # Two-process throughput and payload verification over the real library.
 # See benchmarks/README.md; results belong in docs/THROUGHPUT.md.
 bench = { cmd = "benchmarks/sweep.sh", depends-on = ["build"] }
+
+# --- the demo database -------------------------------------------------------
+#
+# `pixi run db` in one terminal, `pixi run db-setup` once in another, and then
+# the example servers are started by hand -- see examples/README.md.  There are
+# deliberately no tasks for the servers themselves: a device server is what a
+# user of this library writes and launches, and hiding that behind a task would
+# hide the only part of the setup that is theirs.
+#
+# Port 11000, not the customary 10000, so a real local Tango installation and
+# this demo can coexist.
+db = { cmd = "PyDatabaseds --logging_level=2 2", env = { PYTANGO_DATABASE_NAME = "demo-tango.db" } }
+
+# Registers the two example servers.  Idempotent: --add-server overwrites the
+# entry, so re-running it after a rename or a wiped database is safe.
+db-setup = { cmd = """
+    tango_admin --ping-database 30 &&
+    tango_admin --add-server tango-bulk-example-device/demo ExampleDetector bulk/example/1 &&
+    tango_admin --add-server tango-bulk-example-preview/demo PreviewDetector bulk/preview/1 &&
+    tango_admin --check-device bulk/example/1 &&
+    tango_admin --check-device bulk/preview/1
+""" }
+
+# Wipes the demo database.  The server holds it open, so stop `pixi run db` first.
+db-clean = "rm -f demo-tango.db"
+
+[activation.env]
+# Every terminal in this environment -- the database, tango_admin, the example
+# servers started by hand -- has to agree on where the database is.
+TANGO_HOST = "localhost:11000"

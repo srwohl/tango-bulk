@@ -8,3 +8,4 @@ compile_commands.json
 *.a
 *.so
 *.so.*
+demo-tango.db

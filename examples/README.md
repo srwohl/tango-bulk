@@ -47,13 +47,52 @@ bulk stream runs at 100, which is the ratio §7.5 exists to demonstrate.
 
 ## Running them with a database
 
-Register the server and its device the usual way (`tango_admin --add-server`, Jive, or a startup
-script), then drop `-nodb -dlist -ORBendPoint`:
+The database is [PyDatabaseds](https://gitlab.com/tango-controls/incubator/pytango-db), a
+pure-Python Tango database server backed by a single SQLite file. `pixi install` brings it in, so
+there is no MySQL, no system service and nothing to run as root; the whole database is
+`demo-tango.db` in the working directory, and deleting that file resets the demo.
+
+Two tasks, run once each. First terminal — leave it running:
 
 ```sh
+pixi run db
+```
+
+Second terminal, once, to register the servers and their devices:
+
+```sh
+pixi run db-setup
+```
+
+That waits for the database (`tango_admin --ping-database 30`) and then declares what
+[`tango_admin`](https://tango-controls.readthedocs.io/en/latest/tools/tango-admin.html) calls a
+server: an executable/instance pair, the class it exports, and the devices of that class.
+
+| Server | Class | Device |
+|---|---|---|
+| `tango-bulk-example-device/demo` | `ExampleDetector` | `bulk/example/1` |
+| `tango-bulk-example-preview/demo` | `PreviewDetector` | `bulk/preview/1` |
+
+Re-running `db-setup` is harmless — `--add-server` replaces the entry.
+
+Now start the servers by hand. There is no pixi task for them on purpose: a device server is the
+part you write and launch yourself, and the argument that matters is `demo`, the instance name that
+matches the registration above.
+
+```sh
+export TANGO_HOST=localhost:11000     # already set inside `pixi shell`
+
 ./build/examples/tango-bulk-example-device demo
+./build/examples/tango-bulk-example-preview demo
 ./build/examples/tango-bulk-example-client bulk/example/1
 ```
+
+Note what is gone compared with the `-nodb` form: no `-dlist`, no `-ORBendPoint`, and the client
+takes a plain device name. The database supplies all three.
+
+If a server exits with *device not defined in the database*, the instance name and the registration
+disagree; `tango_admin --check-device bulk/example/1` says which of the two is wrong. Port 11000 is
+used rather than the customary 10000 so that an existing local Tango installation keeps working.
 
 Nothing in the extension depends on which of the two you use. The bulk data plane never goes through
 the database, and the coordination plane is three ordinary commands.
