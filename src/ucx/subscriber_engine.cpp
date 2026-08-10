@@ -837,6 +837,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         {
             slot.occupied = false;
             transport_errors_.fetch_add(1, std::memory_order_relaxed);
+            state_.store(SubscriberState::Failed, std::memory_order_release);
             return UCS_OK;
         }
 
@@ -888,6 +889,11 @@ void SubscriberEngine::on_rndv_complete(void *request,
     {
         self->arena_->slot(pending->slot_index).occupied = false;
         self->transport_errors_.fetch_add(1, std::memory_order_relaxed);
+        // A failed rendezvous operation means the endpoint/QP is no longer a
+        // usable data path.  Tell the Tango control loop so BoundedRetry can
+        // retire this session and reconnect instead of reporting Active while
+        // no further frame or credit can move.
+        self->state_.store(SubscriberState::Failed, std::memory_order_release);
     }
     else
     {

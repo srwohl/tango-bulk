@@ -188,7 +188,9 @@ int main(int argc, char *argv[])
         const TangoBulk::SubscriberCounters counters = subscriber.counters();
         std::cout << "received=" << counters.frames_received
                   << " delivered=" << counters.frames_delivered
-                  << " credits_returned=" << counters.credits_returned << std::endl;
+                  << " credits_returned=" << counters.credits_returned
+                  << " transport_errors=" << counters.transport_errors
+                  << " reconnects=" << counters.reconnects << std::endl;
     }
     catch(const Tango::DevFailed &failure)
     {

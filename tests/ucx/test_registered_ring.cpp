@@ -1,0 +1,43 @@
+// SPDX-FileCopyrightText: 2026 Copyright contributors to the tango-bulk project
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+
+#include <ucx/registered_ring.h>
+#include <ucx/ucx_context.h>
+
+#include <tango-bulk/frame.h>
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+
+using namespace TangoBulk;
+using namespace TangoBulk::detail;
+
+TEST_CASE("caller-owned receive rings use the documented packed layout", "[ucx][ring]")
+{
+    // Deliberately not page-aligned, like the detector frame shape that exposed
+    // an out-of-bounds final CUDA slot when the implementation silently rounded
+    // each stride to 4 KiB. Keep the fixture small so it needs little memlock.
+    constexpr std::uint64_t slot_bytes = 5'000;
+    constexpr std::uint32_t depth = 16;
+    constexpr std::uint64_t arena_bytes = slot_bytes * depth;
+
+    std::shared_ptr<void> arena(
+        ::operator new(static_cast<std::size_t>(arena_bytes)),
+        [](void *pointer) { ::operator delete(pointer); });
+
+    UcxContext context("");
+    RegisteredRing ring(context,
+                        slot_bytes,
+                        depth,
+                        arena,
+                        arena_bytes,
+                        MemoryKind::Host);
+
+    CHECK(ring.stride() == slot_bytes);
+    CHECK(ring.slot(depth - 1) + slot_bytes ==
+          static_cast<std::byte *>(arena.get()) + arena_bytes);
+}

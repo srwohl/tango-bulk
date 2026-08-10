@@ -55,7 +55,12 @@ RegisteredRing::RegisteredRing(UcxContext &context,
         context, std::move(receive_buffer), receive_buffer_bytes, memory_kind)),
     base_(memory_.base()),
     slot_bytes_(static_cast<std::size_t>(slot_bytes)),
-    stride_(compute_stride(slot_bytes, false)),
+    // The public receive-buffer contract requires exactly slot_bytes * depth
+    // bytes. Caller-owned arenas are already allocated and cannot absorb the
+    // hidden page-rounding used for UCX-owned host rings. Pack their slots with
+    // no gaps; CUDA allocations do not require each destination to be page
+    // aligned.
+    stride_(static_cast<std::size_t>(slot_bytes)),
     depth_(depth)
 {
 }

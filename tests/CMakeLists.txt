@@ -35,7 +35,8 @@ catch_discover_tests(tango-bulk-unit-tests)
 
 # --- tests/ucx: loopback UCX, no Tango process -----------------------------
 
-add_executable(tango-bulk-ucx-tests ucx/test_session_lifecycle.cpp
+add_executable(tango-bulk-ucx-tests ucx/test_registered_ring.cpp
+                                    ucx/test_session_lifecycle.cpp
                                     ucx/test_ucx_support.cpp
                                     ucx/test_vertical_slice.cpp)
 
