@@ -100,6 +100,26 @@ RULES: tuple[Rule, ...] = (
         paths=("tests/ucx",),
         forbidden=NO_TANGO,
     ),
+    # The M4 fixture is a real device server and the tests drive it through a
+    # real DeviceProxy, so this directory may name Tango types.  What it must
+    # not do is reach past the adapter into the transport: the whole point of
+    # the fixture is that a device server sees encoded bytes and opaque
+    # handles, and a test that included ucp/* would be proving that for a
+    # program nobody ships.
+    Rule(
+        name="tests/tango",
+        paths=("tests/tango",),
+        forbidden=NO_UCX,
+    ),
+    # Same rule, and here it is the M4 exit criterion itself: "an example device
+    # and client use only installed cppTango public headers plus extension
+    # headers".  An example that included a UCX header would still build in this
+    # tree and would be wrong about what integrating the extension costs.
+    Rule(
+        name="examples",
+        paths=("examples",),
+        forbidden=NO_UCX,
+    ),
     # The benchmark links tango-bulk-ucx and inherits its rule.  This is not
     # bookkeeping: the whole point of the benchmark is that it runs on a machine
     # with a NIC and no Tango database, and a stray tango/* include would take

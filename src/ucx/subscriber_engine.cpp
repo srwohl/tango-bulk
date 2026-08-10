@@ -133,15 +133,12 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
             status, std::string("invalid SubscriberConfig: ") + to_string(status), "subscriber"});
     }
 
-    if(config_.delivery_mode != DeliveryMode::Manual)
-    {
-        // No dispatch thread yet: it belongs with the callback path in M4.
-        // Refusing beats silently creating a thread that does not exist.
-        throw BulkException(BulkError{Status::Internal,
-                                      "DeliveryMode::Manual only; the dispatch thread arrives "
-                                      "with the callback path",
-                                      "subscriber"});
-    }
+    // `delivery_mode` is deliberately not inspected here.  This class delivers
+    // by `poll()` and nothing else; whether a library-owned thread calls it or
+    // the application does is `BulkSubscriber`'s business, one layer up, which
+    // is also the layer that owns the `std::function` 5.2 keeps away from the
+    // engine.  A check here would only be able to refuse a mode this class has
+    // no opinion about.
 
     context_ = std::make_shared<UcxContext>(config_.ucx_tls);
     worker_ = std::make_unique<UcxWorker>(*context_);
@@ -1004,6 +1001,14 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
     out.transport_errors = transport_errors_.load(std::memory_order_relaxed);
     out.pinned_bytes = arena_->ring().mapped_bytes();
     return out;
+}
+
+std::unique_ptr<SubscriberTransport> make_subscriber_transport(SubscriberConfig config)
+{
+    // Declared in `core/subscriber_transport.h` and defined here, which is the
+    // point of the seam: `BulkSubscriber` constructs a transport without naming
+    // the concrete type, and therefore without compiling against `ucp/*`.
+    return std::make_unique<SubscriberEngine>(std::move(config));
 }
 
 } // namespace TangoBulk::detail

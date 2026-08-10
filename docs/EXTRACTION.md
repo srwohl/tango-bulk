@@ -88,9 +88,15 @@ this repository, extracted or not.
 | `src/core/credit_window.cpp` | `BulkStreamSupplier::SeqWindow` | Kept the base-plus-out-of-order-ahead invariant. `std::set<std::uint64_t> credited_ahead` → a fixed `ring_depth`-bit bitmap, so there is no allocation on the data path, and moved to the subscriber, which is the side that knows which views were released |
 
 Files with no prototype ancestor (new in this repository): `include/tango-bulk/errors.h`,
-`counters.h`, `limits.h`, `subscriber.h`, `tango.h`; `src/core/enums.cpp`, `errors.cpp`;
-`src/ucx/ucx_support.*`; `src/tango/registration.cpp`, `tango_support.*`; the build system;
-`scripts/check_layering.py`.
+`counters.h`, `limits.h`, `subscriber.h`, `tango.h`; `src/core/enums.cpp`, `errors.cpp`,
+`subscriber_transport.h`; `src/ucx/ucx_support.*`; the whole of `src/tango/`
+(`commands.cpp`, `proxy_client.cpp`, `registration.cpp`, `bulk_commands.h`,
+`tango_support.*`); `examples/`; the build system; `scripts/check_layering.py`.
+
+The Tango layer has no ancestor by construction, not by accident: §8 retires the prototype's
+Tango integration wholesale — `EventData::bulk_frame`, the `ZmqEvent*` hooks, the
+`DeviceProxy` overloads, the bulk IDL — and what replaced it shares no code with any of them.
+Four ordinary commands over `handle_coordination()` is the entire server-side surface.
 
 ## 4. Deviations from IMPLEMENTATION_SPEC.md
 
@@ -101,7 +107,7 @@ Recorded rather than silently taken. None changes a signature in §2.
    validators (rejecting an oversize request from the application). Neither should have to
    include the other, so the constants live in their own header.
 
-2. **`subscriber.h` forward-declares `Tango::DeviceProxy` instead of including `tango/*`.**
+2. **`subscriber.h` forward-declares `Tango::DeviceProxy` instead of including `tango/*`.** ✅ *closed in M4*
    §2.4 gives `BulkSubscriber` a `Tango::DeviceProxy &` constructor parameter, while §1
    places `subscriber_impl.cpp` in `src/ucx/`, which §1.1 forbids from seeing `tango/*`.
    A forward declaration is sufficient for a reference parameter and is what makes both
@@ -120,6 +126,22 @@ Recorded rather than silently taken. None changes a signature in §2.
    commands"). `BulkSubscriber` becomes a shell over the engine in M4, when there is a
    `DeviceProxy` to carry coordination.
 
+   **M4 built the second half.** The interface is `detail::SubscriberTransport` in
+   `src/core/subscriber_transport.h`: pure virtual, every method dealing in encoded bytes,
+   plain enums and `FrameView`. `SubscriberEngine` implements it; `BulkSubscriber` in
+   `src/tango/proxy_client.cpp` drives it and constructs one through
+   `make_subscriber_transport()` — a factory **declared in core and defined in the UCX
+   library**, which is the only part of the arrangement worth arguing about. The alternative
+   was a `#include <ucx/subscriber_engine.h>` in the Tango layer, and that is precisely the
+   include the layering rule exists to forbid.
+
+   The link edge that makes it work: `tango-bulk-tango` links `tango-bulk::ucx` **PRIVATE**,
+   so CMake records it as `$<LINK_ONLY:>`. A device server linking `tango-bulk::tango`
+   resolves `BulkPublisher` and the transport factory and inherits no UCX include directory,
+   because `UCX::ucp` is in turn PRIVATE to `tango-bulk-ucx`. `tests/tango/fixture_device.cpp`
+   and all three examples link only `tango-bulk::tango`, which is what keeps that claim
+   tested rather than asserted.
+
 3. **`FrameView::Fields` is public, not private.** §2.2 shows it private with
    `detail::ReceiveSlotLease` as the only friend. It is public here because the receive path
    populates one per slot and would otherwise need a friend declaration per implementation
@@ -133,7 +155,7 @@ Recorded rather than silently taken. None changes a signature in §2.
 5. **`install_bulk_commands()`, `attach_publisher()` and `detach_publisher()` are declared
    but not defined** until M4. Declaring them keeps §7.2's normative API visible; leaving
    them undefined means an attempt to use them fails at link time rather than at runtime in
-   a device server. They are deliberately not stubbed to throw.
+   a device server. They are deliberately not stubbed to throw. ✅ *all three defined in M4.*
 
 6. **`DropPolicy` is declared in `frame.h`, not `publisher.h`.** §2.3 puts it in
    `publisher.h`, but §3.5 puts it on the wire in `Open`, so `protocol.h` needs it — and
@@ -192,6 +214,18 @@ The following arrived with M2.
     `Query` remains unimplemented and answers `"not implemented before M4"`, because
     MVP_PLAN.md puts `BulkQuery` with the Tango adapter. The handler exists and gives a
     protocol-legal reply rather than dropping the message.
+
+    **Closed in M4.** `handle_query()` answers both halves of §3.8: an all-zero `session_id`
+    asks for server-wide status, a quoted one asks about a session, and an identifier this
+    publisher does not hold is `UnknownSession` — the same answer §3.7 gives a `Renew`, so an
+    operator's `Query` and a client's `Renew` cannot disagree about whether a session exists.
+    The `key=value;` blob carries counters, configured bounds, and identifiers only in §3.2's
+    truncated form; a UCX address or a memory key would be a §3.8 violation and the UCX tests
+    assert their absence.
+
+    The default arm of the dispatcher changed with it. It used to say "not implemented before
+    M4"; it now answers `MalformedMessage` and counts the message, because everything left is
+    a *reply* type and a publisher never receives one.
 
 12. **The consumer has a teardown order, and §4.2 does not give it one.** §4.2 fixes the
     publisher's `Expiring` order and says it MUST NOT be reordered. Nothing states the
@@ -316,6 +350,17 @@ The following arrived with M2.
     `SessionExpired` and `UnknownSession` move the subscriber to `Failed`. MVP_PLAN.md puts
     "negotiate, renew, close, and reopen sessions" in M4's client.
 
+    **Closed in M4**, and both threads landed in `BulkSubscriber` rather than in the engine.
+    The control thread owns the renew timer, the reconnect policy and every `DeviceProxy`
+    call; the dispatch thread owns the two user callbacks. The engine gained neither, which
+    is what keeps §5.2 structural: it still holds no `std::function` and still has no code
+    path from `ucp_worker_progress()` to user code.
+
+    The renew loop waits in 100 ms quanta against a deadline rather than sleeping for a whole
+    interval, so a transport failure is noticed in a tenth of a second instead of a third of
+    a lease. `RenewTooFrequent` is treated as healthy — §3.7 does not shorten the lease as a
+    penalty, so the only correct response is to renew less often.
+
 22. **The publisher destroys its `ucp_worker` explicitly, before any other member.**
     `ucp_worker_destroy` does not merely abandon outstanding sends — it purges them by
     *invoking their completion callbacks* (`uct_rc_txqp_purge_outstanding`, status
@@ -435,6 +480,87 @@ The following arrived with M2.
     assigned to a rail (static, round-robin, NUMA-derived)" to M5 "with hardware in hand", so
     building one now would be inventing exactly what the spec says not to invent yet. This
     milestone observes; M5 decides.
+
+The following arrived with M4.
+
+27. **`set_command_names()` is a free function in `<tango-bulk/tango.h>`, not a
+    `SubscriberConfig` field.** A client pointed at a device whose commands carry a prefix has
+    to know the prefix, and §2.4's `SubscriberConfig` has nowhere to put it. Adding a field
+    there was the obvious move and is wrong: `subscriber.h` is compiled by the UCX layer,
+    which §1.1 forbids from knowing anything Tango-shaped, and `CommandNames` is exactly that.
+
+    So the knob lives in the Tango header, takes the subscriber by reference, and is a
+    `friend` declared in `subscriber.h` against a forward-declared `struct CommandNames`. A
+    forward declaration costs nothing and pulls in no header. It throws after `start()`,
+    because the session was opened with the old names and renaming them would leave no way to
+    renew or close it.
+
+28. **`bulk_query()` and `BulkQueryResult` added.** MVP_PLAN M4 asks the server to "expose
+    optional `BulkQuery` status" and §2 defines no client-side shape for reading it. A caller
+    would otherwise have to encode a `QueryRequest`, call `command_inout` and decode a
+    `QueryReply` by hand — three steps whose only interesting part is the middle one.
+
+    It asks the server-wide question only. §3.8's other half, a `Query` naming one session,
+    needs a `session_id` that no public API hands out; that path is covered in `tests/ucx/`,
+    where the test decodes the `OpenReply` itself. Inventing a public accessor for a session
+    identifier to make one function symmetrical would have been a worse trade.
+
+29. **A command checks that the message matches the door it came through.** §7.1 says all four
+    commands take an encoded coordination message and return an encoded reply, and does not
+    say what happens when a `Close` body arrives at `BulkOpen`. Both are `DevVarCharArray`
+    commands, so nothing below the protocol can tell them apart, and dispatching purely on
+    `msg_type` would have quietly done what the body asked for.
+
+    Refusing with `MalformedMessage` means the name a client called is always the name of the
+    thing that happened, which is what makes a device's black box readable after a fault.
+
+30. **`detach_publisher()` takes an exclusive lock and waits.** §7.2 describes it as the
+    third of three lines and says nothing about concurrency, but the statement after it in
+    every device server is the one that destroys the publisher. So the registry is a
+    `shared_mutex`: a command holds it shared for the whole of `handle_coordination()`, and
+    `detach_publisher()` returns only once no command is inside one.
+
+    Tango's default SERIAL_BY_DEVICE model very nearly makes this unnecessary. "Very nearly"
+    is not a memory-safety argument, and the model is the device server's to change.
+
+31. **The fixture device server exports with an explicit CORBA object name.** Not a deviation
+    from the spec — a property of cppTango worth recording, because it cost an hour.
+    `DeviceClass::export_device(dev)` defaults its second argument to the literal string
+    `"Unused"`, and with `-nodb` that string *becomes the CORBA object key*. Every device in
+    the server is then published under one name and none is reachable: a `DeviceProxy` gets
+    `OBJECT_NOT_EXIST_NoMatch`, from a server that started cleanly and answers on its dserver
+    device. `export_device(dev, dev->get_name().c_str())` is the fix, and the examples do the
+    same.
+
+    Also recorded because it wastes the same hour twice: `Util::init()` replaces
+    `std::cout`'s streambuf with cppTango's logging one, so a readiness line printed to stdout
+    after that point never reaches a parent process. The fixture writes it to inherited
+    descriptor 3 instead.
+
+32. **The transport slot is a handshake, and the first version of it starved.** The dispatch
+    thread borrows the transport, polls it for 20 ms, gives the borrow back, and immediately
+    borrows again — that loop *is* its body. The control thread, replacing the transport on a
+    reconnect, waited for the borrow count to reach zero. Both are correct in isolation and
+    together they hang: the waiter is notified after the count drops, has to reacquire the
+    mutex to observe it, and loses that race to a thread that is already running and takes the
+    same mutex a microsecond later. Repeatedly.
+
+    The symptom was nothing like the cause. A subscriber whose stream was taken away stayed
+    `Active` forever: one renewal sent, one renewal failed, and then silence — because the
+    control thread never got past `close_session()` to say `Reconnecting`. It reproduced about
+    half the time, which is exactly the frequency that gets a test marked flaky and retried.
+
+    The fix is a `swapping` flag that `borrow()` refuses on, so the door closes before the
+    waiter starts waiting. `tests/tango/test_adapter.cpp`'s reconnect case is what found it,
+    and it is the case that would not have existed if "reconnect" had been taken as covered by
+    the code being written.
+
+    Worth knowing when reading test output: a reconnect leaves UCX logging
+    `ERROR req ...: error during flush: Shared memory error` two or three times per full run.
+    That is `quiesce()` step 4 flushing a worker whose peer already tore its endpoint down,
+    which is the ordinary shape of a session that ended from the publisher's side. The flush
+    request *completes* — with an error status — so the worker is destroyed normally rather
+    than quarantined. It is noise, not a leak.
 
 
 ## 5. M0 exit criteria
@@ -606,14 +732,71 @@ timer at all.
 - `ucp_request_cancel` on an AM receive (deviation 12) is still unverified and still
   unreachable from the suite.
 
-## 9. What M0–M3 deliberately do not contain
+## 9. M4 exit criteria
 
-No Tango integration. No commands, no `DeviceProxy` client, no `BulkQuery`, no geometry
-epochs, no reconnect, no relay, no RMA, no dispatch thread, no renew timer.
-`BulkSubscriber` is a declaration only; the transport engine behind it is
-`detail::SubscriberEngine` (deviation 2).
+MVP_PLAN.md states M4's exit condition as: **"an example device and client use only installed
+cppTango public headers plus extension headers; the cppTango source tree is absent from their
+build environment."** The normative detail is §7 (Tango integration contract), §4.1 (client
+state machine), §5.1 (thread inventory) and §5.2 (callback isolation). Tests are in
+`tests/tango/test_adapter.cpp`, against a real device server in a separate process.
 
-The next slice is M4, the stock-Tango adapter: `BulkOpen` / `BulkRenew` / `BulkClose` /
-`BulkQuery` as ordinary commands over `handle_coordination`, a `BulkSubscriber` shell over
-`SubscriberEngine` taking a `Tango::DeviceProxy &`, and the renew timer and reconnect that
-need one.
+| Requirement (MVP_PLAN M4) | Status | Where |
+|---|---|---|
+| Reusable ordinary-command implementations for `BulkOpen`, `BulkRenew`, `BulkClose` | met | `src/tango/commands.cpp`; `The four bulk commands are ordinary commands on a stock device` |
+| A small registration helper suitable for a normal device class | met | `install_bulk_commands()` / `attach_publisher()` / `detach_publisher()`; three lines in `fixture_device.cpp` and in `examples/example_device/` |
+| Optional `BulkQuery` status | met | `handle_query()`; `bulk_query()`; `BulkQuery reports the publisher an operator can see`, `Query answers server-wide and per session` |
+| A separate low-rate preview attribute example | met | `examples/example_preview/` — decimated, 10 Hz, ordinary change event, wholly outside the bulk path |
+| `FrameMetadata` sourced from device state and the acquired lease | met | `examples/example_device/`, `fixture_device.cpp` — no `AttributeValue_5` anywhere on either path |
+| Never construct `AttributeValue_5` or call `push_change_event()` on the bulk-only path | met | the only `push_change_event()` in the repository is inside `if(preview_due())` in the preview example |
+| Client accepts a stock `Tango::DeviceProxy` and a logical stream name | met | `BulkSubscriber(Tango::DeviceProxy &, SubscriberConfig)`; every case in `test_adapter.cpp` |
+| Negotiate, renew, close, and reopen sessions | met | control thread in `src/tango/proxy_client.cpp`; `A subscriber opens over DeviceProxy and receives real frames`, `The renew timer keeps a session past its lease` |
+| Typed state/error callbacks, separate from frame callbacks | met | `set_state_callback()` / `set_frame_callback()`; the state case asserts `Opening → Probing → Active → Closed` |
+| Tango connection errors are recovery hints, not supplier cleanup authority | met | every `DevFailed` becomes a `BulkError` and a state transition; nothing on the publisher is released except by `Close` or the lease |
+| Reopen after the stream goes away and comes back | met | `A subscriber reopens its session after the stream comes back` — `Detach` breaks a live session at the device, `Attach` restores it, and the client reconnects with backoff and carries data again |
+
+**Exit condition met.** 144 ctest cases green under `-Werror`, under
+`-fsanitize=address,undefined`, and under `-fsanitize=thread`. The M4 additions are 12 cases
+and 126 assertions in `tango-bulk-tango-tests`, plus `Query answers server-wide and per
+session` in the UCX suite.
+
+Three things about the fixture are the point rather than plumbing:
+
+- **It is a separate process, running `-nodb`.** A test that linked a device object into the
+  test binary would prove the adapter compiles. Only a real device server reached through a
+  real `DeviceProxy` proves the thing M4 claims, and `-nodb` is what lets it run on a machine
+  with cppTango installed and nothing else configured.
+- **It links `tango-bulk::tango` and nothing else**, exactly as a device server would. The
+  transport arrives as a `LINK_ONLY` dependency and brings no UCX include directory with it,
+  which is the layering rule stated as a link line. `scripts/check_layering.py` now covers
+  `tests/tango/` and `examples/` with the same no-`ucp/*` rule for the same reason.
+- **The bulk commands are appended after the device's own**, so a name collision is found at
+  class-construction time — `install_bulk_commands()` throws rather than shadowing — instead
+  of by whichever command cppTango happens to look up first.
+
+ThreadSanitizer matters more at this milestone than at M3. The subscriber has three threads
+and they hand a transport between them: the control thread may destroy and rebuild the engine
+while the dispatch thread is inside `poll()`. That is arbitrated by a borrow count rather than
+by a `shared_ptr` alone, because dropping the last reference *is* the destruction and the
+engine must not be destroyed on the dispatch thread from inside its own poll. TSan sees the
+whole handshake and reports nothing:
+
+```sh
+setarch -R cmake --build build-tsan       # -R because TSan and ASLR disagree
+setarch -R ./build-tsan/tests/tango-bulk-tango-tests
+```
+
+**What M4 did not resolve.** The §5.4 assumption is unchanged and now has one more consumer:
+release is credit-driven, local send completion frees the header context only, and §9.4's
+P0-10 flush-amortization track still has not run on hardware. `ucp_request_cancel` on an AM
+receive (deviation 12) is still unverified and still unreachable from the suite.
+
+## 10. What M0–M4 deliberately do not contain
+
+No geometry epochs (§4.3 — `declare_geometry()` returns `Internal`), no relay, no RMA, and no
+GPU memory. `M5_TEST_GUIDE.md` was not vendored and its acceptance matrix has not been run;
+in particular **A10 is asserted structurally rather than counted** — the preview example shows
+the separation and nothing yet counts the Tango events emitted during a bulk-only run.
+
+The next slice is M5: the external acceptance matrix, the observability surface as a whole,
+and a target-hardware report that either meets the throughput/CPU budget or records a clear
+no-go.

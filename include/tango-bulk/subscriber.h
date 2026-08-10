@@ -32,6 +32,11 @@ class DeviceProxy;
 namespace TangoBulk
 {
 
+/// Declared in <tango-bulk/tango.h>, which this header deliberately does not
+/// include.  A forward declaration is all `set_command_names()` needs, and it
+/// keeps the Tango-only knob out of the header the UCX layer compiles.
+struct CommandNames;
+
 enum class SubscriberState : std::uint32_t
 {
     Closed = 0,
@@ -107,6 +112,11 @@ class BulkSubscriber
     SubscriberCounters counters() const noexcept;
 
   private:
+    /// The one thing outside this class that reaches into it: the command-name
+    /// override, which is a Tango concept and so is declared in
+    /// <tango-bulk/tango.h> and defined next to this class's implementation.
+    friend void set_command_names(BulkSubscriber &subscriber, const CommandNames &names);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

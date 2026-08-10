@@ -8,6 +8,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -70,6 +71,45 @@ Protocol::CloseReply close(BulkPublisher &publisher,
     Protocol::CloseReply reply;
     REQUIRE(Protocol::decode(raw.data(), raw.size(), reply) == Status::Ok);
     return reply;
+}
+
+Protocol::QueryReply query(BulkPublisher &publisher,
+                           const Protocol::SessionId &id = {},
+                           std::uint64_t correlation_id = 11)
+{
+    Protocol::QueryRequest request;
+    request.session_id = id;
+    const std::vector<std::byte> encoded = Protocol::encode(request, correlation_id);
+    const std::vector<std::byte> raw =
+        publisher.handle_coordination(encoded.data(), encoded.size());
+
+    Protocol::QueryReply reply;
+    REQUIRE(Protocol::decode(raw.data(), raw.size(), reply) == Status::Ok);
+    return reply;
+}
+
+/// The value of `key` in a `key=value;` blob, or empty if it is absent.
+///
+/// Split into fields rather than searched for `key=`, because a substring search
+/// is wrong here in a way that flatters the test: `dropped_no_session=0` ends
+/// with `session=0`, so asking whether the blob mentions `session` would find a
+/// counter that has nothing to do with any session.
+std::string counter(const std::string &blob, const std::string &key)
+{
+    for(std::size_t start = 0; start < blob.size();)
+    {
+        const std::size_t end = std::min(blob.find(';', start), blob.size());
+        const std::size_t equals = blob.find('=', start);
+
+        if(equals < end && blob.compare(start, equals - start, key) == 0)
+        {
+            return blob.substr(equals + 1, end - equals - 1);
+        }
+
+        start = end + 1;
+    }
+
+    return {};
 }
 
 } // namespace
@@ -441,4 +481,67 @@ TEST_CASE("engine_cpu_affinity pins the engine, and the placement report proves 
 
     const std::vector<std::byte> request = subscriber.make_close_request(2);
     publisher.handle_coordination(request.data(), request.size());
+}
+
+TEST_CASE("Query answers server-wide and per session", "[m4][session]")
+{
+    // The Tango-facing `bulk_query()` only ever asks the server-wide question,
+    // because no public API hands out a `session_id`.  3.8's other half -- a
+    // Query naming one session -- is reachable only from a caller that decoded
+    // the `OpenReply` itself, which is exactly what this file does.
+    BulkPublisher publisher(short_lease_config());
+    detail::SubscriberEngine subscriber(subscriber_config());
+
+    const std::vector<std::byte> raw = exchange_open(publisher, subscriber);
+    const Protocol::OpenReply granted = decode_open_reply(raw);
+
+    REQUIRE(subscriber.adopt_open_reply(raw.data(), raw.size()) == Status::Ok);
+    REQUIRE(await_armed(publisher, subscriber));
+
+    SECTION("server-wide")
+    {
+        const Protocol::QueryReply reply = query(publisher);
+
+        CHECK(reply.status == Status::Ok);
+        CHECK(reply.active_sessions == 1);
+        CHECK(reply.generation == publisher.generation());
+        CHECK(reply.geometry.validate() == Status::Ok);
+        CHECK(reply.geometry.max_frame_bytes == k_frame_bytes);
+        CHECK(counter(reply.counters, "stream") == "bulk.slice");
+        CHECK(counter(reply.counters, "sessions_opened") == "1");
+
+        // A server-wide Query says nothing about any particular session, which
+        // is what makes it safe to expose at OPERATOR level.
+        CHECK(counter(reply.counters, "session").empty());
+    }
+
+    SECTION("one session")
+    {
+        const Protocol::QueryReply reply = query(publisher, granted.session_id);
+
+        CHECK(reply.status == Status::Ok);
+        CHECK(reply.session_id == granted.session_id);
+        CHECK(counter(reply.counters, "session_state") == "Armed");
+
+        // 3.2: identifiers appear only in the truncated form, here and in logs.
+        const std::string quoted = counter(reply.counters, "session");
+        CHECK_FALSE(quoted.empty());
+        CHECK(quoted != Protocol::to_hex(granted.session_id));
+
+        const std::string remaining = counter(reply.counters, "session_lease_ms_remaining");
+        CHECK_FALSE(remaining.empty());
+        CHECK(std::stoull(remaining) <= 1'000);
+    }
+
+    SECTION("a session this publisher does not have")
+    {
+        // The same answer 3.7 gives a Renew, so an operator's Query and a
+        // client's Renew cannot disagree about whether a session still exists.
+        Protocol::SessionId stranger{};
+        stranger.bytes[0] = std::byte{0x5A};
+
+        CHECK(query(publisher, stranger).status == Status::UnknownSession);
+    }
+
+    close(publisher, granted.session_id);
 }

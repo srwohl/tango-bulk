@@ -6,7 +6,9 @@
 #define TANGO_BULK_TANGO_H
 
 #include <tango-bulk/publisher.h>
+#include <tango-bulk/subscriber.h>
 
+#include <cstdint>
 #include <string>
 
 // The one public header allowed to name Tango types, and the reason the
@@ -17,6 +19,7 @@ namespace Tango
 {
 class DeviceClass;
 class DeviceImpl;
+class DeviceProxy;
 } // namespace Tango
 
 namespace TangoBulk
@@ -55,6 +58,47 @@ void install_bulk_commands(Tango::DeviceClass &device_class,
 /// finished init_device() is a normal transient state, not a fault.
 void attach_publisher(Tango::DeviceImpl &device, BulkPublisher &publisher);
 void detach_publisher(Tango::DeviceImpl &device) noexcept;
+
+/// Point a subscriber at a device whose commands carry a prefix.
+///
+/// MUST be called before start(); it throws BulkException{Internal} afterwards,
+/// because changing the name of the command that opened a session would leave no
+/// way to renew or close it.
+///
+/// This is a free function rather than a SubscriberConfig field because
+/// SubscriberConfig is declared in <tango-bulk/subscriber.h>, which the UCX
+/// layer compiles against and which therefore cannot name a Tango-only concept.
+/// See docs/EXTRACTION.md.
+void set_command_names(BulkSubscriber &subscriber, const CommandNames &names);
+
+/// What BulkQuery reports about a publisher.
+struct BulkQueryResult
+{
+    Status status{Status::Ok};
+    std::uint32_t active_sessions{0};
+    std::uint32_t generation{0};
+    std::uint64_t max_frame_bytes{0};
+    std::uint32_t ring_depth{0};
+    std::uint32_t credit_window{0};
+
+    /// `key=value;` pairs.  Free-form by design: an operator reads it, and the
+    /// set of counters may grow within a minor version.  It carries no UCX
+    /// address, no memory key, and no untruncated session identifier.
+    std::string counters;
+};
+
+/// Server-wide status of a device's bulk publisher, over the ordinary BulkQuery
+/// command.
+///
+/// Server-wide because that is the question an operator has.  3.8 also allows a
+/// Query naming one session, which needs a `session_id` no public API hands out;
+/// that path is driven through `handle_coordination` and is covered by the UCX
+/// tests, which decode the `OpenReply` themselves.
+///
+/// Throws BulkException on a malformed reply, and lets Tango::DevFailed out of
+/// the command call itself -- a device that cannot be reached is the caller's
+/// problem to handle, not something to flatten into a status code.
+BulkQueryResult bulk_query(Tango::DeviceProxy &proxy, const CommandNames &names = {});
 
 } // namespace TangoBulk
 

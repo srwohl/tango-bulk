@@ -13,6 +13,7 @@
 #include <core/credit_window.h>
 #include <core/lease_pool.h>
 #include <core/receive_slot.h>
+#include <core/subscriber_transport.h>
 
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/subscriber.h>
@@ -29,10 +30,14 @@
 /// `Tango::DeviceProxy &` constructor parameter, and 1.1 forbids `src/ucx/` from
 /// seeing `tango/*`; docs/EXTRACTION.md deviation 2 resolves the pair by putting
 /// the transport engine in this layer and `BulkSubscriber` in the Tango layer,
-/// meeting at an interface.  This is that engine.  `BulkSubscriber` becomes a
-/// shell over it in M4, when there is a `DeviceProxy` to carry the coordination
-/// plane; until then the M2 tests drive the coordination bytes by hand, which is
-/// exactly what 9.3 asks for.
+/// meeting at an interface.  This is that engine, and the interface it meets is
+/// `detail::SubscriberTransport` in `core/subscriber_transport.h`.
+///
+/// M4 built the other half: `BulkSubscriber` in `src/tango/proxy_client.cpp` is
+/// a shell over this class, reached through that interface and constructed
+/// through `make_subscriber_transport()`.  The UCX tests keep driving the
+/// coordination bytes by hand -- which is what 9.3 asks for, and what keeps this
+/// layer testable on a machine with no Tango database.
 namespace TangoBulk::detail
 {
 
@@ -114,72 +119,71 @@ class ReceiveArena : public CreditSink
     std::atomic<std::uint64_t> views_outstanding_{0};
 };
 
-class SubscriberEngine
+class SubscriberEngine final : public SubscriberTransport
 {
   public:
     explicit SubscriberEngine(SubscriberConfig config);
-    ~SubscriberEngine();
-
-    SubscriberEngine(const SubscriberEngine &) = delete;
-    SubscriberEngine &operator=(const SubscriberEngine &) = delete;
+    ~SubscriberEngine() override;
 
     /// Encoded `Open`, to be carried to the publisher by whatever the caller
-    /// has -- a Tango command in M4, a direct `handle_coordination` call in the
-    /// tests here.
+    /// has -- a Tango command from `BulkSubscriber`, a direct
+    /// `handle_coordination` call in the tests here.
     ///
     /// By the time this returns, the receive ring is allocated, registered and
     /// armed: 4.1's `Opening` entry action, in that order, because the publisher
     /// may send the first frame the instant it replies.
-    std::vector<std::byte> make_open_request(std::uint64_t correlation_id) const;
+    std::vector<std::byte> make_open_request(std::uint64_t correlation_id) const override;
 
     /// Adopt an `OpenReply`: stream id, granted geometry, endpoint to the
     /// server.  Starts the engine thread and leaves the state in `Probing`; the
     /// publisher's `Probe` moves it to `Active` (4.1).
-    Status adopt_open_reply(const std::byte *data, std::size_t size);
+    Status adopt_open_reply(const std::byte *data, std::size_t size) override;
 
     /// 3.7's lease renewal, as a pair of byte-level steps.
     ///
     /// There is no renew *timer* here.  5.1 puts one on the subscriber's control
-    /// thread, but that thread's other job is calling `DeviceProxy`, and there
-    /// is no proxy until M4 -- so M3 exposes the two ends and lets the caller
-    /// drive them, exactly as it does for `Open` and `Close`.
-    std::vector<std::byte> make_renew_request(std::uint64_t correlation_id);
+    /// thread, and that thread's other job is calling `DeviceProxy` -- so the
+    /// timer lives with the proxy, in `BulkSubscriber`, and this layer exposes
+    /// the two ends exactly as it does for `Open` and `Close`.
+    std::vector<std::byte> make_renew_request(std::uint64_t correlation_id) override;
 
     /// Adopt a `RenewReply`.  `SessionExpired` and `UnknownSession` are terminal
     /// for this session (3.7: "There is no resurrection"); the state goes to
     /// `Failed` and the caller must open a new one.
-    Status adopt_renew_reply(const std::byte *data, std::size_t size);
+    Status adopt_renew_reply(const std::byte *data, std::size_t size) override;
 
-    std::vector<std::byte> make_close_request(std::uint64_t correlation_id) const;
+    std::vector<std::byte> make_close_request(std::uint64_t correlation_id) const override;
 
     /// The lease terms the server granted, as they stand after the last reply.
     /// M4's renew timer reads these; 3.7 lets the server change them at any
     /// renewal and requires the client to adopt the new values.
-    std::uint32_t lease_ttl_ms() const noexcept
+    std::uint32_t lease_ttl_ms() const noexcept override
     {
         return lease_ttl_ms_;
     }
 
-    std::uint32_t renew_interval_ms() const noexcept
+    std::uint32_t renew_interval_ms() const noexcept override
     {
         return renew_interval_ms_;
     }
 
-    /// Manual delivery (9.3 allows no other kind in M2): invokes `cb` on the
-    /// CALLING thread and returns how many frames it dispatched.
-    std::size_t poll(std::chrono::milliseconds timeout, const FrameCallback &cb);
+    /// Invokes `cb` on the CALLING thread and returns how many frames it
+    /// dispatched.  Which thread that is belongs to the layer above: a test
+    /// calls this directly, and `BulkSubscriber` calls it from its dispatch
+    /// thread.  Either way it is never the engine thread (5.2).
+    std::size_t poll(std::chrono::milliseconds timeout, const FrameCallback &cb) override;
 
-    SubscriberState state() const noexcept
+    SubscriberState state() const noexcept override
     {
         return state_.load(std::memory_order_acquire);
     }
 
-    std::uint32_t generation() const noexcept
+    std::uint32_t generation() const noexcept override
     {
         return generation_;
     }
 
-    SubscriberCounters counters() const noexcept;
+    SubscriberCounters counters() const noexcept override;
 
     /// Test instrumentation for 9.3's zero-copy criterion.
     ///

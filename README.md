@@ -14,24 +14,22 @@ A device server opts in by linking a library and registering four ordinary Tango
 No cppTango ABI, event implementation, public class, IDL, build option, or upstream source
 file changes.
 
-> **Status: M3 — session lifecycle and fault containment.** Bytes move over UCX and sessions
-> now have a lifetime. A bounded table of clients each holds an expiring lease with its own
-> credit window and sequence space; a frame fans out to all of them and its producer slot
-> comes back only when every one has credited it. `Probe`/`ProbeAck` arms a session before it
-> can be sent to, `Renew` extends it, `Close` is idempotent, and a client that simply vanishes
-> has its pinned slots reclaimed on the lease deadline — with the stream still serving
-> everybody else, and a restarted client able to open a new session without restarting the
-> device server. The M2 vertical slice passes unchanged on top of all of it. Green under a
-> normal `-Werror` build, under `-fsanitize=address,undefined`, and under
-> `-fsanitize=thread`.
+> **Status: M4 — the stock-Tango adapter.** It is a Tango extension now, not a library with a
+> Tango-shaped plan. `BulkOpen` / `BulkRenew` / `BulkClose` / `BulkQuery` are ordinary commands
+> on an ordinary device class; `BulkSubscriber` takes a stock `Tango::DeviceProxy`, opens a
+> session over it, renews on a timer, reconnects with backoff, and delivers frames on a
+> library-owned dispatch thread that never touches Tango or UCX. A device server integrates in
+> three lines and links one target.
 >
-> Deliberately not here yet: no Tango integration. No commands, no `DeviceProxy`, no
-> `BulkQuery`, geometry epochs, reconnect, relay, RMA, dispatch thread, or renew timer —
-> `DeliveryMode::Manual` and `poll()` only, and the coordination plane is driven as encoded
-> bytes by the caller. `BulkSubscriber` is still a declaration; the transport engine behind it
-> is `detail::SubscriberEngine`. The stock-Tango command adapter is M4. See
-> [docs/EXTRACTION.md](docs/EXTRACTION.md) for exactly what exists, which deviations from the
-> spec were taken deliberately, and what each test is worth.
+> The tests are the claim: `tests/tango/` starts a **real device server in a separate process**
+> with `-nodb` and drives it through a real `DeviceProxy`. Green under a normal `-Werror`
+> build, under `-fsanitize=address,undefined`, and under `-fsanitize=thread`.
+>
+> Deliberately not here yet: geometry epochs (§4.3), the relay, RMA, GPU memory, and M5's
+> external acceptance matrix — including the event-count proof that a bulk-only run emits no
+> full-rate Tango event, which the preview example demonstrates structurally but nothing yet
+> counts. See [docs/EXTRACTION.md](docs/EXTRACTION.md) for exactly what exists, which
+> deviations from the spec were taken deliberately, and what each test is worth.
 >
 > The repository is self-contained: the normative spec, the plan, the benchmark and the
 > results all live here, and no cppTango source tree is needed to build, test or measure it.
@@ -89,7 +87,8 @@ src/ucx/                the engine and registered memory.  ucp/* allowed
 src/tango/              commands and DeviceProxy glue.  tango/* allowed
 tests/unit/             core only; no UCX device, no Tango database
 tests/ucx/              loopback UCX; no Tango process
-tests/tango/            stock-cppTango device fixture
+tests/tango/            a real -nodb device server, driven through a DeviceProxy
+examples/               device, client, and the decimated preview attribute
 benchmarks/             two-process throughput and payload verification
 scripts/                layering check, verbs test runner
 ```
@@ -106,6 +105,13 @@ scripts/                layering check, verbs test runner
 The third row is the load-bearing one. The Tango adapter deals in encoded byte vectors and
 opaque handles, so a device server that links it never inherits UCX headers.
 
+It survives M4 intact, which was the interesting question: `BulkSubscriber` lives in the Tango
+layer and has to *construct* a UCX transport. It does so through an abstract interface declared
+in `src/core/` whose factory is defined in the UCX library, and `tango-bulk-tango` links
+`tango-bulk::ucx` **PRIVATE** — so the symbols resolve and no include directory travels. The
+fixture device server and all three examples link `tango-bulk::tango` alone, which is what
+keeps that a tested property rather than a claim.
+
 `scripts/check_layering.py` greps each layer's translation units and fails on violation. It
 runs as a test (`ctest -R layering`) and is meant to run in CI as a standalone step, with no
 configured build tree required:
@@ -120,7 +126,7 @@ has never been observed to fail is not a check.
 ## Testing
 
 ```sh
-pixi run test        # 127 cases
+pixi run test        # 143 cases
 pixi run test-asan   # the same, under -fsanitize=address,undefined
 ```
 
@@ -132,14 +138,22 @@ no return value can express that. Without a sanitizer they are mostly wasted run
 `tests/unit/golden_vectors.h` is generated. A diff of it is a protocol change and should be
 reviewed as one; `tests/unit/test_protocol_golden.cpp` documents how to regenerate it.
 
-The session table is worth a race detector too, since every transition in the server state
-machine is a handshake between a Tango command thread and the engine thread. There is no pixi
-task because it needs ASLR disabled on recent kernels:
+`tests/tango/` needs no Tango database: it starts the fixture device server with `-nodb` on a
+port the kernel picks, waits for it to report readiness on an inherited descriptor, and drives
+it through an ordinary `DeviceProxy`. Nothing to configure, and nothing to clean up if a case
+fails.
+
+Both sides are worth a race detector. The server state machine is a handshake between a Tango
+command thread and the engine thread; the client has three threads and passes a transport
+between them, so the control thread may rebuild the engine while the dispatch thread is inside
+`poll()`. There is no pixi task because TSan needs ASLR disabled on recent kernels — including
+at *build* time, since `catch_discover_tests` runs the binary to enumerate cases:
 
 ```sh
 cmake -S . -B build-tsan -GNinja -DBUILD_TESTING=ON -DTANGO_BULK_SANITIZERS=thread
-cmake --build build-tsan --target tango-bulk-ucx-tests
+setarch -R cmake --build build-tsan
 setarch -R ./build-tsan/tests/tango-bulk-ucx-tests
+setarch -R ./build-tsan/tests/tango-bulk-tango-tests
 ```
 
 ### Run it over a verbs transport too
@@ -245,13 +259,55 @@ What is missing in *this* repository, and what each gap costs:
 | `--iters` only, no `--duration` | Cannot express "stream for 60 s", which is what a hardware soak wants |
 | No latency measurement at all | §9.4's **P0-7** (latency) cannot be answered; only aggregate rate is reported |
 | No CPU-time reporting | MVP_PLAN's M5 release gate asks for a throughput **and CPU** budget; the CPU half is unmeasured |
-| `engine_cpu_affinity` is declared in §2.3/§2.4 and read nowhere | The engine thread cannot be pinned, so **P0-11** (affinity, NUMA, one engine per rail) is out of reach — and it matters most exactly where it is missing, on a host whose NIC hangs off one socket |
+| No rail-assignment policy | `engine_cpu_affinity` works and the placement it produces is reported, but **P0-11**'s "one engine per rail" needs a policy §10 defers to M5 with hardware in hand |
 | No endpoint-error-mode knob | §6.3 allows `UCP_ERR_HANDLING_MODE_PEER` by configuration; **P0-14** asks whether it changes `rc`/`dc` selection, and there is no way to ask |
 | No RMA path (§3.2 Path B) | **P0-10** flush amortization remains unanswerable at any transport — see docs/THROUGHPUT.md |
 
-The first three are benchmark ergonomics and cheap. `engine_cpu_affinity` is a small fix that
-is currently a silently inert public field, which is worse than an absent one. The last is
-architectural and the spec places it well past M4.
+The first three are benchmark ergonomics and cheap. The last is architectural and the spec
+places it past the MVP.
+
+## Using it
+
+A device server. Three lines, and they are the whole integration:
+
+```cpp
+void MyClass::command_factory()       { TangoBulk::install_bulk_commands(*this); }
+void MyDevice::init_device()          { TangoBulk::attach_publisher(*this, *publisher_); }
+void MyDevice::delete_device()        { TangoBulk::detach_publisher(*this); }
+```
+
+The acquisition path then never touches Tango:
+
+```cpp
+TangoBulk::BulkSource::Lease lease = publisher_->source().try_acquire();
+if(lease)                             // never blocks; a full ring means drop, not wait
+{
+    fill(lease.data());               // the DMA target, filled in place
+    publisher_->publish(std::move(lease), meta);
+}
+```
+
+A client. Construct, two callbacks, `start()`:
+
+```cpp
+Tango::DeviceProxy proxy("bulk/example/1");   // BORROWED; you keep it alive
+
+TangoBulk::SubscriberConfig config;
+config.stream_name = "image";
+
+TangoBulk::BulkSubscriber subscriber(proxy, config);
+subscriber.set_frame_callback([](TangoBulk::FrameView f) { process(f); });
+subscriber.set_state_callback([](auto state, const auto &err) { log(state, err); });
+subscriber.start();
+```
+
+The frame callback runs on a library-owned dispatch thread — never the UCX engine thread, so a
+slow consumer cannot stall the transport, and never a Tango thread, so a stuck `command_inout`
+cannot stall delivery. `DeliveryMode::Manual` plus `poll()` hands the thread back to you.
+
+Working versions of all of the above, including the decimated preview attribute for legacy
+visibility, are in [examples/](examples/) with instructions for running them with or without a
+Tango database.
 
 ## Design in one paragraph
 

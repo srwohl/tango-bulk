@@ -49,7 +49,20 @@ catch_discover_tests(tango-bulk-ucx-tests)
 # --- tests/tango: stock-cppTango device fixture ----------------------------
 
 if(TANGO_BULK_BUILD_TANGO_ADAPTER)
-    add_executable(tango-bulk-tango-tests tango/test_command_names.cpp)
+    # A real device server, in its own process, running -nodb.  The M4 exit
+    # criterion is that an example device and client use only installed cppTango
+    # headers plus extension headers -- which is a property of a process, not of
+    # a translation unit, so the fixture is a process.
+    add_executable(tango-bulk-fixture-device tango/fixture_device.cpp)
+
+    # tango-bulk::tango only, exactly as a real device server would link it: the
+    # transport comes along as a LINK_ONLY dependency and brings no UCX include
+    # directory with it.  Naming tango-bulk::ucx here as well would work and
+    # would quietly stop this fixture from testing that.
+    target_link_libraries(tango-bulk-fixture-device PRIVATE tango-bulk::tango)
+
+    add_executable(tango-bulk-tango-tests tango/test_adapter.cpp
+                                          tango/test_command_names.cpp)
 
     target_link_libraries(tango-bulk-tango-tests PRIVATE tango-bulk::tango
                                                          Catch2::Catch2WithMain)
@@ -57,7 +70,20 @@ if(TANGO_BULK_BUILD_TANGO_ADAPTER)
     target_include_directories(tango-bulk-tango-tests
                                PRIVATE ${PROJECT_SOURCE_DIR}/src/tango)
 
-    catch_discover_tests(tango-bulk-tango-tests)
+    # The test spawns the fixture, so it needs to know where it landed.  A
+    # generator expression rather than a guessed path: multi-config generators
+    # put it somewhere this file cannot predict.
+    target_compile_definitions(
+        tango-bulk-tango-tests
+        PRIVATE
+            TANGO_BULK_FIXTURE_DEVICE="$<TARGET_FILE:tango-bulk-fixture-device>")
+
+    add_dependencies(tango-bulk-tango-tests tango-bulk-fixture-device)
+
+    # Every case in test_adapter.cpp starts a CORBA server and waits on real
+    # leases, so the default 1 500 s ctest timeout is generous and the serial
+    # property is what keeps two cases from fighting over the same fixture.
+    catch_discover_tests(tango-bulk-tango-tests PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 # --- Layering ---------------------------------------------------------------

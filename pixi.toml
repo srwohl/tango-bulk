@@ -45,13 +45,14 @@ _configure = { cmd = [
     "-DBUILD_TESTING=ON",
     "-DTANGO_BULK_WARNINGS_AS_ERRORS=ON",
     "-DTANGO_BULK_BUILD_BENCHMARKS=ON",
+    "-DTANGO_BULK_BUILD_EXAMPLES=ON",
     "-DCMAKE_INSTALL_PREFIX=\"$CONDA_PREFIX\"",
     "-S.",
     "-Bbuild",
 ] }
 build = { cmd = "cmake --build build", depends-on = ["_configure"] }
 test = { cmd = "ctest --test-dir build --output-on-failure", depends-on = ["build"] }
-clean = "rm -rf build build-asan"
+clean = "rm -rf build build-asan build-tsan"
 
 # The sweeps in tests/unit/test_protocol_malformed.cpp only prove the
 # "never read past the supplied length" rule when a sanitizer is watching.
@@ -64,6 +65,7 @@ _configure-asan = { cmd = [
     "-DBUILD_TESTING=ON",
     "-DTANGO_BULK_SANITIZERS=address,undefined",
     "-DTANGO_BULK_BUILD_BENCHMARKS=ON",
+    "-DTANGO_BULK_BUILD_EXAMPLES=ON",
     "-S.",
     "-Bbuild-asan",
 ] }
