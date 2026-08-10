@@ -24,6 +24,14 @@ endif()
 add_executable(tango-bulk-example-device example_device/example_device.cpp)
 target_link_libraries(tango-bulk-example-device PRIVATE tango-bulk::tango)
 
+# The replay server is deliberately an example-only HDF5 dependency.  The
+# tango-bulk libraries do not know about file formats.
+find_package(HDF5 REQUIRED COMPONENTS CXX)
+add_executable(tango-bulk-example-hdf5-device
+               example_hdf5_device/example_hdf5_device.cpp)
+target_link_libraries(tango-bulk-example-hdf5-device
+                      PRIVATE tango-bulk::tango HDF5::HDF5)
+
 add_executable(tango-bulk-example-preview example_preview/example_preview.cpp)
 target_link_libraries(tango-bulk-example-preview PRIVATE tango-bulk::tango)
 

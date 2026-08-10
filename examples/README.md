@@ -6,11 +6,12 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 # Examples
 
-Three programs, and between them the whole M4 surface:
+The examples cover the whole M4 surface plus a file-backed detector:
 
 | | What it shows |
 |---|---|
 | `example_device/` | A device server that publishes a bulk stream. The integration is the three lines of §7.2, marked in the source. |
+| `example_hdf5_device/` | Replays an image stack from a NeXus/HDF5 dataset, using file metadata for frame geometry, numeric type, byte order, and default rate. |
 | `example_client/` | A subscriber driven by a stock `Tango::DeviceProxy`. Construct, two callbacks, `start()`, `stop()`. |
 | `example_preview/` | The compatibility path: the same bulk stream plus a decimated, rate-capped Tango image attribute with an ordinary change event (§7.5). |
 
@@ -27,7 +28,7 @@ Two terminals, no database, no configuration:
 ./build/examples/tango-bulk-example-device demo -nodb \
     -dlist bulk/example/1 -ORBendPoint giop:tcp::10000
 
-./build/examples/tango-bulk-example-client "localhost:10000/bulk/example/1#dbase=no"
+./build/examples/tango-bulk-example-client "tango://localhost:10000/bulk/example/1#dbase=no"
 ```
 
 The client prints a frame rate once a second and its counters on exit. `Ctrl-C` closes the session;
@@ -39,11 +40,32 @@ The preview server is the same shape:
 ./build/examples/tango-bulk-example-preview demo -nodb \
     -dlist bulk/preview/1 -ORBendPoint giop:tcp::10001
 
-./build/examples/tango-bulk-example-client "localhost:10001/bulk/preview/1#dbase=no"
+./build/examples/tango-bulk-example-client "tango://localhost:10001/bulk/preview/1#dbase=no"
 ```
 
 Point any Tango client at its `preview` attribute at the same time: it updates at 10 Hz while the
 bulk stream runs at 100, which is the ratio §7.5 exists to demonstrate.
+
+## Replaying a NeXus/HDF5 image stack
+
+The HDF5 server follows the NeXus `default` attributes to an `NXdata` group and its `signal`
+attribute, so the dataset path is normally unnecessary. It treats a rank-three dataset as
+`[frame, height, width]`, derives the wire element type and byte order from HDF5, and loops forever.
+
+```sh
+./build/examples/tango-bulk-example-hdf5-device demo -nodb \
+    -dlist bulk/hdf5/1 -ORBendPoint giop:tcp::10002 \
+    --hdf5-file /path/to/cb1_image0000.hdf5 --cache-mib 512
+
+./build/examples/tango-bulk-example-client "tango://localhost:10002/bulk/hdf5/1#dbase=no"
+```
+
+The cache budget contains whole source frames. If the complete stack does not fit, the server
+reads consecutive chunks and starts again at frame zero after the last chunk. A frame is copied
+from this ordinary RAM cache into a registered publisher slot; the library then delivers that slot
+to the subscribing device or client. `--frame-rate 0` removes pacing. Otherwise the server uses
+`exposure_time + latency_time` when present, falling back to 100 Hz. Use `--hdf5-dataset PATH`
+for a non-NeXus file and `--hdf5-help` for all replay options.
 
 ## Running them with a database
 
@@ -71,6 +93,7 @@ server: an executable/instance pair, the class it exports, and the devices of th
 | Server | Class | Device |
 |---|---|---|
 | `tango-bulk-example-device/demo` | `ExampleDetector` | `bulk/example/1` |
+| `tango-bulk-example-hdf5-device/demo` | `Hdf5ReplayDetector` | `bulk/hdf5/1` |
 | `tango-bulk-example-preview/demo` | `PreviewDetector` | `bulk/preview/1` |
 
 Re-running `db-setup` is harmless — `--add-server` replaces the entry.
@@ -83,6 +106,8 @@ matches the registration above.
 echo $TANGO_HOST                      # pixi sets it: <hostname>:11000
 
 ./build/examples/tango-bulk-example-device demo
+./build/examples/tango-bulk-example-hdf5-device demo \
+    --hdf5-file /path/to/cb1_image0000.hdf5 --cache-mib 512
 ./build/examples/tango-bulk-example-preview demo
 ./build/examples/tango-bulk-example-client bulk/example/1
 ```

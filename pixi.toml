@@ -28,6 +28,7 @@ catch2 = ">=3.1.1"
 # package ships only the runtime, so the headers have to be asked for
 # explicitly.  This is a property of the packaging, not of tango-bulk.
 cppzmq = "*"
+hdf5 = "*"
 
 # The demo database.  PyDatabaseds is a pure-Python Tango database server backed
 # by SQLite, so the examples get a real database without MySQL, a service, or
@@ -128,8 +129,10 @@ db = { cmd = "PyDatabaseds --logging_level=2 2", env = { PYTANGO_DATABASE_NAME =
 db-setup = { cmd = """
     tango_admin --ping-database 30 &&
     tango_admin --add-server tango-bulk-example-device/demo ExampleDetector bulk/example/1 &&
+    tango_admin --add-server tango-bulk-example-hdf5-device/demo Hdf5ReplayDetector bulk/hdf5/1 &&
     tango_admin --add-server tango-bulk-example-preview/demo PreviewDetector bulk/preview/1 &&
     tango_admin --check-device bulk/example/1 &&
+    tango_admin --check-device bulk/hdf5/1 &&
     tango_admin --check-device bulk/preview/1
 """ }
 
