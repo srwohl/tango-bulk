@@ -8,6 +8,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -63,9 +64,34 @@ int main(int argc, char *argv[])
 
     try
     {
-        constexpr std::uint64_t max_frame_bytes = 8ull << 20;
-        constexpr std::uint32_t ring_depth = 32;
-        constexpr std::uint64_t ring_bytes = max_frame_bytes * ring_depth;
+        Tango::DeviceProxy proxy(device);
+
+        // Discover the stream before allocating GPU memory. BulkOpen can clamp
+        // an oversized request, but cannot enlarge an undersized CUDA slot.
+        const TangoBulk::BulkQueryResult publisher = TangoBulk::bulk_query(proxy);
+        if(publisher.status != TangoBulk::Status::Ok)
+        {
+            throw TangoBulk::BulkException(
+                {publisher.status, "publisher is not ready", "BulkQuery"});
+        }
+
+        // Preserve the example's original 256 MiB receive-ring target. The
+        // protocol requires at least two slots, so an exceptionally large frame
+        // can raise the actual allocation above that target (up to 512 MiB).
+        constexpr std::uint64_t ring_memory_target = 256ull << 20;
+        const std::uint64_t slots_in_target =
+            ring_memory_target / publisher.max_frame_bytes;
+        const std::uint32_t ring_depth = std::min<std::uint32_t>(
+            publisher.ring_depth,
+            static_cast<std::uint32_t>(std::max<std::uint64_t>(2, slots_in_target)));
+        const std::uint32_t credit_window =
+            std::min(publisher.credit_window, ring_depth);
+        const std::uint64_t ring_bytes = publisher.max_frame_bytes * ring_depth;
+
+        std::cout << "publisher geometry: max_frame_bytes=" << publisher.max_frame_bytes
+                  << " ring_depth=" << ring_depth
+                  << " credit_window=" << credit_window
+                  << " cuda_ring_bytes=" << ring_bytes << std::endl;
 
         check_cuda(cudaSetDevice(gpu), "cudaSetDevice");
 
@@ -84,13 +110,11 @@ int main(int argc, char *argv[])
                                                  }
                                              });
 
-        Tango::DeviceProxy proxy(device);
-
         TangoBulk::SubscriberConfig config;
         config.stream_name = stream;
-        config.max_frame_bytes = max_frame_bytes;
+        config.max_frame_bytes = publisher.max_frame_bytes;
         config.ring_depth = ring_depth;
-        config.credit_window = 16;
+        config.credit_window = credit_window;
         config.delivery_mode = TangoBulk::DeliveryMode::DispatchThread;
         config.reconnect_policy = TangoBulk::ReconnectPolicy::BoundedRetry;
         config.receive_buffer = receive_buffer;

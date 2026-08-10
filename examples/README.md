@@ -13,6 +13,7 @@ The examples cover the whole M4 surface plus a file-backed detector:
 | `example_device/` | A device server that publishes a bulk stream. The integration is the three lines of §7.2, marked in the source. |
 | `example_hdf5_device/` | Replays an image stack from a NeXus/HDF5 dataset, using file metadata for frame geometry, numeric type, byte order, and default rate. |
 | `example_client/` | A subscriber driven by a stock `Tango::DeviceProxy`. Construct, two callbacks, `start()`, `stop()`. |
+| `example_cuda_client/` | Discovers the stream geometry and receives directly into a CUDA allocation through UCX/GPUDirect RDMA. |
 | `example_preview/` | The compatibility path: the same bulk stream plus a decimated, rate-capped Tango image attribute with an ordinary change event (§7.5). |
 
 They are built with `-DTANGO_BULK_BUILD_EXAMPLES=ON`, which `pixi run build` sets. They link
@@ -58,11 +59,16 @@ attribute, so the dataset path is normally unnecessary. It treats a rank-three d
     --hdf5-file /path/to/cb1_image0000.hdf5 --cache-mib 512
 
 ./build/examples/tango-bulk-example-client "tango://localhost:10002/bulk/hdf5/1#dbase=no"
+
+# Or receive into GPU 0:
+./build/examples/tango-bulk-example-cuda-client \
+    "tango://localhost:10002/bulk/hdf5/1#dbase=no" image 0
 ```
 
-The example client calls `BulkQuery` before opening the stream and sizes its receive slots from the
-publisher geometry. This is required for this detector shape: a `2208 x 3216 x uint16` frame is
-14,201,856 bytes, larger than the subscriber API's general-purpose 8 MiB default.
+Both example clients call `BulkQuery` before opening the stream and size their receive slots from
+the publisher geometry. The CUDA client does this before allocating its GPU receive ring. This is
+required for this detector shape: a `2208 x 3216 x uint16` frame is 14,201,856 bytes, larger than
+the subscriber API's general-purpose 8 MiB default.
 
 The cache budget contains whole source frames. If the complete stack does not fit, the server
 reads consecutive chunks and starts again at frame zero after the last chunk. A frame is copied
