@@ -6,6 +6,7 @@
 
 #include <tango/tango.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -55,11 +56,34 @@ int main(int argc, char *argv[])
         // keeping it alive, and the subscriber never copies it.
         Tango::DeviceProxy proxy(device);
 
+        // BulkOpen can clamp a request downward, but it cannot make an
+        // undersized receive slot larger.  Discover the publisher geometry
+        // instead of relying on SubscriberConfig's 8 MiB default.  Detector
+        // frames such as 2208 x 3216 x uint16 are already about 13.5 MiB.
+        const TangoBulk::BulkQueryResult publisher = TangoBulk::bulk_query(proxy);
+        if(publisher.status != TangoBulk::Status::Ok)
+        {
+            throw TangoBulk::BulkException(
+                {publisher.status, "publisher is not ready", "BulkQuery"});
+        }
+
         TangoBulk::SubscriberConfig config;
         config.stream_name = stream;
-        config.max_frame_bytes = 8ull << 20;
-        config.ring_depth = 32;
-        config.credit_window = 16;
+        config.max_frame_bytes = publisher.max_frame_bytes;
+
+        // Keep the receive ring within the default 1 GiB pinned-memory budget.
+        // Two slots is the protocol minimum; the 256 MiB frame hard cap means
+        // that the minimum always fits.
+        const std::uint64_t slots_in_budget =
+            config.pinned_memory_limit_bytes / config.max_frame_bytes;
+        config.ring_depth = std::min<std::uint32_t>(
+            publisher.ring_depth,
+            static_cast<std::uint32_t>(std::max<std::uint64_t>(2, slots_in_budget)));
+        config.credit_window = std::min(publisher.credit_window, config.ring_depth);
+
+        std::cout << "publisher geometry: max_frame_bytes=" << config.max_frame_bytes
+                  << " ring_depth=" << config.ring_depth
+                  << " credit_window=" << config.credit_window << std::endl;
 
         // The default.  A library-owned dispatch thread invokes the callback, so
         // it never runs on the UCX engine thread (5.2) -- which is what lets a

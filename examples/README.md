@@ -60,6 +60,10 @@ attribute, so the dataset path is normally unnecessary. It treats a rank-three d
 ./build/examples/tango-bulk-example-client "tango://localhost:10002/bulk/hdf5/1#dbase=no"
 ```
 
+The example client calls `BulkQuery` before opening the stream and sizes its receive slots from the
+publisher geometry. This is required for this detector shape: a `2208 x 3216 x uint16` frame is
+14,201,856 bytes, larger than the subscriber API's general-purpose 8 MiB default.
+
 The cache budget contains whole source frames. If the complete stack does not fit, the server
 reads consecutive chunks and starts again at frame zero after the last chunk. A frame is copied
 from this ordinary RAM cache into a registered publisher slot; the library then delivers that slot
