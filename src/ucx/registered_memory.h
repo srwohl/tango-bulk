@@ -39,6 +39,27 @@
 namespace TangoBulk::detail
 {
 
+/// What UCX calls one of our `MemoryKind`s.
+///
+/// Two places need the same answer and used to be free to disagree: the
+/// `ucp_mem_map` that registers a region, and the `ucp_am_recv_data_nbx` that
+/// lands a payload in it.  Naming the type on the receive is what lets UCX skip
+/// probing the destination pointer for a type it was already told at
+/// registration -- one `cuPointerGetAttribute` per frame on the CUDA path.
+inline ucs_memory_type_t to_ucs_memory_type(MemoryKind kind) noexcept
+{
+    switch(kind)
+    {
+    case MemoryKind::Cuda:
+        return UCS_MEMORY_TYPE_CUDA;
+    case MemoryKind::Rocm:
+        return UCS_MEMORY_TYPE_ROCM;
+    case MemoryKind::Host:
+        break;
+    }
+    return UCS_MEMORY_TYPE_HOST;
+}
+
 class RegisteredMemory
 {
   public:

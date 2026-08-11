@@ -13,6 +13,7 @@
 #include <core/credit_window.h>
 #include <core/lease_pool.h>
 #include <core/receive_slot.h>
+#include <core/session_client.h>
 #include <core/subscriber_transport.h>
 
 #include <tango-bulk/protocol.h>
@@ -162,12 +163,12 @@ class SubscriberEngine final : public SubscriberTransport
     /// renewal and requires the client to adopt the new values.
     std::uint32_t lease_ttl_ms() const noexcept override
     {
-        return lease_ttl_ms_;
+        return session_.lease_ttl_ms();
     }
 
     std::uint32_t renew_interval_ms() const noexcept override
     {
-        return renew_interval_ms_;
+        return session_.renew_interval_ms();
     }
 
     /// Invokes `cb` on the CALLING thread and returns how many frames it
@@ -183,7 +184,7 @@ class SubscriberEngine final : public SubscriberTransport
 
     std::uint32_t generation() const noexcept override
     {
-        return generation_;
+        return session_.generation();
     }
 
     SubscriberCounters counters() const noexcept override;
@@ -205,7 +206,7 @@ class SubscriberEngine final : public SubscriberTransport
 
     std::uint32_t granted_ring_depth() const noexcept
     {
-        return granted_depth_;
+        return session_.granted_ring_depth();
     }
 
     std::uint64_t bytes_copied() const noexcept
@@ -288,6 +289,16 @@ class SubscriberEngine final : public SubscriberTransport
     /// inside `ucp_worker_progress`.
     std::size_t rndv_inflight_{0};
 
+    /// Set once `quiesce()` starts, to stop the AM handler taking on new work.
+    ///
+    /// Not an atomic and not part of `SubscriberState`: both the write and the
+    /// read happen on the engine thread, because `quiesce()` reaches the AM
+    /// handler through its own `ucp_worker_progress` calls.  That is exactly the
+    /// problem it solves -- without it, draining outstanding receives starts
+    /// fresh ones and the drain cannot finish while a publisher is still
+    /// sending.
+    bool closing_{false};
+
     /// A `Probe` received and not yet answered.  Written by the probe AM
     /// handler, cleared by the loop that sends the ack; both are the engine.
     std::uint64_t pending_probe_token_{0};
@@ -302,17 +313,16 @@ class SubscriberEngine final : public SubscriberTransport
     std::atomic<SubscriberState> state_{SubscriberState::Closed};
 
     ucp_ep_h endpoint_{nullptr};
-    Protocol::StreamId stream_id_{0};
-    Protocol::SessionId session_id_{};
-    std::uint32_t generation_{0};
+
+    /// Identifiers, granted geometry and lease terms -- everything `Open` and
+    /// `Renew` settle.  Written by the thread that adopts a reply, and read on
+    /// the data path afterwards; the engine thread does not exist until
+    /// `adopt_open_reply` starts it, which is what publishes those writes.
+    SessionClient session_;
+
     /// Where this subscriber's ring, NIC and engine landed.  Engine thread
     /// writes it when the probe is answered; read for diagnostics only.
     Locality locality_;
-
-    std::uint32_t granted_depth_{0};
-    std::uint64_t granted_frame_bytes_{0};
-    std::uint32_t lease_ttl_ms_{0};
-    std::uint32_t renew_interval_ms_{0};
 
     std::atomic<std::uint64_t> renewals_sent_{0};
     std::atomic<std::uint64_t> renewals_failed_{0};

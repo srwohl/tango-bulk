@@ -24,8 +24,8 @@ namespace
 ///
 /// Long enough that a rendezvous transfer already on the wire lands, short
 /// enough that a publisher which died mid-frame cannot hold a subscriber's
-/// destructor open.  4.2 gives the publisher the same bounded-wait-then-force
-/// shape for the same reason.
+/// destructor open.  4.2 gives the publisher the same bounded-wait shape for the
+/// same reason.
 constexpr std::chrono::milliseconds k_quiesce_budget{2000};
 
 /// Park a worker that could not be quiesced, for the life of the process.
@@ -39,17 +39,32 @@ constexpr std::chrono::milliseconds k_quiesce_budget{2000};
 ///
 /// The context comes along because unmapping the ring needs it, and because
 /// `ucp_cleanup` on a context with a live worker is the same class of mistake.
+///
+/// So does the arena.  The receives that could not be drained are rendezvous
+/// gets -- RDMA reads landing in ring slots, which the NIC completes without
+/// asking the CPU.  Nothing progresses a quarantined worker again so no callback
+/// can fire, but `ucp_mem_unmap` and a free underneath a live RDMA read needs no
+/// callback to corrupt whatever takes those pages next, and the arena would
+/// otherwise go as soon as the last `FrameView` did.
+///
 /// The holder is heap-allocated and never freed: a static with a destructor would
 /// simply move the abort to exit time.
-void quarantine(std::unique_ptr<UcxWorker> worker, std::shared_ptr<UcxContext> context)
+void quarantine(std::unique_ptr<UcxWorker> worker,
+                std::shared_ptr<UcxContext> context,
+                std::shared_ptr<ReceiveArena> arena)
 {
-    using Held = std::vector<std::pair<std::unique_ptr<UcxWorker>, std::shared_ptr<UcxContext>>>;
+    struct Held
+    {
+        std::unique_ptr<UcxWorker> worker;
+        std::shared_ptr<UcxContext> context;
+        std::shared_ptr<ReceiveArena> arena;
+    };
 
     static std::mutex mutex;
-    static Held *held = new Held();
+    static std::vector<Held> *held = new std::vector<Held>();
 
     const std::lock_guard<std::mutex> lock(mutex);
-    held->emplace_back(std::move(worker), std::move(context));
+    held->push_back(Held{std::move(worker), std::move(context), std::move(arena)});
 }
 
 } // namespace
@@ -209,7 +224,7 @@ SubscriberEngine::~SubscriberEngine()
     // device server than a fatal error raised by a client's disappearance.
     if(!quiesced_.load(std::memory_order_acquire))
     {
-        quarantine(std::move(worker_), context_);
+        quarantine(std::move(worker_), context_, arena_);
     }
 
     // Anything still in the delivery queue, and anything the application is
@@ -243,90 +258,34 @@ void SubscriberEngine::register_am_handlers()
             "ucp_worker_set_am_recv_handler(probe)");
 }
 
+// -- control plane ----------------------------------------------------------
+//
+// What is left here is the transport's share of it: the worker address to put
+// in the request, the endpoint to create from the reply, and the state this
+// class publishes to the layer above.  `SessionClient` owns the rest, and owns
+// it in `core/` where it can be tested without a NIC.
+
 std::vector<std::byte> SubscriberEngine::make_open_request(std::uint64_t correlation_id) const
 {
-    Protocol::OpenRequest request;
-    request.version_min = Protocol::k_version_major;
-    request.version_max = Protocol::k_version_major;
-    // Coalescing and probe.  Geometry re-arm is left out because 4.3's
-    // two-ring interlock is not implemented, and claiming a capability this side
-    // cannot honour is worse than not having it.
-    request.requested_caps = Protocol::k_caps_credit_coalescing | Protocol::k_caps_probe;
-    request.client_instance_id = Protocol::generate_client_instance_id();
-    request.requested_max_frame_bytes = config_.max_frame_bytes;
-    request.requested_ring_depth = config_.ring_depth;
-    request.requested_credit_window = config_.credit_window;
-    request.requested_memory_kind = config_.receive_memory_kind;
-    request.requested_transport = Protocol::Transport::ActiveMessage;
-    request.drop_policy = config_.drop_policy;
-    request.stream_name = config_.stream_name;
-    request.client_ucx_address = worker_->address();
-
-    return Protocol::encode(request, correlation_id);
+    return session_.make_open_request(config_, worker_->address(), correlation_id);
 }
 
 Status SubscriberEngine::adopt_open_reply(const std::byte *data, std::size_t size)
 {
-    Protocol::Envelope envelope;
-    if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
+    const Status status = session_.adopt_open_reply(data, size, config_);
+    if(status != Status::Ok)
     {
         state_.store(SubscriberState::Failed, std::memory_order_release);
-        return Status::MalformedMessage;
+        return status;
     }
-
-    // A client must accept Error in place of any expected reply.
-    if(envelope.msg_type == Protocol::CoordType::Error)
-    {
-        Protocol::ErrorMessage error;
-        const Status decoded = Protocol::decode(data, size, error);
-        state_.store(SubscriberState::Failed, std::memory_order_release);
-        return decoded == Status::Ok ? error.status : Status::MalformedMessage;
-    }
-
-    Protocol::OpenReply reply;
-    if(Protocol::decode(data, size, reply) != Status::Ok)
-    {
-        state_.store(SubscriberState::Failed, std::memory_order_release);
-        return Status::MalformedMessage;
-    }
-
-    if(reply.status != Status::Ok)
-    {
-        state_.store(SubscriberState::Failed, std::memory_order_release);
-        return reply.status;
-    }
-
-    if(reply.geometry.validate() != Status::Ok)
-    {
-        state_.store(SubscriberState::Failed, std::memory_order_release);
-        return Status::GeometryMismatch;
-    }
-
-    // A grant is only ever clamped downward (3.5 step 5), so a ring registered
-    // at the requested geometry is always large enough for the granted one.
-    // Checking anyway, because "always" here depends on the peer behaving.
-    if(reply.geometry.max_frame_bytes > config_.max_frame_bytes ||
-       reply.geometry.ring_depth > config_.ring_depth)
-    {
-        state_.store(SubscriberState::Failed, std::memory_order_release);
-        return Status::GeometryMismatch;
-    }
-
-    session_id_ = reply.session_id;
-    stream_id_ = reply.stream_id;
-    generation_ = reply.geometry.generation;
-    granted_depth_ = reply.geometry.ring_depth;
-    granted_frame_bytes_ = reply.geometry.max_frame_bytes;
-    lease_ttl_ms_ = reply.lease_ttl_ms;
-    renew_interval_ms_ = reply.renew_interval_ms;
 
     tracker_.reset(0);
 
     // Still the only thread touching this worker: the engine has not started.
     try
     {
-        endpoint_ = worker_->create_endpoint(reply.server_ucx_address.data(),
-                                             reply.server_ucx_address.size());
+        endpoint_ = worker_->create_endpoint(session_.server_address().data(),
+                                             session_.server_address().size());
     }
     catch(const BulkException &)
     {
@@ -346,72 +305,33 @@ Status SubscriberEngine::adopt_open_reply(const std::byte *data, std::size_t siz
 
 std::vector<std::byte> SubscriberEngine::make_renew_request(std::uint64_t correlation_id)
 {
-    Protocol::RenewRequest request;
-    request.session_id = session_id_;
-    request.client_frames_delivered = frames_delivered_.load(std::memory_order_relaxed);
-    request.client_credits_returned = arena_ ? arena_->credits_returned() : 0;
-    request.client_state = static_cast<std::uint32_t>(state_.load(std::memory_order_acquire));
-
     renewals_sent_.fetch_add(1, std::memory_order_relaxed);
-    return Protocol::encode(request, correlation_id);
+    return session_.make_renew_request(
+        correlation_id,
+        frames_delivered_.load(std::memory_order_relaxed),
+        arena_ ? arena_->credits_returned() : 0,
+        static_cast<std::uint32_t>(state_.load(std::memory_order_acquire)));
 }
 
 Status SubscriberEngine::adopt_renew_reply(const std::byte *data, std::size_t size)
 {
-    Protocol::Envelope envelope;
-    if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
+    const SessionClient::RenewOutcome outcome = session_.adopt_renew_reply(data, size);
+
+    if(outcome.status != Status::Ok)
     {
         renewals_failed_.fetch_add(1, std::memory_order_relaxed);
-        return Status::MalformedMessage;
     }
-
-    // 7.4: a transport-level failure of the command is a recovery hint, and so
-    // is an Error in place of the reply.  Neither is terminal on its own -- only
-    // the server saying the session is gone is.
-    if(envelope.msg_type == Protocol::CoordType::Error)
+    if(outcome.session_lost)
     {
-        renewals_failed_.fetch_add(1, std::memory_order_relaxed);
-        Protocol::ErrorMessage error;
-        const Status decoded = Protocol::decode(data, size, error);
-        return decoded == Status::Ok ? error.status : Status::MalformedMessage;
+        state_.store(SubscriberState::Failed, std::memory_order_release);
     }
 
-    Protocol::RenewReply reply;
-    if(Protocol::decode(data, size, reply) != Status::Ok)
-    {
-        renewals_failed_.fetch_add(1, std::memory_order_relaxed);
-        return Status::MalformedMessage;
-    }
-
-    if(reply.status != Status::Ok)
-    {
-        renewals_failed_.fetch_add(1, std::memory_order_relaxed);
-
-        // 3.7: SessionExpired and UnknownSession both mean this session is over
-        // and MUST NOT be treated as recoverable -- "There is no resurrection."
-        // RenewTooFrequent is the opposite: the lease is untouched and the only
-        // correct response is to renew less often.
-        if(reply.status != Status::RenewTooFrequent)
-        {
-            state_.store(SubscriberState::Failed, std::memory_order_release);
-        }
-        return reply.status;
-    }
-
-    // 3.7: the server MAY change either term at any renewal and the client MUST
-    // adopt the new value.
-    lease_ttl_ms_ = reply.lease_ttl_ms;
-    renew_interval_ms_ = reply.renew_interval_ms;
-
-    return Status::Ok;
+    return outcome.status;
 }
 
 std::vector<std::byte> SubscriberEngine::make_close_request(std::uint64_t correlation_id) const
 {
-    Protocol::CloseRequest request;
-    request.session_id = session_id_;
-    request.reason = Protocol::CloseReason::ClientShutdown;
-    return Protocol::encode(request, correlation_id);
+    return session_.make_close_request(correlation_id);
 }
 
 // -- engine thread ----------------------------------------------------------
@@ -477,9 +397,18 @@ bool SubscriberEngine::quiesce() noexcept
     // rendezvous get and which this class can neither name nor close.
     //
     // The whole point is that none of this may depend on the peer.  A device
-    // server restarts, a client is killed, a session is force-closed with frames
-    // still moving -- in each case the far side stops answering mid-transfer, and
+    // server restarts, a client is killed, a session is closed with frames still
+    // moving -- in each case the far side stops answering mid-transfer, and
     // teardown here still has to end at a worker that is safe to destroy.
+
+    // 0. Stop accepting new frames, before anything progresses the worker.
+    //
+    //    Every step below drains by calling ucp_worker_progress, and progress is
+    //    what runs the AM handler.  Without this the drain competes with a
+    //    publisher that is still sending -- each pass retires some receives and
+    //    starts others, `rndv_inflight_` never reaches zero, and a subscriber
+    //    closing under load quarantines a healthy worker.
+    closing_ = true;
 
     // 1. Bounded wait for outstanding receives to land on their own.  When the
     //    peer is merely slower than we are, every transfer finishes here and the
@@ -510,14 +439,23 @@ bool SubscriberEngine::quiesce() noexcept
     // runs inside progress -- so it needs a second drain to be observed.
     drain_inflight_receives();
 
-    // 3. Close our own endpoint: bounded wait, then force, the same shape 4.2
-    //    fixes for the publisher.
+    // 3. Close our own endpoint, bounded.
+    //
+    //    Deliberately *not* UCP_EP_CLOSE_FLAG_FORCE, which ucp.h says "requires
+    //    set UCP_ERR_HANDLING_MODE_PEER for all endpoints created on both (local
+    //    and remote) sides to avoid undefined behavior".  6.3 mandates NONE, and
+    //    the behaviour force leaves undefined is the publisher's, not ours: a
+    //    client's shutdown must not be able to fault a device server.
+    //
+    //    Without the flag the close flushes outstanding operations instead, so a
+    //    silent peer leaves it in progress.  That is what the budget is for --
+    //    ucp_request_free releases a request "regardless of its current state",
+    //    after which no callback fires and the close still finishes internally.
     if(endpoint_ != nullptr)
     {
         ucp_request_param_t param;
         std::memset(&param, 0, sizeof(param));
-        param.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS;
-        param.flags = UCP_EP_CLOSE_FLAG_FORCE;
+        param.op_attr_mask = 0;
 
         void *close = ucp_ep_close_nbx(endpoint_, &param);
         if(UCS_PTR_IS_PTR(close))
@@ -571,9 +509,10 @@ bool SubscriberEngine::drain_credit_returns()
         // The slot is free the moment its credit is on its way back.  Clearing
         // the flag here, on the engine thread, is what keeps `occupied` a purely
         // engine-thread quantity despite releases happening anywhere.
-        if(granted_depth_ != 0)
+        const std::uint32_t depth = session_.granted_ring_depth();
+        if(depth != 0)
         {
-            arena_->slot(static_cast<std::size_t>(sequence % granted_depth_)).occupied = false;
+            arena_->slot(static_cast<std::size_t>(sequence % depth)).occupied = false;
         }
 
         tracker_.release(sequence);
@@ -597,8 +536,8 @@ bool SubscriberEngine::send_pending_credit()
     }
 
     Protocol::CreditMessage credit;
-    credit.generation = generation_;
-    credit.stream_id = stream_id_;
+    credit.generation = session_.generation();
+    credit.stream_id = session_.stream_id();
     // 3.12: cumulative.  Every sequence at or below this has been released, and
     // 5.5 advances it only across the contiguous prefix -- one message per
     // progress iteration however many views were let go, which is what makes
@@ -622,6 +561,9 @@ bool SubscriberEngine::send_pending_credit()
 
     if(UCS_PTR_IS_ERR(request))
     {
+        // Hand the ack back to the tracker: nothing carries it now, and if this
+        // was the last release of the stream nothing later will either.
+        tracker_.mark_ack_failed();
         transport_errors_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -648,8 +590,9 @@ ucs_status_t SubscriberEngine::on_probe_am(void *arg,
     auto *self = static_cast<SubscriberEngine *>(arg);
 
     Protocol::ProbeMessage probe;
-    if(Protocol::decode(static_cast<const std::byte *>(header), header_length, probe) != Status::Ok ||
-       probe.stream_id != self->stream_id_)
+    const auto *bytes = static_cast<const std::byte *>(header);
+    if(Protocol::decode(bytes, header_length, probe) != Status::Ok ||
+       probe.stream_id != self->session_.stream_id())
     {
         self->dropped_bad_header_.fetch_add(1, std::memory_order_relaxed);
         return UCS_OK;
@@ -671,8 +614,8 @@ bool SubscriberEngine::send_pending_probe_ack()
     }
 
     Protocol::ProbeAckMessage ack;
-    ack.generation = generation_;
-    ack.stream_id = stream_id_;
+    ack.generation = session_.generation();
+    ack.stream_id = session_.stream_id();
     ack.probe_token = pending_probe_token_;
 
     const std::array<std::byte, Protocol::k_probe_ack_bytes> bytes = Protocol::encode(ack);
@@ -721,9 +664,12 @@ void SubscriberEngine::on_credit_sent(void *request,
 
     if(status != UCS_OK)
     {
-        // Nothing to repair: credit is cumulative, so the next Credit message
-        // carries everything this one would have (3.12).  That is the whole
-        // reason there is no retransmit path here.
+        // Credit is cumulative, so the next Credit message carries everything
+        // this one would have (3.12) -- but only if there is a next one.  Re-arm
+        // the ack so the loop sends it again, rather than betting the last
+        // credit of a stream on a release that may never come.  This runs inside
+        // ucp_worker_progress, so it is the engine thread touching the tracker.
+        self->tracker_.mark_ack_failed();
         self->transport_errors_.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -751,9 +697,19 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
                                             std::size_t length,
                                             const ucp_am_recv_param_t *param) noexcept
 {
-    // 3.11's seven checks, in order.  Every failure drops the frame, bumps a
-    // counter, and returns UCS_OK -- never aborts the worker, because one
-    // malformed frame from one peer must not take the transport down.
+    if(closing_)
+    {
+        // Teardown drains outstanding receives by calling ucp_worker_progress,
+        // which is what runs this handler; starting one more here is what would
+        // make that drain unbounded.  Returning UCS_OK without calling
+        // ucp_am_recv_data_nbx drops the descriptor and completes the
+        // publisher's send with UCS_OK (ucp.h).
+        return UCS_OK;
+    }
+
+    // 3.11's seven checks.  Every failure drops the frame, bumps a counter, and
+    // returns UCS_OK -- never aborts the worker, because one malformed frame
+    // from one peer must not take the transport down.
     Protocol::FrameHeader frame;
     if(Protocol::decode(header, header_length, frame) != Status::Ok)
     {
@@ -761,7 +717,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         return UCS_OK;
     }
 
-    if(frame.stream_id != stream_id_)
+    if(frame.stream_id != session_.stream_id())
     {
         // 4.4: a frame for an unknown stream_id is dropped, never treated as a
         // request to create a session.
@@ -769,31 +725,45 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         return UCS_OK;
     }
 
-    if(frame.payload_bytes != length)
-    {
-        dropped_bad_header_.fetch_add(1, std::memory_order_relaxed);
-        return UCS_OK;
-    }
-
-    if(frame.payload_bytes > granted_frame_bytes_)
-    {
-        dropped_oversize_.fetch_add(1, std::memory_order_relaxed);
-        return UCS_OK;
-    }
-
-    if(frame.generation != generation_)
+    // Ahead of the size checks, deviating from 3.11's written order, because the
+    // releases below depend on it: a sequence only means something inside its
+    // own epoch, since sequences restart at a re-arm.
+    if(frame.generation != session_.generation())
     {
         dropped_stale_epoch_.fetch_add(1, std::memory_order_relaxed);
         return UCS_OK;
     }
 
-    const std::size_t slot_index = static_cast<std::size_t>(frame.sequence % granted_depth_);
+    // Past here the sequence is in *this* window, so dropping the frame has to
+    // release it.  Nothing else ever will -- a dropped frame is never committed
+    // and so never gets a view -- and credit advances only across a contiguous
+    // prefix (5.5), so one un-released sequence freezes the ack below it for
+    // good and the publisher's window fills and never reopens.
+    if(frame.payload_bytes != length)
+    {
+        dropped_bad_header_.fetch_add(1, std::memory_order_relaxed);
+        tracker_.release(frame.sequence);
+        return UCS_OK;
+    }
+
+    if(frame.payload_bytes > session_.granted_frame_bytes())
+    {
+        dropped_oversize_.fetch_add(1, std::memory_order_relaxed);
+        tracker_.release(frame.sequence);
+        return UCS_OK;
+    }
+
+    const auto slot_index =
+        static_cast<std::size_t>(frame.sequence % session_.granted_ring_depth());
     ReceiveSlot &slot = arena_->slot(slot_index);
 
     if(slot.occupied || frame.sequence < tracker_.released_end())
     {
         // 5.3: unreachable while the credit window is respected, so reaching it
-        // means the peer sent a sequence it had no credit for.
+        // means the peer sent a sequence it had no credit for.  Not released,
+        // unlike the drops above: this sequence either belongs to a frame still
+        // moving through the slot or was released once already, and releasing it
+        // again would credit one arrival twice.
         dropped_duplicate_seq_.fetch_add(1, std::memory_order_relaxed);
         return UCS_OK;
     }
@@ -823,9 +793,17 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         // application eventually sees is this one.
         ucp_request_param_t recv_param;
         std::memset(&recv_param, 0, sizeof(recv_param));
-        recv_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
+        recv_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA |
+                                  UCP_OP_ATTR_FIELD_MEMORY_TYPE | UCP_OP_ATTR_FIELD_MEMH;
         recv_param.cb.recv_am = &SubscriberEngine::on_rndv_complete;
         recv_param.user_data = &pending_[slot_index];
+        // The destination was registered at construction and its kind known
+        // then, so there is no reason to make UCX rediscover either: ucp.h
+        // describes the handle as letting a protocol "skip the registration
+        // step", and the memory type is what stops UCX probing the pointer for
+        // one -- a driver query per frame on the CUDA path.
+        recv_param.memory_type = to_ucs_memory_type(config_.receive_memory_kind);
+        recv_param.memh = arena_->ring().memory().handle();
 
         void *request = ucp_am_recv_data_nbx(worker_->get(),
                                              data,
@@ -853,6 +831,20 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         pending_[slot_index].request = request;
         ++rndv_inflight_;
         return UCS_INPROGRESS;
+    }
+
+    // Eager into a device ring is not a slow path, it is an invalid one: the
+    // memcpy below is a CPU store into what for a Cuda or Rocm arena is a device
+    // pointer.  The publisher forces rendezvous for a non-host session (4.4), so
+    // arriving here means the two sides disagree and the data path can no longer
+    // be trusted -- fail the session, as a failed rendezvous start does.
+    if(config_.receive_memory_kind != MemoryKind::Host)
+    {
+        slot.occupied = false;
+        tracker_.release(frame.sequence);
+        transport_errors_.fetch_add(1, std::memory_order_relaxed);
+        state_.store(SubscriberState::Failed, std::memory_order_release);
+        return UCS_OK;
     }
 
     // Eager: UCX has already staged the bytes, so there is a copy and no way to
@@ -1015,7 +1007,7 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
     out.views_outstanding = arena_->views_outstanding();
     out.delivery_queue_depth = delivery_.size();
     out.delivery_queue_high_water = delivery_high_water_.load(std::memory_order_relaxed);
-    out.sessions_opened = stream_id_ != 0 ? 1u : 0u;
+    out.sessions_opened = session_.stream_id() != 0 ? 1u : 0u;
     out.renewals_sent = renewals_sent_.load(std::memory_order_relaxed);
     out.renewals_failed = renewals_failed_.load(std::memory_order_relaxed);
     out.transport_errors = transport_errors_.load(std::memory_order_relaxed);

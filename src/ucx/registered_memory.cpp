@@ -95,27 +95,13 @@ RegisteredMemory RegisteredMemory::adopted(UcxContext &context,
     memory.bytes_ = bytes;
     memory.owner_ = std::move(owner);
 
-    ucs_memory_type_t ucx_memory_type = UCS_MEMORY_TYPE_HOST;
-    switch(memory_kind)
-    {
-    case MemoryKind::Host:
-        ucx_memory_type = UCS_MEMORY_TYPE_HOST;
-        break;
-    case MemoryKind::Cuda:
-        ucx_memory_type = UCS_MEMORY_TYPE_CUDA;
-        break;
-    case MemoryKind::Rocm:
-        ucx_memory_type = UCS_MEMORY_TYPE_ROCM;
-        break;
-    }
-
     ucp_mem_map_params_t params;
     std::memset(&params, 0, sizeof(params));
     params.field_mask = UCP_MEM_MAP_PARAM_FIELD_ADDRESS | UCP_MEM_MAP_PARAM_FIELD_LENGTH |
                         UCP_MEM_MAP_PARAM_FIELD_MEMORY_TYPE;
     params.address = memory.owner_.get();
     params.length = bytes;
-    params.memory_type = ucx_memory_type;
+    params.memory_type = to_ucs_memory_type(memory_kind);
 
     const ucs_status_t status = ucp_mem_map(memory.context_, &params, &memory.memh_);
     if(status != UCS_OK)

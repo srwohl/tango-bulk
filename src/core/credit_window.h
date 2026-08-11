@@ -105,6 +105,20 @@ class ReleaseTracker
     /// and why the ratio between them is the direct measurement of coalescing.
     bool take_pending_ack(std::uint64_t &ack_sequence) noexcept;
 
+    /// Offer the last taken ack again, because sending it failed.
+    ///
+    /// A lost `Credit` message is normally self-repairing, and cumulative credit
+    /// is why: the next one carries everything the lost one would have.  That
+    /// argument holds for every ack except the last.  If nothing else is
+    /// released there is no next message, and the publisher waits out its lease
+    /// holding a slot the application gave back long ago -- the one credit whose
+    /// loss is not recoverable is the one at the end of a stream.
+    ///
+    /// Rolling back rather than tracking the send is deliberate.  Re-offering an
+    /// ack that in fact arrived costs one duplicate message, which a cumulative
+    /// protocol is required to ignore anyway.
+    void mark_ack_failed() noexcept;
+
     /// First sequence not yet released contiguously.
     std::uint64_t released_end() const noexcept;
 

@@ -75,9 +75,18 @@ int main(int argc, char *argv[])
                 {publisher.status, "publisher is not ready", "BulkQuery"});
         }
 
+        // Everything below divides by this, and it arrives from the peer.
+        if(publisher.max_frame_bytes == 0)
+        {
+            throw TangoBulk::BulkException({TangoBulk::Status::GeometryMismatch,
+                                            "publisher advertised a zero maximum frame size",
+                                            "BulkQuery"});
+        }
+
         // Preserve the example's original 256 MiB receive-ring target. The
         // protocol requires at least two slots, so an exceptionally large frame
-        // can raise the actual allocation above that target (up to 512 MiB).
+        // can raise the actual allocation above that target -- to at most twice
+        // k_max_frame_bytes_hard_cap, which is the 512 MiB worst case.
         constexpr std::uint64_t ring_memory_target = 256ull << 20;
         const std::uint64_t slots_in_target =
             ring_memory_target / publisher.max_frame_bytes;
@@ -102,12 +111,25 @@ int main(int argc, char *argv[])
         // subscriber, so the CUDA allocation must follow the receive arena's
         // lifetime rather than main()'s lexical scope.
         std::shared_ptr<void> receive_buffer(device_memory,
-                                             [](void *pointer)
+                                             [gpu](void *pointer)
                                              {
-                                                 if(pointer != nullptr)
+                                                 if(pointer == nullptr)
                                                  {
-                                                     (void) cudaFree(pointer);
+                                                     return;
                                                  }
+                                                 // Which thread drops the last
+                                                 // reference is not knowable
+                                                 // here -- it may be the engine,
+                                                 // or a FrameView released after
+                                                 // this scope ended -- and the
+                                                 // CUDA runtime's current device
+                                                 // is per thread.  Freeing a
+                                                 // device-`gpu` pointer from a
+                                                 // thread still on device 0
+                                                 // fails, and the failure is
+                                                 // this allocation leaking.
+                                                 (void) cudaSetDevice(gpu);
+                                                 (void) cudaFree(pointer);
                                              });
 
         TangoBulk::SubscriberConfig config;
@@ -130,20 +152,52 @@ int main(int argc, char *argv[])
         const auto buffer_end = buffer_begin + ring_bytes;
 
         subscriber.set_frame_callback(
-            [&frames, &bytes, buffer_begin, buffer_end](TangoBulk::FrameView view)
+            [&frames, &bytes, gpu, buffer_begin, buffer_end](TangoBulk::FrameView view)
             {
+                // DeliveryMode::DispatchThread runs this on a library thread,
+                // and the CUDA runtime's current device is per thread: the
+                // cudaSetDevice above bound main(), not this one, so a kernel
+                // launched below would go to device 0 whatever `gpu` says.
+                // This is the first code of ours the dispatch thread runs, so it
+                // is the earliest place to bind it, and once is enough.
+                thread_local const cudaError_t bound = cudaSetDevice(gpu);
+                if(bound != cudaSuccess)
+                {
+                    std::cerr << "dispatch thread could not select GPU " << gpu << ": "
+                              << cudaGetErrorString(bound) << "\n";
+                    running.store(false);
+                    return;
+                }
+
                 // This is a CUDA device address: never dereference it on the CPU.
+                //
+                // Written as a subtraction because `address + view.size()` can
+                // wrap, and a wrapped sum compares as in-range.
                 const auto address = reinterpret_cast<std::uintptr_t>(view.data());
-                if(address < buffer_begin || address + view.size() > buffer_end)
+                if(address < buffer_begin || address > buffer_end ||
+                   view.size() > buffer_end - address)
                 {
                     std::cerr << "received a frame outside the CUDA ring\n";
                     running.store(false);
                     return;
                 }
 
-                // A real GPU consumer can launch a kernel on view.data() here.
-                // It must retain the FrameView until that kernel/stream has
-                // finished, because releasing the view returns the slot credit.
+                // A real GPU consumer launches a kernel on view.data() here and
+                // must hold the FrameView until that kernel has finished, not
+                // until this callback returns: releasing the view returns the
+                // slot credit, and the publisher may then overwrite the slot
+                // while the kernel is still reading it.  A launch is
+                // asynchronous, so the shape that works is to record a CUDA
+                // event after the launch and move the view onto a pending queue,
+                // destroying it only once that event is complete.
+                //
+                // The ordering is also why the kernel is launched from here
+                // rather than by a kernel already resident on the GPU: NVIDIA's
+                // GPUDirect RDMA documentation is explicit that a running kernel
+                // cannot safely observe an incoming RDMA write, and that the CPU
+                // must see the network completion before it submits work that
+                // depends on it.  This callback runs after exactly that
+                // completion.
                 frames.fetch_add(1, std::memory_order_relaxed);
                 bytes.fetch_add(view.size(), std::memory_order_relaxed);
             });

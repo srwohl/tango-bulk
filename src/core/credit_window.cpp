@@ -190,6 +190,14 @@ bool ReleaseTracker::take_pending_ack(std::uint64_t &ack_sequence) noexcept
     return true;
 }
 
+void ReleaseTracker::mark_ack_failed() noexcept
+{
+    // Clearing the flag rather than restoring `last_ack_sent_`: the next take
+    // offers `released_end_ - 1`, which is the failed ack or something newer,
+    // and either way it is the value the publisher needs.
+    ack_sent_ = false;
+}
+
 std::uint64_t ReleaseTracker::released_end() const noexcept
 {
     return released_end_;

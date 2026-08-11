@@ -21,6 +21,7 @@ add_library(
     lease_pool.cpp
     pinned_budget.cpp
     protocol.cpp
+    session_client.cpp
     session_id.cpp)
 add_library(tango-bulk::core ALIAS tango-bulk-core)
 

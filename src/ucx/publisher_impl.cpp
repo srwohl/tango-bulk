@@ -1147,28 +1147,36 @@ struct BulkPublisher::Impl
             flush_param.op_attr_mask = 0;
             await_request(worker->get(), ucp_ep_flush_nbx(session.ep, &flush_param));
 
-            // 3. Close the endpoint, forcing after the bounded wait.
+            // 3. Close the endpoint, bounded.
+            //
+            // Deliberately *not* UCP_EP_CLOSE_FLAG_FORCE.  ucp.h requires
+            // UCP_ERR_HANDLING_MODE_PEER "for all endpoints created on both
+            // (local and remote) sides to avoid undefined behavior", and 6.3
+            // mandates NONE.  What force actually buys is the right to raise a
+            // transport-level error in the *client*, which under NONE has no
+            // handler for it -- a publisher tearing down one session must not be
+            // able to fault the process at the other end of it.  The subscriber
+            // dropped the same flag for the mirror-image reason.
             ucp_request_param_t close_param;
             std::memset(&close_param, 0, sizeof(close_param));
-            close_param.op_attr_mask = UCP_OP_ATTR_FIELD_FLAGS;
-            close_param.flags = UCP_EP_CLOSE_FLAG_FORCE;
+            close_param.op_attr_mask = 0;
             await_request(worker->get(), ucp_ep_close_nbx(session.ep, &close_param));
             session.ep = nullptr;
 
-            // 3b. Collect the completions the force-close just produced.
+            // 3b. Collect the completions the close produced.
             //
-            // Forcing the endpoint shut fails every send still on it, but a
-            // failed send is still delivered through on_send_complete, and that
-            // callback only runs inside progress.  Without this the requests are
-            // never freed: UCX reports it at cleanup as "was not returned to
-            // mpool ucp_requests" and LeakSanitizer as an indirect leak from
-            // ucs_posix_memalign.
+            // A close completes every send still on the endpoint, successfully
+            // or not, and either way through on_send_complete -- which only runs
+            // inside progress.  Without this the requests are never freed: UCX
+            // reports it at cleanup as "was not returned to mpool ucp_requests"
+            // and LeakSanitizer as an indirect leak from ucs_posix_memalign.
             //
             // It sits after the close rather than in step 2 on purpose.  The
             // sends stranded here are exactly the ones the step-2 flush could
             // not drain -- a consumer that stopped returning credit leaves them
-            // unsendable -- so waiting on them before forcing would only burn
-            // the budget twice.
+            // unsendable -- so waiting on them before closing would only burn
+            // the budget twice.  Whatever the budget does not collect leaves the
+            // seat poisoned below, which is the accounted outcome.
             const auto deadline = std::chrono::steady_clock::now() + k_teardown_budget;
             while(session.sends_inflight > 0 && std::chrono::steady_clock::now() < deadline)
             {
