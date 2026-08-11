@@ -33,6 +33,8 @@ target_link_libraries(
     PUBLIC tango-bulk::core tango-bulk::settings Tango::Tango
     PRIVATE tango-bulk::ucx Threads::Threads)
 
+tango_bulk_apply_warnings(tango-bulk-tango)
+
 # cppTango's public headers do not survive this project's warning set, and it is
 # not this project's business to demand that they should.  No action is needed:
 # CMake already treats an IMPORTED target's interface includes as SYSTEM, so

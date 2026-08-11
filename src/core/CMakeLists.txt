@@ -33,4 +33,6 @@ target_include_directories(
 
 target_link_libraries(tango-bulk-core PUBLIC tango-bulk::settings)
 
+tango_bulk_apply_warnings(tango-bulk-core)
+
 set_target_properties(tango-bulk-core PROPERTIES OUTPUT_NAME tango-bulk-core)

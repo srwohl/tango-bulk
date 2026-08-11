@@ -21,6 +21,31 @@ They are built with `-DTANGO_BULK_BUILD_EXAMPLES=ON`, which `pixi run build` set
 property: an example that reached inside the library would fail to compile rather than quietly work
 in this tree and nowhere else.
 
+## Building against an installed tango-bulk
+
+The examples above are in this tree, so they get their targets from the build tree. A real
+application gets them from the installed package instead:
+
+```sh
+pixi run install                 # or: cmake --install build --prefix /your/prefix
+```
+
+```cmake
+find_package(tango-bulk 0.1 REQUIRED)
+
+add_executable(my-client my_client.cpp)
+target_link_libraries(my-client PRIVATE tango-bulk::tango)
+```
+
+```sh
+cmake -S . -B build -DCMAKE_PREFIX_PATH=/your/prefix
+```
+
+The target names are the same either way — `tango-bulk::tango`, `::ucx`, `::core`, and the
+`tango-bulk::tango-bulk` umbrella — and the package config finds UCX (through the `FindUCX.cmake`
+installed beside it) and cppTango on the consumer's behalf. A device server links
+`tango-bulk::tango`; a client that never touches Tango can link `tango-bulk::ucx`.
+
 ## Running them without a Tango database
 
 Two terminals, no database, no configuration:

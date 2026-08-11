@@ -31,3 +31,5 @@ target_link_libraries(
     tango-bulk-ucx
     PUBLIC tango-bulk::core tango-bulk::settings
     PRIVATE UCX::ucp Threads::Threads)
+
+tango_bulk_apply_warnings(tango-bulk-ucx)

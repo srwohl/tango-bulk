@@ -66,6 +66,13 @@ _configure = { cmd = [
 ] }
 build = { cmd = "cmake --build build", depends-on = ["_configure"] }
 test = { cmd = "ctest --test-dir build --output-on-failure", depends-on = ["build"] }
+
+# The exported package is part of what this project ships, so there has to be a
+# documented way to produce it.  Without one it is only ever exercised by
+# whoever packages the library, which is how the installed target names came to
+# disagree with the ones in the README.  CMAKE_INSTALL_PREFIX is $CONDA_PREFIX
+# from _configure; pass --prefix to install somewhere else.
+install = { cmd = "cmake --install build", depends-on = ["build"] }
 clean = "rm -rf build build-asan build-tsan"
 
 # The sweeps in tests/unit/test_protocol_malformed.cpp only prove the

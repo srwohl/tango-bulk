@@ -16,6 +16,8 @@ target_link_libraries(tango-bulk-bench PRIVATE tango-bulk::ucx)
 
 target_include_directories(tango-bulk-bench PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+tango_bulk_apply_warnings(tango-bulk-bench)
+
 set_target_properties(tango-bulk-bench PROPERTIES RUNTIME_OUTPUT_NAME tango-bulk-bench)
 
 # A loopback smoke run, so "the benchmark still builds and moves bytes" is a

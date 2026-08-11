@@ -6,10 +6,24 @@
 
 include(CMakeFindDependencyMacro)
 
+# FindUCX.cmake is installed beside this file, so the module path has to reach
+# it for the find_dependency below -- and must be left exactly as it was found,
+# because this is a consumer's variable, not ours.
+#
+# Save and restore rather than insert-then-REMOVE_AT(0): find_dependency(Tango)
+# runs in between and cppTango's config is free to prepend a directory of its
+# own, in which case removing index 0 takes Tango's entry and leaves ours on a
+# consumer's module path for the rest of their configure.
+set(_tango_bulk_saved_module_path "${CMAKE_MODULE_PATH}")
 list(INSERT CMAKE_MODULE_PATH 0 "${CMAKE_CURRENT_LIST_DIR}")
 
 find_dependency(Threads)
-find_dependency(UCX @UCX_VERSION@)
+
+# The version this project requires, substituted from TANGO_BULK_UCX_MIN_VERSION
+# -- not the version that happened to be installed on the machine that built the
+# package, which is what @UCX_VERSION@ meant and which refused consumers running
+# a UCX this library supports.
+find_dependency(UCX @TANGO_BULK_UCX_MIN_VERSION@)
 
 set(TANGO_BULK_WITH_TANGO_ADAPTER @TANGO_BULK_BUILD_TANGO_ADAPTER@)
 
@@ -17,7 +31,8 @@ if(TANGO_BULK_WITH_TANGO_ADAPTER)
     find_dependency(Tango)
 endif()
 
-list(REMOVE_AT CMAKE_MODULE_PATH 0)
+set(CMAKE_MODULE_PATH "${_tango_bulk_saved_module_path}")
+unset(_tango_bulk_saved_module_path)
 
 include("${CMAKE_CURRENT_LIST_DIR}/tango-bulk-targets.cmake")
 

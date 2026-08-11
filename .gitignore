@@ -9,3 +9,4 @@ compile_commands.json
 *.so
 *.so.*
 demo-tango.db
+Testing/

@@ -55,4 +55,18 @@ if(CUDAToolkit_FOUND)
     endif()
     target_link_libraries(tango-bulk-example-cuda-client
                           PRIVATE tango-bulk::tango CUDA::cudart)
+
+    tango_bulk_apply_warnings(tango-bulk-example-cuda-client)
 endif()
+
+# The examples are this project's own source, so they are held to this project's
+# warning policy -- which they inherited transitively until the policy stopped
+# being an INTERFACE property, and which is now asked for by name.
+#
+# Worth knowing what this costs: the examples are also the closest thing in the
+# tree to a consumer, so while they compile under our flags they cannot notice
+# if those flags start leaking to real consumers again.  tango-bulk-node is what
+# notices that, by being an out-of-tree consumer with its own warning policy.
+tango_bulk_apply_warnings(
+    tango-bulk-example-device tango-bulk-example-hdf5-device
+    tango-bulk-example-preview tango-bulk-example-client)
