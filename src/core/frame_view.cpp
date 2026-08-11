@@ -23,6 +23,45 @@ const FrameView::Fields &empty_fields() noexcept
     return k_empty;
 }
 
+/// The credit sink behind FrameView::detached(): it owns the description and
+/// throws the credit away.
+///
+/// A detached view could have been given a null lease instead, which would have
+/// been less code.  It would also have made `operator bool` false and
+/// `use_count()` zero, so a synthetic frame would have behaved differently from
+/// a delivered one in exactly the places a test looks -- and a test fixture that
+/// does not behave like the thing it stands in for is worse than none.  Giving
+/// it a real lease over a sink that discards costs one small allocation per
+/// synthetic frame and makes the two indistinguishable.
+///
+/// Owning the Fields copy here is what lets the factory take them by const
+/// reference: the sink outlives the view by construction, so `fields_` cannot
+/// dangle the way it would if it pointed at the caller's temporary.
+class DetachedSink final : public detail::CreditSink
+{
+  public:
+    DetachedSink(std::shared_ptr<const void> owner,
+                 const FrameView::Fields &fields) :
+        owner_(std::move(owner)),
+        fields_(fields)
+    {
+    }
+
+    void return_credit(std::uint64_t) noexcept override
+    {
+        // There is no slot and no engine. Deliberately empty.
+    }
+
+    const FrameView::Fields *fields() const noexcept
+    {
+        return &fields_;
+    }
+
+  private:
+    std::shared_ptr<const void> owner_;
+    FrameView::Fields fields_;
+};
+
 } // namespace
 
 FrameView::FrameView(std::shared_ptr<detail::ReceiveSlotLease> lease,
@@ -32,6 +71,23 @@ FrameView::FrameView(std::shared_ptr<detail::ReceiveSlotLease> lease,
     data_(data),
     fields_(fields)
 {
+}
+
+FrameView FrameView::detached(std::shared_ptr<const void> owner,
+                              const std::byte *data,
+                              const Fields &fields)
+{
+    auto sink = std::make_shared<DetachedSink>(std::move(owner), fields);
+
+    // The Fields pointer must outlive every copy of the view, so it is taken
+    // from the sink -- which the lease owns and the view holds -- and never
+    // from the caller's argument.
+    const Fields *stored = sink->fields();
+
+    auto lease = std::make_shared<detail::ReceiveSlotLease>(std::move(sink),
+                                                            fields.sequence);
+
+    return FrameView(std::move(lease), data, stored);
 }
 
 FrameView::operator bool() const noexcept

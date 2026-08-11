@@ -270,15 +270,39 @@ class FrameView
     long use_count() const noexcept;                 // diagnostics/tests only
     void reset() noexcept;                           // release early; returns the credit
 
+    struct Fields { /* POD: shape, strides, sequence, timestamps, type, ... */ };
+
+    // A view over caller-owned memory that references no receive slot. Holds a
+    // real lease over a discarding sink, so operator bool, use_count() and
+    // reset() behave exactly as they do for a delivered frame. `fields` is
+    // copied; `data` is never dereferenced and may be a device pointer.
+    static FrameView detached(std::shared_ptr<const void> owner,
+                              const std::byte *data,
+                              const Fields &fields);
+
   private:
     friend class detail::ReceiveSlotLease;
-    struct Fields;                                   // POD, copied by value
+    FrameView(std::shared_ptr<detail::ReceiveSlotLease>, const std::byte *,
+              const Fields *) noexcept;
     std::shared_ptr<detail::ReceiveSlotLease> lease_;
+    const std::byte *data_{nullptr};
     const Fields *fields_{nullptr};
 };
 
 } // namespace TangoBulk
 ```
+
+`Fields` is public. The receive path populates one, and an application building a synthetic frame
+populates one; hiding it would buy nothing and cost a friend declaration per implementation file.
+
+`detached()` exists because the receive path's constructor is private, which left an application
+unable to construct a `FrameView` at all — and therefore unable to unit-test anything written
+against `FrameCallback`, which is `void(FrameView)` and so is most of what an application writes.
+Testing those against a live publisher is an integration test, not a unit test, and it does not run
+where there is no fabric. A synthetic view is deliberately indistinguishable from a delivered one
+in every observable, because a fixture that behaves differently from the thing it stands in for
+cannot answer the question worth asking of this API: *does this code hold the view longer than it
+should?*
 
 `FrameView` is deliberately Tango-free: no `EventData`, no `DeviceAttribute`, no `AttributeValue_5`.
 That is the removal of the Tango dependency called for in the extraction map (§8).

@@ -172,6 +172,47 @@ class FrameView
         Endian endian{Endian::Little};
     };
 
+    /// A view over caller-owned memory that references no receive slot.
+    ///
+    /// Every other FrameView comes out of the receive path, whose constructor is
+    /// private -- which left an application unable to build one at all, and so
+    /// unable to unit-test any function that takes a FrameView.  Since the
+    /// callback signature is `void(FrameView)`, that is most of what an
+    /// application writes against this library: the geometry checks, the
+    /// retention policy, the fan-out to a consumer.  Those were testable only
+    /// against a live publisher, which is not a unit test and does not run in
+    /// CI.  This factory is the fix.
+    ///
+    /// The view it returns is observationally identical to a delivered one.  It
+    /// holds a real lease, so `operator bool` is true, `use_count()` counts
+    /// copies, and `reset()` drops the reference -- the credit simply goes to a
+    /// sink that discards it.  That equivalence is the point: it is what makes
+    /// "does my code hold the view longer than it should?" a question a test can
+    /// ask, and holding a view too long is the mistake this API is easiest to
+    /// make.
+    ///
+    /// `owner` shares ownership of whatever keeps `data` alive and may be null
+    /// when the caller guarantees that lifetime by other means.  `data` is not
+    /// dereferenced here and may point at device memory.  `fields` is copied,
+    /// so the caller need not keep it alive; note that `size()` reports
+    /// `fields.payload_bytes` and nothing cross-checks it against the
+    /// allocation behind `data`.
+    ///
+    ///     const auto pixels = std::make_shared<std::vector<std::uint16_t>>(w * h);
+    ///     FrameView::Fields fields;
+    ///     fields.rank = 2;
+    ///     fields.shape = {h, w, 0, 0};
+    ///     fields.strides = {w * 2, 2, 0, 0};
+    ///     fields.element_type = ElementType::UInt16;
+    ///     fields.element_size = 2;
+    ///     fields.payload_bytes = w * h * 2;
+    ///
+    ///     const FrameView frame = FrameView::detached(
+    ///         pixels, reinterpret_cast<const std::byte *>(pixels->data()), fields);
+    static FrameView detached(std::shared_ptr<const void> owner,
+                              const std::byte *data,
+                              const Fields &fields);
+
   private:
     friend class detail::ReceiveSlotLease;
 

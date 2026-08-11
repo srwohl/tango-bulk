@@ -19,6 +19,7 @@ add_executable(
     unit/test_credit_window.cpp
     unit/test_enums.cpp
     unit/test_errors.cpp
+    unit/test_frame_view.cpp
     unit/test_geometry.cpp
     unit/test_identifiers.cpp
     unit/test_protocol_golden.cpp
@@ -30,6 +31,8 @@ target_link_libraries(tango-bulk-unit-tests PRIVATE tango-bulk::core
                                                     Catch2::Catch2WithMain)
 
 target_include_directories(tango-bulk-unit-tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+tango_bulk_apply_warnings(tango-bulk-unit-tests)
 
 catch_discover_tests(tango-bulk-unit-tests)
 
@@ -44,6 +47,8 @@ target_link_libraries(tango-bulk-ucx-tests PRIVATE tango-bulk::ucx
                                                    Catch2::Catch2WithMain)
 
 target_include_directories(tango-bulk-ucx-tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+tango_bulk_apply_warnings(tango-bulk-ucx-tests)
 
 catch_discover_tests(tango-bulk-ucx-tests)
 
@@ -80,6 +85,8 @@ if(TANGO_BULK_BUILD_TANGO_ADAPTER)
             TANGO_BULK_FIXTURE_DEVICE="$<TARGET_FILE:tango-bulk-fixture-device>")
 
     add_dependencies(tango-bulk-tango-tests tango-bulk-fixture-device)
+
+    tango_bulk_apply_warnings(tango-bulk-fixture-device tango-bulk-tango-tests)
 
     # Every case in test_adapter.cpp starts a CORBA server and waits on real
     # leases, so the default 1 500 s ctest timeout is generous and the serial
