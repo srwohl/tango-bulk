@@ -31,7 +31,7 @@ pixi run install                 # or: cmake --install build --prefix /your/pref
 ```
 
 ```cmake
-find_package(tango-bulk 0.1 REQUIRED)
+find_package(tango-bulk 0.2 REQUIRED)
 
 add_executable(my-client my_client.cpp)
 target_link_libraries(my-client PRIVATE tango-bulk::tango)

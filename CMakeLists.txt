@@ -4,11 +4,31 @@
 
 cmake_minimum_required(VERSION 3.18)
 
+# 0.2.0 because FrameView::detached() added public API.
+#
+# The bump is not bookkeeping.  A consumer that needs detached() has no other way
+# to say so: find_package(tango-bulk 0.1) is satisfied by a package that predates
+# it, so the mismatch surfaces as "'detached' is not a member of
+# 'TangoBulk::FrameView'" partway through compiling the consumer's tests --
+# minutes in, in a file that has nothing to do with the cause.  A version a
+# consumer can require is what turns that into a configure-time error naming the
+# two versions.  Every later addition to the public API bumps the minor
+# component for the same reason.
 project(
     tango-bulk
-    VERSION 0.1.0
+    VERSION 0.2.0
     DESCRIPTION "UCX bulk-data plane for Tango device servers"
     LANGUAGES CXX)
+
+# The version, somewhere a parent project can actually see it.
+#
+# find_package() sets tango-bulk_VERSION in the caller's scope, but a consumer
+# that pulls this in with add_subdirectory or FetchContent gets nothing:
+# project() sets <NAME>_VERSION in the current scope, and a subdirectory's
+# scope does not reach its parent.  So the one route where a consumer is most
+# likely to be holding a stale checkout is the route where it cannot tell.
+# A global property is visible everywhere and costs a line.
+set_property(GLOBAL PROPERTY TANGO_BULK_VERSION ${PROJECT_VERSION})
 
 # Linux only, and it must fail at configure time rather than emit stub APIs.
 # IMPLEMENTATION_SPEC.md section 0.
