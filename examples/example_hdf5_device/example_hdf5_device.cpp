@@ -11,12 +11,15 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
+#include <deque>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -33,11 +36,11 @@ struct Options
 {
     std::string file;
     std::string dataset;
-    std::uint64_t cache_mib{512};
+    std::uint32_t prefetch_frames{8};
     std::optional<double> frame_rate;
     bool file_from_command_line{false};
     bool dataset_from_command_line{false};
-    bool cache_from_command_line{false};
+    bool prefetch_from_command_line{false};
 };
 
 Options options;
@@ -86,9 +89,9 @@ std::vector<char *> parse_options(int argc, char *argv[])
                 << "HDF5 replay options:\n"
                 << "  --hdf5-file PATH       override Hdf5File (mainly for -nodb)\n"
                 << "  --hdf5-dataset PATH    image stack; default follows NeXus default/signal\n"
-                << "  --cache-mib N          RAM used for whole cached frames (default 512)\n"
+                << "  --prefetch-frames N    HDF5 frames read ahead into publisher slots (default 8)\n"
                 << "  --frame-rate HZ        replay rate; 0 is unlimited (default: file timing or 100)\n"
-                << "Database mode reads Hdf5File, Hdf5Dataset, CacheMiB, and FrameRate\n"
+                << "Database mode reads Hdf5File, Hdf5Dataset, PrefetchFrames, and FrameRate\n"
                 << "from device properties; command-line values take precedence.\n";
             std::exit(0);
         }
@@ -102,15 +105,18 @@ std::vector<char *> parse_options(int argc, char *argv[])
             options.dataset = option_value(argument, "--hdf5-dataset", i, argc, argv);
             options.dataset_from_command_line = true;
         }
-        else if(argument == "--cache-mib" || argument.rfind("--cache-mib=", 0) == 0)
+        else if(argument == "--prefetch-frames" ||
+                argument.rfind("--prefetch-frames=", 0) == 0)
         {
-            const std::string value = option_value(argument, "--cache-mib", i, argc, argv);
-            options.cache_mib = std::stoull(value);
-            options.cache_from_command_line = true;
-            if(options.cache_mib == 0)
+            const std::string value = option_value(argument, "--prefetch-frames", i, argc, argv);
+            const unsigned long parsed = std::stoul(value);
+            if(parsed == 0 || parsed > k_max_ring_depth / 2)
             {
-                throw std::runtime_error("--cache-mib must be greater than zero");
+                throw std::runtime_error("--prefetch-frames must be in the range 1.." +
+                                         std::to_string(k_max_ring_depth / 2));
             }
+            options.prefetch_frames = static_cast<std::uint32_t>(parsed);
+            options.prefetch_from_command_line = true;
         }
         else if(argument == "--frame-rate" || argument.rfind("--frame-rate=", 0) == 0)
         {
@@ -220,10 +226,10 @@ DataDescription describe_type(const H5::DataType &type)
     return result;
 }
 
-class ReplayBuffer
+class ReplayReader
 {
   public:
-    ReplayBuffer(const Options &configuration) :
+    ReplayReader(const Options &configuration) :
         file_(configuration.file, H5F_ACC_RDONLY),
         dataset_path_(configuration.dataset.empty() ? discover_nexus_dataset(file_)
                                                      : configuration.dataset),
@@ -260,30 +266,26 @@ class ReplayBuffer
         {
             throw std::runtime_error("a frame exceeds tango-bulk's 256 MiB hard limit");
         }
-
-        const std::uint64_t cache_bytes = checked_multiply(configuration.cache_mib, 1ull << 20,
-                                                           "cache budget");
-        if(cache_bytes < frame_bytes_)
-        {
-            throw std::runtime_error("cache budget is smaller than one frame (frame is " +
-                                     std::to_string(frame_bytes_) + " bytes)");
-        }
-        cached_capacity_ = std::min(frame_count_, cache_bytes / frame_bytes_);
-        bytes_.resize(static_cast<std::size_t>(checked_multiply(cached_capacity_, frame_bytes_,
-                                                                "cache allocation")));
-        load(0);
     }
 
-    void copy_frame(std::uint64_t index, void *destination)
+    void read_frame(std::uint64_t index, void *destination)
     {
-        if(index < first_cached_ || index >= first_cached_ + cached_count_)
+        if(index >= frame_count_)
         {
-            load(index);
+            throw std::runtime_error("HDF5 frame index is out of range");
         }
-        const std::uint64_t offset = checked_multiply(index - first_cached_, frame_bytes_,
-                                                      "cache offset");
-        std::memcpy(destination, bytes_.data() + static_cast<std::size_t>(offset),
-                    static_cast<std::size_t>(frame_bytes_));
+
+        H5::DataSpace file_space = dataset_.getSpace();
+        std::vector<hsize_t> start(dimensions_.size(), 0);
+        std::vector<hsize_t> count = dimensions_;
+        if(dimensions_.size() > 2)
+        {
+            start[0] = index;
+            count[0] = 1;
+        }
+        file_space.selectHyperslab(H5S_SELECT_SET, count.data(), start.data());
+        H5::DataSpace memory_space(static_cast<int>(count.size()), count.data());
+        dataset_.read(destination, file_type_, memory_space, file_space);
     }
 
     double suggested_rate() const
@@ -313,7 +315,6 @@ class ReplayBuffer
     }
 
     std::uint64_t frame_count() const noexcept { return frame_count_; }
-    std::uint64_t cached_capacity() const noexcept { return cached_capacity_; }
     std::uint64_t frame_bytes() const noexcept { return frame_bytes_; }
     const std::vector<hsize_t> &frame_shape() const noexcept { return frame_shape_; }
     const std::string &dataset_path() const noexcept { return dataset_path_; }
@@ -328,28 +329,6 @@ class ReplayBuffer
         return result;
     }
 
-    void load(std::uint64_t first)
-    {
-        first_cached_ = first;
-        cached_count_ = std::min(cached_capacity_, frame_count_ - first);
-
-        H5::DataSpace file_space = dataset_.getSpace();
-        std::vector<hsize_t> start(dimensions_.size(), 0);
-        std::vector<hsize_t> count = dimensions_;
-        if(dimensions_.size() == 2)
-        {
-            count = dimensions_;
-        }
-        else
-        {
-            start[0] = first_cached_;
-            count[0] = cached_count_;
-        }
-        file_space.selectHyperslab(H5S_SELECT_SET, count.data(), start.data());
-        H5::DataSpace memory_space(static_cast<int>(count.size()), count.data());
-        dataset_.read(bytes_.data(), file_type_, memory_space, file_space);
-    }
-
     H5::H5File file_;
     std::string dataset_path_;
     H5::DataSet dataset_;
@@ -359,10 +338,6 @@ class ReplayBuffer
     std::vector<hsize_t> frame_shape_;
     std::uint64_t frame_count_{0};
     std::uint64_t frame_bytes_{0};
-    std::uint64_t cached_capacity_{0};
-    std::uint64_t first_cached_{0};
-    std::uint64_t cached_count_{0};
-    std::vector<std::byte> bytes_;
 };
 
 enum class ReplayAttribute
@@ -370,7 +345,8 @@ enum class ReplayAttribute
     FrameWidth,
     FrameHeight,
     DatasetFrames,
-    CachedFrames,
+    PrefetchFrames,
+    ReadyFrames,
     FrameRate
 };
 
@@ -389,14 +365,14 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
     {
         H5::Exception::dontPrint();
         configuration_ = read_configuration();
-        replay_ = std::make_unique<ReplayBuffer>(configuration_);
+        replay_ = std::make_unique<ReplayReader>(configuration_);
         frame_rate_.store(configuration_.frame_rate.value_or(replay_->suggested_rate()));
         frame_width_read_ = replay_->frame_shape().back();
         frame_height_read_ = replay_->frame_shape().size() > 1
                                  ? replay_->frame_shape()[replay_->frame_shape().size() - 2]
                                  : 1;
         dataset_frames_read_ = replay_->frame_count();
-        cached_frames_read_ = replay_->cached_capacity();
+        prefetch_frames_read_ = configuration_.prefetch_frames;
 
         PublisherConfig config;
         config.stream_name = "image";
@@ -404,9 +380,8 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         // carry their exact payload_bytes in FrameMetadata.
         config.max_frame_bytes = std::max<std::uint64_t>(k_min_frame_bytes,
                                                          replay_->frame_bytes());
-        const std::uint64_t depth = std::min<std::uint64_t>(16, replay_->cached_capacity());
-        config.ring_depth = static_cast<std::uint32_t>(std::max<std::uint64_t>(2, depth));
-        config.credit_window = std::max<std::uint32_t>(1, config.ring_depth / 2);
+        config.ring_depth = configuration_.prefetch_frames * 2;
+        config.credit_window = configuration_.prefetch_frames;
         config.max_sessions = 4;
         config.pinned_memory_limit_bytes = std::max<std::uint64_t>(
             1ull << 30, checked_multiply(config.max_frame_bytes, config.ring_depth + 1,
@@ -416,18 +391,27 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         attach_publisher(*this, *publisher_);
 
         running_ = true;
-        replay_thread_ = std::thread([this] { replay_loop(); });
         set_state(Tango::RUNNING);
         set_status("replaying " + configuration_.file + ":" + replay_->dataset_path() + "; " +
                    std::to_string(replay_->frame_count()) + " frames, " +
-                   std::to_string(replay_->cached_capacity()) + " cached");
+                   std::to_string(configuration_.prefetch_frames) + " prefetched");
+        loader_thread_ = std::thread([this] { loader_loop(); });
+        replay_thread_ = std::thread([this] { replay_loop(); });
     }
 
     void delete_device() override
     {
         running_ = false;
+        ready_changed_.notify_all();
+        if(loader_thread_.joinable())
+            loader_thread_.join();
         if(replay_thread_.joinable())
             replay_thread_.join();
+        {
+            std::lock_guard<std::mutex> lock(ready_mutex_);
+            ready_.clear();
+            ready_frames_.store(0);
+        }
         if(publisher_)
             detach_publisher(*this);
         publisher_.reset();
@@ -447,8 +431,12 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         case ReplayAttribute::DatasetFrames:
             attribute.set_value(&dataset_frames_read_);
             break;
-        case ReplayAttribute::CachedFrames:
-            attribute.set_value(&cached_frames_read_);
+        case ReplayAttribute::PrefetchFrames:
+            attribute.set_value(&prefetch_frames_read_);
+            break;
+        case ReplayAttribute::ReadyFrames:
+            ready_frames_read_ = ready_frames_.load();
+            attribute.set_value(&ready_frames_read_);
             break;
         case ReplayAttribute::FrameRate:
             double_read_ = frame_rate_.load();
@@ -478,7 +466,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
             Tango::DbData properties;
             properties.emplace_back("Hdf5File");
             properties.emplace_back("Hdf5Dataset");
-            properties.emplace_back("CacheMiB");
+            properties.emplace_back("PrefetchFrames");
             properties.emplace_back("FrameRate");
             get_db_device()->get_property(properties);
 
@@ -486,12 +474,18 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
                 properties[0] >> result.file;
             if(!result.dataset_from_command_line && !properties[1].is_empty())
                 properties[1] >> result.dataset;
-            if(!result.cache_from_command_line && !properties[2].is_empty())
+            if(!result.prefetch_from_command_line && !properties[2].is_empty())
             {
                 Tango::DevULong64 value = 0;
                 if(!(properties[2] >> value))
-                    throw std::runtime_error("device property CacheMiB is not an unsigned integer");
-                result.cache_mib = value;
+                    throw std::runtime_error(
+                        "device property PrefetchFrames is not an unsigned integer");
+                if(value == 0 || value > k_max_ring_depth / 2)
+                {
+                    throw std::runtime_error("device property PrefetchFrames must be in the range 1.." +
+                                             std::to_string(k_max_ring_depth / 2));
+                }
+                result.prefetch_frames = static_cast<std::uint32_t>(value);
             }
             if(!result.frame_rate && !properties[3].is_empty())
             {
@@ -507,17 +501,113 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
             throw std::runtime_error(
                 "Hdf5File device property is required (or use --hdf5-file in -nodb mode)");
         }
-        if(result.cache_mib == 0)
-            throw std::runtime_error("device property CacheMiB must be greater than zero");
+        if(result.prefetch_frames == 0 || result.prefetch_frames > k_max_ring_depth / 2)
+            throw std::runtime_error("PrefetchFrames must produce a valid publisher ring depth");
         if(result.frame_rate && (!std::isfinite(*result.frame_rate) || *result.frame_rate < 0.0))
             throw std::runtime_error("device property FrameRate must be finite and >= 0");
         return result;
     }
 
+    struct PreparedFrame
+    {
+        std::uint64_t dataset_frame{0};
+        BulkSource::Lease lease;
+    };
+
+    void restart_prefetch(std::uint64_t dataset_frame)
+    {
+        std::lock_guard<std::mutex> lock(ready_mutex_);
+        ++load_epoch_;
+        next_frame_to_load_ = dataset_frame;
+        ready_.clear();
+        ready_frames_.store(0);
+        ready_changed_.notify_all();
+    }
+
+    void loader_loop()
+    {
+        try
+        {
+            while(running_)
+            {
+                std::uint64_t dataset_frame = 0;
+                std::uint64_t epoch = 0;
+                {
+                    std::unique_lock<std::mutex> lock(ready_mutex_);
+                    ready_changed_.wait(lock,
+                                        [this]
+                                        {
+                                            return !running_ ||
+                                                   ready_.size() < configuration_.prefetch_frames;
+                                        });
+                    if(!running_)
+                        break;
+                    dataset_frame = next_frame_to_load_;
+                    next_frame_to_load_ = (next_frame_to_load_ + 1) % replay_->frame_count();
+                    epoch = load_epoch_;
+                }
+
+                BulkSource::Lease lease;
+                while(running_ && !lease)
+                {
+                    lease = publisher_->source().try_acquire();
+                    if(!lease)
+                        std::this_thread::yield();
+                }
+                if(!running_)
+                    break;
+
+                replay_->read_frame(dataset_frame, lease.data());
+
+                std::lock_guard<std::mutex> lock(ready_mutex_);
+                if(running_ && epoch == load_epoch_)
+                {
+                    ready_.push_back({dataset_frame, std::move(lease)});
+                    ready_frames_.store(ready_.size());
+                    ready_changed_.notify_all();
+                }
+            }
+        }
+        catch(...)
+        {
+            {
+                std::lock_guard<std::mutex> lock(ready_mutex_);
+                loader_failure_ = std::current_exception();
+            }
+            running_ = false;
+            ready_changed_.notify_all();
+        }
+    }
+
+    PreparedFrame next_ready_frame()
+    {
+        std::unique_lock<std::mutex> lock(ready_mutex_);
+        ready_changed_.wait(lock,
+                            [this]
+                            {
+                                return !running_ || loader_failure_ || !ready_.empty();
+                            });
+        if(loader_failure_)
+            std::rethrow_exception(loader_failure_);
+        if(!running_ || ready_.empty())
+            return {};
+
+        PreparedFrame frame = std::move(ready_.front());
+        ready_.pop_front();
+        ready_frames_.store(ready_.size());
+        ready_changed_.notify_all();
+        return frame;
+    }
+
+    void rethrow_loader_failure()
+    {
+        std::lock_guard<std::mutex> lock(ready_mutex_);
+        if(loader_failure_)
+            std::rethrow_exception(loader_failure_);
+    }
+
     void replay_loop()
     {
-        using namespace std::chrono_literals;
-        std::uint64_t dataset_frame = 0;
         std::uint64_t event = 0;
         auto next_frame = std::chrono::steady_clock::now();
 
@@ -525,14 +615,21 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         {
             while(running_)
             {
-                BulkSource::Lease lease = publisher_->source().try_acquire();
-                if(!lease)
+                while(running_ && publisher_->session_count() == 0)
+                    std::this_thread::yield();
+                while(running_ &&
+                      publisher_->counters().credits_outstanding >= configuration_.prefetch_frames)
+                    std::this_thread::yield();
+                if(!running_)
                 {
-                    std::this_thread::sleep_for(1ms);
-                    continue;
+                    rethrow_loader_failure();
+                    break;
                 }
 
-                replay_->copy_frame(dataset_frame, lease.data());
+                PreparedFrame frame = next_ready_frame();
+                if(!frame.lease)
+                    break;
+
                 FrameMetadata metadata;
                 metadata.element_type = replay_->description().element_type;
                 metadata.element_size = static_cast<std::uint32_t>(replay_->description().element_bytes);
@@ -543,11 +640,30 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
                 metadata.event_counter = event;
                 metadata.endian = replay_->description().endian;
 
-                const PublishResult result = publisher_->publish(std::move(lease), metadata);
+                PublishResult result = PublishResult::QueueFull;
+                while(running_ && result == PublishResult::QueueFull)
+                {
+                    result = publisher_->publish(std::move(frame.lease), metadata);
+                    if(result == PublishResult::QueueFull)
+                        std::this_thread::yield();
+                }
                 if(result == PublishResult::Accepted)
                 {
                     ++event;
-                    dataset_frame = (dataset_frame + 1) % replay_->frame_count();
+                }
+                else if(result == PublishResult::NoSession ||
+                        result == PublishResult::CreditStalled)
+                {
+                    restart_prefetch(frame.dataset_frame);
+                    continue;
+                }
+                else if(result == PublishResult::Shutdown)
+                {
+                    break;
+                }
+                else
+                {
+                    throw std::runtime_error("publish failed: " + std::string(to_string(result)));
                 }
 
                 const double rate = frame_rate_.load();
@@ -566,6 +682,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
                     next_frame = std::chrono::steady_clock::now();
                 }
             }
+            rethrow_loader_failure();
         }
         catch(const H5::Exception &failure)
         {
@@ -580,15 +697,24 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
     }
 
     Options configuration_;
-    std::unique_ptr<ReplayBuffer> replay_;
+    std::unique_ptr<ReplayReader> replay_;
     std::unique_ptr<BulkPublisher> publisher_;
+    std::thread loader_thread_;
     std::thread replay_thread_;
     std::atomic<bool> running_{false};
     std::atomic<double> frame_rate_{100.0};
+    std::mutex ready_mutex_;
+    std::condition_variable ready_changed_;
+    std::deque<PreparedFrame> ready_;
+    std::exception_ptr loader_failure_;
+    std::uint64_t next_frame_to_load_{0};
+    std::uint64_t load_epoch_{0};
+    std::atomic<std::uint64_t> ready_frames_{0};
     Tango::DevULong64 frame_width_read_{0};
     Tango::DevULong64 frame_height_read_{0};
     Tango::DevULong64 dataset_frames_read_{0};
-    Tango::DevULong64 cached_frames_read_{0};
+    Tango::DevULong64 prefetch_frames_read_{0};
+    Tango::DevULong64 ready_frames_read_{0};
     Tango::DevDouble double_read_{0};
 };
 
@@ -635,8 +761,10 @@ class Hdf5ReplayDetectorClass : public Tango::DeviceClass
                                             ReplayAttribute::FrameHeight, Tango::READ));
         attributes.push_back(new ReplayAttr("datasetFrames", Tango::DEV_ULONG64,
                                             ReplayAttribute::DatasetFrames, Tango::READ));
-        attributes.push_back(new ReplayAttr("cachedFrames", Tango::DEV_ULONG64,
-                                            ReplayAttribute::CachedFrames, Tango::READ));
+        attributes.push_back(new ReplayAttr("prefetchFrames", Tango::DEV_ULONG64,
+                                            ReplayAttribute::PrefetchFrames, Tango::READ));
+        attributes.push_back(new ReplayAttr("readyFrames", Tango::DEV_ULONG64,
+                                            ReplayAttribute::ReadyFrames, Tango::READ));
         attributes.push_back(new ReplayAttr("frameRate", Tango::DEV_DOUBLE,
                                             ReplayAttribute::FrameRate, Tango::READ_WRITE));
     }

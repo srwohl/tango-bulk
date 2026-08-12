@@ -81,7 +81,7 @@ attribute, so the dataset path is normally unnecessary. It treats a rank-three d
 ```sh
 ./build/examples/tango-bulk-example-hdf5-device demo -nodb \
     -dlist bulk/hdf5/1 -ORBendPoint giop:tcp::10002 \
-    --hdf5-file /path/to/cb1_image0000.hdf5 --cache-mib 512
+    --hdf5-file /path/to/cb1_image0000.hdf5 --prefetch-frames 8
 
 ./build/examples/tango-bulk-example-client "tango://localhost:10002/bulk/hdf5/1#dbase=no"
 
@@ -95,12 +95,12 @@ the publisher geometry. The CUDA client does this before allocating its GPU rece
 required for this detector shape: a `2208 x 3216 x uint16` frame is 14,201,856 bytes, larger than
 the subscriber API's general-purpose 8 MiB default.
 
-The cache budget contains whole source frames. If the complete stack does not fit, the server
-reads consecutive chunks and starts again at frame zero after the last chunk. A frame is copied
-from this ordinary RAM cache into a registered publisher slot; the library then delivers that slot
-to the subscribing device or client. `--frame-rate 0` removes pacing. Otherwise the server uses
-`exposure_time + latency_time` when present, falling back to 100 Hz. Use `--hdf5-dataset PATH`
-for a non-NeXus file and `--hdf5-help` for all replay options.
+One loader thread reads HDF5 frames directly into registered publisher slots, so the replay path
+does not copy frames through an intermediate application cache. Prepared slots are kept in a
+bounded queue while the replay thread publishes earlier frames. `--prefetch-frames N` controls the
+ready queue and credit window; the publisher ring contains `2 * N` slots. `--frame-rate 0` removes
+pacing. Otherwise the server uses `exposure_time + latency_time` when present, falling back to 100
+Hz. Use `--hdf5-dataset PATH` for a non-NeXus file and `--hdf5-help` for all replay options.
 
 ## Running them with a database
 
@@ -139,7 +139,7 @@ remaining properties are optional:
 ```sh
 tango_admin --add-property bulk/hdf5/1 Hdf5File \
     /ufs/bl31/controls/phantom/cb1_image/scan_0071/cb1_image0000.hdf5
-tango_admin --add-property bulk/hdf5/1 CacheMiB 512
+tango_admin --add-property bulk/hdf5/1 PrefetchFrames 8
 
 # Optional for a non-NeXus file or to override the acquisition timing:
 tango_admin --add-property bulk/hdf5/1 Hdf5Dataset \
@@ -148,8 +148,8 @@ tango_admin --add-property bulk/hdf5/1 FrameRate 100
 ```
 
 When `Hdf5Dataset` is absent, the server follows the NeXus `default` and `signal` attributes. When
-`FrameRate` is absent, it uses `exposure_time + latency_time`, falling back to 100 Hz. `CacheMiB`
-defaults to 512.
+`FrameRate` is absent, it uses `exposure_time + latency_time`, falling back to 100 Hz.
+`PrefetchFrames` defaults to 8.
 
 Now start the servers by hand. There is no pixi task for them on purpose: a device server is the
 part you write and launch yourself, and the argument that matters is `demo`, the instance name that
