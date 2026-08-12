@@ -113,6 +113,11 @@ Status PublisherConfig::validate() const noexcept
         return Status::DepthTooLarge;
     }
 
+    if(fanout_mode != FanoutMode::BestEffort && fanout_mode != FanoutMode::AllActive)
+    {
+        return Status::MalformedMessage;
+    }
+
     if(publish_queue_depth < k_min_publish_queue || publish_queue_depth > k_max_publish_queue)
     {
         return Status::DepthTooLarge;

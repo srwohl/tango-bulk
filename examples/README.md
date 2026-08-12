@@ -81,7 +81,8 @@ attribute, so the dataset path is normally unnecessary. It treats a rank-three d
 ```sh
 ./build/examples/tango-bulk-example-hdf5-device demo -nodb \
     -dlist bulk/hdf5/1 -ORBendPoint giop:tcp::10002 \
-    --hdf5-file /path/to/cb1_image0000.hdf5 --prefetch-frames 8
+    --hdf5-file /path/to/cb1_image0000.hdf5 --prefetch-frames 8 \
+    --fanout-mode all-active
 
 ./build/examples/tango-bulk-example-client "tango://localhost:10002/bulk/hdf5/1#dbase=no"
 
@@ -100,7 +101,9 @@ does not copy frames through an intermediate application cache. Prepared slots a
 bounded queue while the replay thread publishes earlier frames. `--prefetch-frames N` controls the
 ready queue and credit window; the publisher ring contains `2 * N` slots. `--frame-rate 0` removes
 pacing. Otherwise the server uses `exposure_time + latency_time` when present, falling back to 100
-Hz. Use `--hdf5-dataset PATH` for a non-NeXus file and `--hdf5-help` for all replay options.
+Hz. `--fanout-mode best-effort` lets a slow client miss frames while healthy clients continue;
+`--fanout-mode all-active` retries each frame until every currently active client has credit. Use
+`--hdf5-dataset PATH` for a non-NeXus file and `--hdf5-help` for all replay options.
 
 ## Running them with a database
 
@@ -140,6 +143,7 @@ remaining properties are optional:
 tango_admin --add-property bulk/hdf5/1 Hdf5File \
     /ufs/bl31/controls/phantom/cb1_image/scan_0071/cb1_image0000.hdf5
 tango_admin --add-property bulk/hdf5/1 PrefetchFrames 8
+tango_admin --add-property bulk/hdf5/1 FanoutMode all-active
 
 # Optional for a non-NeXus file or to override the acquisition timing:
 tango_admin --add-property bulk/hdf5/1 Hdf5Dataset \
@@ -149,7 +153,7 @@ tango_admin --add-property bulk/hdf5/1 FrameRate 100
 
 When `Hdf5Dataset` is absent, the server follows the NeXus `default` and `signal` attributes. When
 `FrameRate` is absent, it uses `exposure_time + latency_time`, falling back to 100 Hz.
-`PrefetchFrames` defaults to 8.
+`PrefetchFrames` defaults to 8 and `FanoutMode` defaults to `best-effort`.
 
 Now start the servers by hand. There is no pixi task for them on purpose: a device server is the
 part you write and launch yourself, and the argument that matters is `demo`, the instance name that

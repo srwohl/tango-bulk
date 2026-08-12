@@ -321,6 +321,12 @@ enum class DropPolicy : std::uint32_t
     DropOldest = 1,   // delivery queue only; illegal on the producer ring
 };
 
+enum class FanoutMode : std::uint32_t
+{
+    BestEffort = 0, // a lagging session misses frames without stopping peers
+    AllActive = 1,  // retain and retry until every armed session has credit
+};
+
 struct PublisherConfig
 {
     std::string   stream_name;                  // 1..64 bytes, [A-Za-z0-9_.-]
@@ -328,6 +334,7 @@ struct PublisherConfig
     std::uint32_t ring_depth{32};
     std::uint32_t credit_window{16};            // MUST be <= ring_depth
     std::uint32_t max_sessions{4};
+    FanoutMode    fanout_mode{FanoutMode::BestEffort};
     std::uint32_t publish_queue_depth{256};
     std::uint32_t lease_ttl_ms{10'000};
     std::uint32_t renew_interval_ms{3'333};
@@ -393,6 +400,7 @@ enum class PublishResult : std::uint32_t
     CreditStalled = 3,   // credit window closed; frame dropped, counted
     BadMetadata   = 4,
     Shutdown      = 5,
+    WouldBlock    = 6,   // AllActive session lacks credit; lease stays with caller
 };
 
 class BulkPublisher

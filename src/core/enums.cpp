@@ -96,6 +96,19 @@ const char *to_string(DropPolicy policy) noexcept
     return "Unknown";
 }
 
+const char *to_string(FanoutMode mode) noexcept
+{
+    switch(mode)
+    {
+    case FanoutMode::BestEffort:
+        return "BestEffort";
+    case FanoutMode::AllActive:
+        return "AllActive";
+    }
+
+    return "Unknown";
+}
+
 const char *to_string(PublishResult result) noexcept
 {
     switch(result)
@@ -112,6 +125,8 @@ const char *to_string(PublishResult result) noexcept
         return "BadMetadata";
     case PublishResult::Shutdown:
         return "Shutdown";
+    case PublishResult::WouldBlock:
+        return "WouldBlock";
     }
 
     return "Unknown";

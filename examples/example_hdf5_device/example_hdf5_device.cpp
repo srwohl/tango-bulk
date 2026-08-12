@@ -37,10 +37,12 @@ struct Options
     std::string file;
     std::string dataset;
     std::uint32_t prefetch_frames{8};
+    FanoutMode fanout_mode{FanoutMode::BestEffort};
     std::optional<double> frame_rate;
     bool file_from_command_line{false};
     bool dataset_from_command_line{false};
     bool prefetch_from_command_line{false};
+    bool fanout_from_command_line{false};
 };
 
 Options options;
@@ -74,6 +76,16 @@ std::string option_value(const std::string &argument,
     throw std::runtime_error(name + " requires a value");
 }
 
+FanoutMode parse_fanout_mode(const std::string &value, const char *origin)
+{
+    if(value == "best-effort" || value == "BestEffort")
+        return FanoutMode::BestEffort;
+    if(value == "all-active" || value == "AllActive")
+        return FanoutMode::AllActive;
+    throw std::runtime_error(std::string(origin) +
+                             " must be 'best-effort' or 'all-active'");
+}
+
 std::vector<char *> parse_options(int argc, char *argv[])
 {
     std::vector<char *> tango_arguments;
@@ -90,9 +102,10 @@ std::vector<char *> parse_options(int argc, char *argv[])
                 << "  --hdf5-file PATH       override Hdf5File (mainly for -nodb)\n"
                 << "  --hdf5-dataset PATH    image stack; default follows NeXus default/signal\n"
                 << "  --prefetch-frames N    HDF5 frames read ahead into publisher slots (default 8)\n"
+                << "  --fanout-mode MODE     best-effort or all-active (default best-effort)\n"
                 << "  --frame-rate HZ        replay rate; 0 is unlimited (default: file timing or 100)\n"
-                << "Database mode reads Hdf5File, Hdf5Dataset, PrefetchFrames, and FrameRate\n"
-                << "from device properties; command-line values take precedence.\n";
+                << "Database mode reads Hdf5File, Hdf5Dataset, PrefetchFrames, FanoutMode,\n"
+                << "and FrameRate; command-line values take precedence.\n";
             std::exit(0);
         }
         if(argument == "--hdf5-file" || argument.rfind("--hdf5-file=", 0) == 0)
@@ -117,6 +130,12 @@ std::vector<char *> parse_options(int argc, char *argv[])
             }
             options.prefetch_frames = static_cast<std::uint32_t>(parsed);
             options.prefetch_from_command_line = true;
+        }
+        else if(argument == "--fanout-mode" || argument.rfind("--fanout-mode=", 0) == 0)
+        {
+            options.fanout_mode = parse_fanout_mode(
+                option_value(argument, "--fanout-mode", i, argc, argv), "--fanout-mode");
+            options.fanout_from_command_line = true;
         }
         else if(argument == "--frame-rate" || argument.rfind("--frame-rate=", 0) == 0)
         {
@@ -383,6 +402,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         config.ring_depth = configuration_.prefetch_frames * 2;
         config.credit_window = configuration_.prefetch_frames;
         config.max_sessions = 4;
+        config.fanout_mode = configuration_.fanout_mode;
         config.pinned_memory_limit_bytes = std::max<std::uint64_t>(
             1ull << 30, checked_multiply(config.max_frame_bytes, config.ring_depth + 1,
                                         "publisher memory budget"));
@@ -394,7 +414,8 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         set_state(Tango::RUNNING);
         set_status("replaying " + configuration_.file + ":" + replay_->dataset_path() + "; " +
                    std::to_string(replay_->frame_count()) + " frames, " +
-                   std::to_string(configuration_.prefetch_frames) + " prefetched");
+                   std::to_string(configuration_.prefetch_frames) + " prefetched, fanout=" +
+                   to_string(configuration_.fanout_mode));
         loader_thread_ = std::thread([this] { loader_loop(); });
         replay_thread_ = std::thread([this] { replay_loop(); });
     }
@@ -467,6 +488,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
             properties.emplace_back("Hdf5File");
             properties.emplace_back("Hdf5Dataset");
             properties.emplace_back("PrefetchFrames");
+            properties.emplace_back("FanoutMode");
             properties.emplace_back("FrameRate");
             get_db_device()->get_property(properties);
 
@@ -487,10 +509,17 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
                 }
                 result.prefetch_frames = static_cast<std::uint32_t>(value);
             }
-            if(!result.frame_rate && !properties[3].is_empty())
+            if(!result.fanout_from_command_line && !properties[3].is_empty())
+            {
+                std::string value;
+                if(!(properties[3] >> value))
+                    throw std::runtime_error("device property FanoutMode is not a string");
+                result.fanout_mode = parse_fanout_mode(value, "device property FanoutMode");
+            }
+            if(!result.frame_rate && !properties[4].is_empty())
             {
                 double value = 0.0;
-                if(!(properties[3] >> value))
+                if(!(properties[4] >> value))
                     throw std::runtime_error("device property FrameRate is not numeric");
                 result.frame_rate = value;
             }
@@ -638,10 +667,11 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
                 metadata.endian = replay_->description().endian;
 
                 PublishResult result = PublishResult::QueueFull;
-                while(running_ && result == PublishResult::QueueFull)
+                while(running_ && (result == PublishResult::QueueFull ||
+                                   result == PublishResult::WouldBlock))
                 {
                     result = publisher_->publish(std::move(frame.lease), metadata);
-                    if(result == PublishResult::QueueFull)
+                    if(result == PublishResult::QueueFull || result == PublishResult::WouldBlock)
                         std::this_thread::yield();
                 }
                 if(result == PublishResult::Accepted)

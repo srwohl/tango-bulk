@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -1024,19 +1025,17 @@ struct BulkPublisher::Impl
 
     /// Publisher-wide admission headroom, recomputed on the engine.
     ///
-    /// `credited` is the highest ordinal any armed session is done with, so
-    /// `admitted - credited` on the application thread is "how far ahead of the
-    /// fastest consumer this publisher has run".  Taking the max rather than the
-    /// min is deliberate: a frame only has to be deliverable to *someone*, so a
-    /// session stalled behind a retained view -- or a dead one waiting out its
-    /// lease -- must not stop the publisher serving everyone else.  Its own
-    /// window still holds its own slots, and 5.4 still holds those until it
-    /// credits or expires.
+    /// `credited` follows the configured fan-out contract. BestEffort tracks the
+    /// fastest armed session so a laggard cannot stall its peers. AllActive
+    /// tracks the slowest, so publish() retains the caller's lease until every
+    /// armed session has room for the next frame.
     void refresh_gauges() noexcept
     {
         const std::uint64_t admitted_now = admitted.load(std::memory_order_acquire);
 
         std::uint64_t best = 0;
+        std::uint64_t worst = admitted_now;
+        std::uint64_t strict_limit = std::numeric_limits<std::uint64_t>::max();
         std::uint64_t worst_outstanding = 0;
         std::uint32_t armed = 0;
 
@@ -1058,13 +1057,22 @@ struct BulkPublisher::Impl
                                                              ring.depth())]
                           .ordinal;
             best = std::max(best, retired);
+            worst = std::min(worst, retired);
+            strict_limit = std::min(strict_limit,
+                                    retired + static_cast<std::uint64_t>(
+                                                  session.geometry.credit_window));
 
             // The laggard, not the last one to speak: under fan-out the useful
             // reading is how far behind the slowest consumer has fallen.
             worst_outstanding = std::max(worst_outstanding, session.window.outstanding());
         }
 
-        credited.store(armed != 0 ? best : admitted_now, std::memory_order_release);
+        const std::uint64_t admission_credit =
+            config.fanout_mode == FanoutMode::AllActive ? worst : best;
+        credited.store(armed != 0 ? admission_credit : admitted_now, std::memory_order_release);
+        all_active_admission_limit.store(
+            armed != 0 ? strict_limit : std::numeric_limits<std::uint64_t>::max(),
+            std::memory_order_release);
         armed_sessions.store(armed, std::memory_order_release);
         counters.credits_outstanding.store(worst_outstanding, std::memory_order_relaxed);
     }
@@ -1340,13 +1348,16 @@ struct BulkPublisher::Impl
     // Admission control, read by publish() on application threads.
     //
     // `admitted` counts frames publish() accepted; `credited` is the engine's
-    // view of how far the fastest armed session has got.  Their difference is
-    // "accepted but not yet released by anyone who could take it", which is what
-    // the credit window bounds -- and computing it on the application thread is
-    // what lets publish() answer CreditStalled itself instead of discovering it
-    // later on the engine.
+    // view of how far the relevant armed session has got: fastest for
+    // BestEffort, slowest for AllActive. Computing the difference on the
+    // application thread lets publish() report backpressure synchronously.
     std::atomic<std::uint64_t> admitted{0};
     std::atomic<std::uint64_t> credited{0};
+    /// First publisher ordinal AllActive may not admit. This is computed from
+    /// each session's negotiated window, which may be smaller than the
+    /// publisher-wide configured window.
+    std::atomic<std::uint64_t> all_active_admission_limit{
+        std::numeric_limits<std::uint64_t>::max()};
     std::atomic<std::uint64_t> dropped_before_all{0};
 
     /// Sessions a frame could go to.  A gauge rather than a walk of the table,
@@ -1432,7 +1443,16 @@ PublishResult BulkPublisher::publish(BulkSource::Lease &&lease, const FrameMetad
 
     const std::uint64_t admitted = impl_->admitted.load(std::memory_order_acquire);
     const std::uint64_t credited = impl_->credited.load(std::memory_order_acquire);
-    if(admitted - credited >= impl_->config.credit_window)
+    if(impl_->config.fanout_mode == FanoutMode::AllActive &&
+       admitted >= impl_->all_active_admission_limit.load(std::memory_order_acquire))
+    {
+        // Strict fan-out is retryable: consuming the producer's filled slot
+        // here would make it impossible to submit this exact frame once the
+        // slow subscriber returns credit.
+        return PublishResult::WouldBlock;
+    }
+    if(impl_->config.fanout_mode == FanoutMode::BestEffort &&
+       admitted - credited >= impl_->config.credit_window)
     {
         impl_->counters.dropped_credit_stalled.fetch_add(1, std::memory_order_relaxed);
         impl_->dropped_before_all.fetch_add(1, std::memory_order_relaxed);
@@ -1897,6 +1917,7 @@ std::vector<std::byte> BulkPublisher::Impl::handle_query(const std::byte *data,
     add_text("stream", config.stream_name);
     add_text("transport", "am");
     add_text("memory_kind", "host");
+    add_text("fanout_mode", to_string(config.fanout_mode));
 
     const AtomicPublisherCounters &c = counters;
     add("frames_published", c.frames_published.load(std::memory_order_relaxed));

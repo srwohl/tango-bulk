@@ -22,6 +22,15 @@ namespace TangoBulk
 // DropPolicy is declared in <tango-bulk/frame.h>, which this header includes.
 // See the note there for why it does not live here.
 
+/// How a publisher treats an armed subscriber that has exhausted its credit.
+enum class FanoutMode : std::uint32_t
+{
+    BestEffort = 0, ///< skip only the lagging subscriber; other clients continue
+    AllActive = 1,  ///< accept a frame only when every armed subscriber can receive it
+};
+
+const char *to_string(FanoutMode mode) noexcept;
+
 struct PublisherConfig
 {
     std::string stream_name; ///< 1..64 bytes, [A-Za-z0-9_.-]
@@ -29,6 +38,7 @@ struct PublisherConfig
     std::uint32_t ring_depth{32};
     std::uint32_t credit_window{16}; ///< MUST be <= ring_depth
     std::uint32_t max_sessions{4};
+    FanoutMode fanout_mode{FanoutMode::BestEffort};
     std::uint32_t publish_queue_depth{256};
     std::uint32_t lease_ttl_ms{10'000};
     std::uint32_t renew_interval_ms{3'333};
@@ -108,6 +118,7 @@ enum class PublishResult : std::uint32_t
     CreditStalled = 3, ///< credit window closed; frame dropped, counted
     BadMetadata = 4,
     Shutdown = 5,
+    WouldBlock = 6, ///< AllActive subscriber lacks credit; lease returned to caller
 };
 
 const char *to_string(PublishResult result) noexcept;
@@ -125,7 +136,7 @@ class BulkPublisher
     BulkSource &source() noexcept;
 
     /// Consumes the lease on Accepted; leaves it engaged in the caller's hands
-    /// on QueueFull.  Never blocks, never throws, never allocates.
+    /// on QueueFull and WouldBlock.  Never blocks, never throws, never allocates.
     PublishResult publish(BulkSource::Lease &&lease, const FrameMetadata &meta) noexcept;
 
     /// Re-declare geometry.  Opens a new epoch; see IMPLEMENTATION_SPEC.md 4.3
