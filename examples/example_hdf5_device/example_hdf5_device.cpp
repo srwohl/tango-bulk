@@ -617,9 +617,6 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
             {
                 while(running_ && publisher_->session_count() == 0)
                     std::this_thread::yield();
-                while(running_ &&
-                      publisher_->counters().credits_outstanding >= configuration_.prefetch_frames)
-                    std::this_thread::yield();
                 if(!running_)
                 {
                     rethrow_loader_failure();
