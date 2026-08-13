@@ -9,7 +9,9 @@
 #include <hdf5.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -19,6 +21,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <fcntl.h>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -26,18 +29,28 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <spawn.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <system_error>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
+
+extern char **environ;
 
 namespace
 {
 
-using TangoBulk::Endian;
 using TangoBulk::ElementType;
+using TangoBulk::Endian;
 using TangoBulk::FrameView;
 using TangoBulk::MemoryKind;
 
@@ -197,7 +210,8 @@ Geometry geometry_from_publisher(const TangoBulk::BulkQueryResult &publisher)
     {
         const std::size_t i = reverse - 1;
         if(publisher.shape[i] == 0 || publisher.strides[i] != stride)
-            throw std::runtime_error("the HDF5 client requires non-empty C-contiguous publisher geometry");
+            throw std::runtime_error(
+                "the HDF5 client requires non-empty C-contiguous publisher geometry");
         if(stride > std::numeric_limits<std::uint64_t>::max() / publisher.shape[i])
             throw std::runtime_error("publisher frame geometry overflows");
         stride *= publisher.shape[i];
@@ -217,6 +231,14 @@ struct Block
     std::size_t frame_count{0};
     Endian endian{Endian::Little};
     std::vector<FrameView> frames;
+};
+
+struct Hdf5Block
+{
+    std::uint64_t local_first_frame{0};
+    std::size_t frame_count{0};
+    Endian endian{Endian::Little};
+    std::vector<const std::byte *> frames;
 };
 
 std::string shard_suffix(std::size_t index)
@@ -240,9 +262,8 @@ void write_scalar_attribute(hid_t object, const char *name, std::uint64_t value)
     hid_t attribute = -1;
     try
     {
-        attribute = checked_id(H5Acreate2(object, name, H5T_STD_U64LE, space, H5P_DEFAULT,
-                                          H5P_DEFAULT),
-                               "H5Acreate2");
+        attribute = checked_id(
+            H5Acreate2(object, name, H5T_STD_U64LE, space, H5P_DEFAULT, H5P_DEFAULT), "H5Acreate2");
         check_hdf5(H5Awrite(attribute, H5T_NATIVE_UINT64, &value), "H5Awrite");
         check_hdf5(H5Aclose(attribute), "H5Aclose");
         check_hdf5(H5Sclose(space), "H5Sclose");
@@ -286,12 +307,9 @@ void write_string_attribute(hid_t object, const char *name, const std::string &v
 class Hdf5ShardWriter
 {
   public:
-    Hdf5ShardWriter(std::filesystem::path filename,
-                    std::size_t shard_index,
-                    std::uint64_t local_frames,
-                    const Geometry &geometry,
-                    const Options &options) :
-        filename_(std::move(filename)), geometry_(geometry)
+    Hdf5ShardWriter(std::filesystem::path filename, std::size_t shard_index,
+                    std::uint64_t local_frames, const Geometry &geometry, const Options &options)
+        : filename_(std::move(filename)), geometry_(geometry)
     {
         file_ = checked_id(H5Fcreate(filename_.c_str(), H5F_ACC_EXCL, H5P_DEFAULT, H5P_DEFAULT),
                            "H5Fcreate(shard)");
@@ -302,9 +320,9 @@ class Hdf5ShardWriter
         hid_t creation = H5P_DEFAULT;
         try
         {
-            space = checked_id(H5Screate_simple(static_cast<int>(dimensions.size()),
-                                                dimensions.data(), nullptr),
-                               "H5Screate_simple(shard)");
+            space = checked_id(
+                H5Screate_simple(static_cast<int>(dimensions.size()), dimensions.data(), nullptr),
+                "H5Screate_simple(shard)");
             if(options.chunked)
             {
                 creation = checked_id(H5Pcreate(H5P_DATASET_CREATE), "H5Pcreate");
@@ -340,7 +358,7 @@ class Hdf5ShardWriter
 
     ~Hdf5ShardWriter() { close_noexcept(); }
 
-    void write(const Block &block)
+    void write(const Hdf5Block &block)
     {
         // A block can wrap around the receive ring, or contain non-adjacent
         // slots after earlier shard writes return credits out of order.  Write
@@ -351,8 +369,7 @@ class Hdf5ShardWriter
         {
             std::size_t run_end = run_begin + 1;
             while(run_end < block.frames.size() &&
-                  block.frames[run_end].data() ==
-                      block.frames[run_end - 1].data() + geometry_.slot_bytes)
+                  block.frames[run_end] == block.frames[run_end - 1] + geometry_.slot_bytes)
                 ++run_end;
             write_run(block, run_begin, run_end);
             run_begin = run_end;
@@ -374,7 +391,7 @@ class Hdf5ShardWriter
     }
 
   private:
-    void write_run(const Block &block, std::size_t begin, std::size_t end)
+    void write_run(const Hdf5Block &block, std::size_t begin, std::size_t end)
     {
         const std::size_t run_frames = end - begin;
         std::vector<hsize_t> file_start(geometry_.frame_dimensions.size() + 1, 0);
@@ -398,10 +415,9 @@ class Hdf5ShardWriter
                 // memory as one enormous 1-D hyperslab makes HDF5 expand the
                 // selection element by element during chunk setup; a block of
                 // four 14 MB frames can spend minutes in H5S__hyper_iter_next.
-                memory_space = checked_id(
-                    H5Screate_simple(static_cast<int>(file_count.size()), file_count.data(),
-                                     nullptr),
-                    "H5Screate_simple(contiguous receive slots)");
+                memory_space = checked_id(H5Screate_simple(static_cast<int>(file_count.size()),
+                                                           file_count.data(), nullptr),
+                                          "H5Screate_simple(contiguous receive slots)");
             }
             else
             {
@@ -418,8 +434,7 @@ class Hdf5ShardWriter
                            "H5Sselect_hyperslab(receive slots)");
             }
             check_hdf5(H5Dwrite(dataset_, hdf5_type(geometry_.element_type, block.endian),
-                                memory_space, file_space, H5P_DEFAULT,
-                                block.frames[begin].data()),
+                                memory_space, file_space, H5P_DEFAULT, block.frames[begin]),
                        "H5Dwrite");
             check_hdf5(H5Sclose(memory_space), "H5Sclose");
             check_hdf5(H5Sclose(file_space), "H5Sclose");
@@ -449,31 +464,337 @@ class Hdf5ShardWriter
     hid_t dataset_{-1};
 };
 
+constexpr int k_writer_control_fd = 3;
+constexpr int k_writer_ring_fd = 4;
+constexpr std::uint32_t k_writer_protocol_magic = 0x54424835;
+constexpr std::uint32_t k_writer_protocol_version = 1;
+
+enum class WriterCommand : std::uint32_t
+{
+    Write = 1,
+    Stop = 2,
+};
+
+enum class WriterResponse : std::uint32_t
+{
+    Ready = 1,
+    Complete = 2,
+    Stopped = 3,
+    Error = 4,
+};
+
+struct WriterConfigMessage
+{
+    std::uint32_t magic{k_writer_protocol_magic};
+    std::uint32_t version{k_writer_protocol_version};
+    std::uint32_t filename_size{0};
+    std::uint32_t shard_index{0};
+    std::uint64_t local_frames{0};
+    std::uint64_t writer_count{0};
+    std::uint64_t frames_per_block{0};
+    std::uint64_t blocks_per_stripe{0};
+    std::uint64_t ring_bytes{0};
+    std::uint64_t frame_bytes{0};
+    std::uint64_t slot_bytes{0};
+    std::uint32_t element_type{0};
+    std::uint32_t element_size{0};
+    std::uint32_t rank{0};
+    std::uint32_t chunked{0};
+    std::array<std::uint64_t, TangoBulk::k_max_rank> dimensions{};
+};
+
+struct WriterCommandMessage
+{
+    WriterCommand command{WriterCommand::Stop};
+    std::uint32_t frame_count{0};
+    std::uint32_t endian{0};
+    std::uint32_t reserved{0};
+    std::uint64_t local_first_frame{0};
+};
+
+struct WriterResponseMessage
+{
+    WriterResponse response{WriterResponse::Error};
+    std::int32_t status{0};
+    std::uint64_t blocks_written{0};
+    std::uint64_t bytes_written{0};
+    double write_seconds{0.0};
+    std::array<char, 512> message{};
+};
+
+[[noreturn]] void throw_system_error(const char *operation)
+{
+    throw std::system_error(errno, std::generic_category(), operation);
+}
+
+void write_exact(int fd, const void *buffer, std::size_t bytes)
+{
+    const auto *position = static_cast<const std::byte *>(buffer);
+    while(bytes != 0)
+    {
+        const ssize_t written = ::send(fd, position, bytes, MSG_NOSIGNAL);
+        if(written < 0)
+        {
+            if(errno == EINTR)
+                continue;
+            throw_system_error("send(writer IPC)");
+        }
+        if(written == 0)
+            throw std::runtime_error("writer IPC closed while sending");
+        position += written;
+        bytes -= static_cast<std::size_t>(written);
+    }
+}
+
+void read_exact(int fd, void *buffer, std::size_t bytes)
+{
+    auto *position = static_cast<std::byte *>(buffer);
+    while(bytes != 0)
+    {
+        const ssize_t received = ::recv(fd, position, bytes, 0);
+        if(received < 0)
+        {
+            if(errno == EINTR)
+                continue;
+            throw_system_error("recv(writer IPC)");
+        }
+        if(received == 0)
+            throw std::runtime_error("writer process closed its control socket");
+        position += received;
+        bytes -= static_cast<std::size_t>(received);
+    }
+}
+
+WriterResponseMessage response_message(WriterResponse response, const std::string &message = {})
+{
+    WriterResponseMessage result;
+    result.response = response;
+    result.status = response == WriterResponse::Error ? 1 : 0;
+    if(!message.empty())
+        std::strncpy(result.message.data(), message.c_str(), result.message.size() - 1);
+    return result;
+}
+
+void require_response(const WriterResponseMessage &response, WriterResponse expected)
+{
+    if(response.response == WriterResponse::Error || response.status != 0)
+        throw std::runtime_error(std::string("HDF5 writer process: ") + response.message.data());
+    if(response.response != expected)
+        throw std::runtime_error("HDF5 writer process returned an unexpected response");
+}
+
+class SharedReceiveRing
+{
+  public:
+    explicit SharedReceiveRing(std::uint64_t bytes) : bytes_(bytes)
+    {
+        if(bytes == 0 ||
+           bytes > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+           bytes > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()))
+            throw std::runtime_error("shared receive-ring size is not representable");
+
+        std::string name;
+        for(unsigned int attempt = 0; attempt != 100; ++attempt)
+        {
+            name = "/tango-bulk-hdf5-" + std::to_string(::getpid()) + "-" + std::to_string(attempt);
+            fd_ = ::shm_open(name.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            if(fd_ >= 0 || errno != EEXIST)
+                break;
+        }
+        if(fd_ < 0)
+            throw_system_error("shm_open(receive ring)");
+        ::shm_unlink(name.c_str());
+
+        if(::ftruncate(fd_, static_cast<off_t>(bytes_)) != 0)
+        {
+            const int saved_errno = errno;
+            ::close(fd_);
+            fd_ = -1;
+            errno = saved_errno;
+            throw_system_error("ftruncate(receive ring)");
+        }
+        void *mapping = ::mmap(nullptr, static_cast<std::size_t>(bytes_), PROT_READ | PROT_WRITE,
+                               MAP_SHARED, fd_, 0);
+        if(mapping == MAP_FAILED)
+        {
+            const int saved_errno = errno;
+            ::close(fd_);
+            fd_ = -1;
+            errno = saved_errno;
+            throw_system_error("mmap(receive ring)");
+        }
+        memory_ = std::shared_ptr<void>(mapping, [bytes](void *address) {
+            ::munmap(address, static_cast<std::size_t>(bytes));
+        });
+    }
+
+    SharedReceiveRing(const SharedReceiveRing &) = delete;
+    SharedReceiveRing &operator=(const SharedReceiveRing &) = delete;
+
+    ~SharedReceiveRing()
+    {
+        memory_.reset();
+        if(fd_ >= 0)
+            ::close(fd_);
+    }
+
+    int fd() const noexcept { return fd_; }
+    std::uint64_t bytes() const noexcept { return bytes_; }
+    std::byte *data() const noexcept { return static_cast<std::byte *>(memory_.get()); }
+    const std::shared_ptr<void> &memory() const noexcept { return memory_; }
+
+  private:
+    int fd_{-1};
+    std::uint64_t bytes_{0};
+    std::shared_ptr<void> memory_;
+};
+
+int writer_child_main()
+{
+    void *mapping = MAP_FAILED;
+    std::uint64_t mapping_bytes = 0;
+    try
+    {
+        WriterConfigMessage config;
+        read_exact(k_writer_control_fd, &config, sizeof(config));
+        if(config.magic != k_writer_protocol_magic || config.version != k_writer_protocol_version ||
+           config.filename_size == 0 || config.filename_size > 1024 * 1024 || config.rank == 0 ||
+           config.rank > TangoBulk::k_max_rank || config.frame_bytes == 0 ||
+           config.slot_bytes < config.frame_bytes || config.ring_bytes < config.slot_bytes)
+            throw std::runtime_error("invalid writer-process configuration");
+
+        std::string filename(config.filename_size, '\0');
+        read_exact(k_writer_control_fd, filename.data(), filename.size());
+
+        struct stat ring_stat
+        {
+        };
+        if(::fstat(k_writer_ring_fd, &ring_stat) != 0)
+            throw_system_error("fstat(receive ring)");
+        if(ring_stat.st_size < 0 ||
+           static_cast<std::uint64_t>(ring_stat.st_size) < config.ring_bytes)
+            throw std::runtime_error("shared receive ring is smaller than configured");
+        if(config.ring_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))
+            throw std::runtime_error("shared receive ring is too large to map");
+        mapping_bytes = config.ring_bytes;
+        mapping = ::mmap(nullptr, static_cast<std::size_t>(mapping_bytes), PROT_READ, MAP_SHARED,
+                         k_writer_ring_fd, 0);
+        if(mapping == MAP_FAILED)
+            throw_system_error("mmap(writer receive ring)");
+
+        Options options;
+        options.writers = static_cast<std::size_t>(config.writer_count);
+        options.frames_per_block = static_cast<std::size_t>(config.frames_per_block);
+        options.blocks_per_stripe = static_cast<std::size_t>(config.blocks_per_stripe);
+        options.chunked = config.chunked != 0;
+
+        Geometry geometry;
+        geometry.element_type = static_cast<ElementType>(config.element_type);
+        geometry.element_size = config.element_size;
+        geometry.frame_bytes = config.frame_bytes;
+        geometry.slot_bytes = config.slot_bytes;
+        for(std::uint32_t i = 0; i < config.rank; ++i)
+            geometry.frame_dimensions.push_back(static_cast<hsize_t>(config.dimensions[i]));
+
+        Hdf5ShardWriter writer(filename, config.shard_index, config.local_frames, geometry,
+                               options);
+        WriterResponseMessage response = response_message(WriterResponse::Ready);
+        write_exact(k_writer_control_fd, &response, sizeof(response));
+        std::uint64_t blocks_written = 0;
+        std::uint64_t bytes_written = 0;
+        double write_seconds = 0.0;
+
+        while(true)
+        {
+            WriterCommandMessage command;
+            read_exact(k_writer_control_fd, &command, sizeof(command));
+            if(command.command == WriterCommand::Stop)
+            {
+                writer.close();
+                response = response_message(WriterResponse::Stopped);
+                response.blocks_written = blocks_written;
+                response.bytes_written = bytes_written;
+                response.write_seconds = write_seconds;
+                write_exact(k_writer_control_fd, &response, sizeof(response));
+                ::munmap(mapping, static_cast<std::size_t>(mapping_bytes));
+                return 0;
+            }
+            if(command.command != WriterCommand::Write || command.frame_count == 0 ||
+               command.frame_count > config.frames_per_block)
+                throw std::runtime_error("invalid write request from coordinator");
+
+            std::vector<std::uint64_t> offsets(command.frame_count);
+            read_exact(k_writer_control_fd, offsets.data(), offsets.size() * sizeof(offsets[0]));
+            Hdf5Block block;
+            block.local_first_frame = command.local_first_frame;
+            block.frame_count = command.frame_count;
+            block.endian = static_cast<Endian>(command.endian);
+            block.frames.reserve(offsets.size());
+            const auto *base = static_cast<const std::byte *>(mapping);
+            for(const std::uint64_t offset : offsets)
+            {
+                if(offset > config.ring_bytes || config.frame_bytes > config.ring_bytes - offset)
+                    throw std::runtime_error("write request references outside receive ring");
+                block.frames.push_back(base + offset);
+            }
+            const auto write_started = std::chrono::steady_clock::now();
+            writer.write(block);
+            write_seconds +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - write_started)
+                    .count();
+            ++blocks_written;
+            bytes_written += config.frame_bytes * command.frame_count;
+            response = response_message(WriterResponse::Complete);
+            write_exact(k_writer_control_fd, &response, sizeof(response));
+        }
+    }
+    catch(const std::exception &error)
+    {
+        try
+        {
+            const WriterResponseMessage response =
+                response_message(WriterResponse::Error, error.what());
+            write_exact(k_writer_control_fd, &response, sizeof(response));
+        }
+        catch(...)
+        {
+        }
+        if(mapping != MAP_FAILED)
+            ::munmap(mapping, static_cast<std::size_t>(mapping_bytes));
+        return 1;
+    }
+}
+
 class ShardWorker
 {
   public:
-    ShardWorker(std::filesystem::path filename,
-                std::size_t index,
-                std::uint64_t local_frames,
-                const Geometry &geometry,
-                const Options &options) :
-        filename_(std::move(filename)), index_(index), local_frames_(local_frames),
-        geometry_(geometry), options_(options)
+    ShardWorker(std::filesystem::path filename, std::size_t index, std::uint64_t local_frames,
+                const Geometry &geometry, const Options &options, int ring_fd,
+                const std::byte *ring_base, std::uint64_t ring_bytes)
+        : filename_(std::move(filename)), index_(index), local_frames_(local_frames),
+          geometry_(geometry), options_(options), ring_base_(ring_base), ring_bytes_(ring_bytes)
     {
-        thread_ = std::thread([this] { run(); });
+        start_child(ring_fd);
+        try
+        {
+            thread_ = std::thread([this] { run(); });
+        }
+        catch(...)
+        {
+            ::close(socket_);
+            socket_ = -1;
+            reap_child(false);
+            throw;
+        }
     }
 
-    ~ShardWorker()
-    {
-        stop_noexcept();
-    }
+    ~ShardWorker() { stop_noexcept(); }
 
     void submit(Block block)
     {
         std::unique_lock<std::mutex> lock(mutex_);
-        space_available_.wait(lock, [this] {
-            return queue_.size() < options_.queue_depth || stopping_ || error_;
-        });
+        space_available_.wait(
+            lock, [this] { return queue_.size() < options_.queue_depth || stopping_ || error_; });
         rethrow_if_failed();
         if(stopping_)
             throw std::runtime_error("submit to a stopped shard worker");
@@ -500,6 +821,8 @@ class ShardWorker
     std::uint64_t bytes_written() const noexcept { return bytes_written_; }
     std::uint64_t blocks_written() const noexcept { return blocks_written_; }
     std::size_t peak_queue() const noexcept { return peak_queue_; }
+    pid_t process_id() const noexcept { return process_id_; }
+    double write_seconds() const noexcept { return write_seconds_; }
     double seconds() const noexcept
     {
         return started_ ? std::chrono::duration<double>(finished_at_ - started_at_).count() : 0.0;
@@ -516,7 +839,6 @@ class ShardWorker
     {
         try
         {
-            Hdf5ShardWriter writer(filename_, index_, local_frames_, geometry_, options_);
             while(true)
             {
                 Block block;
@@ -534,18 +856,41 @@ class ShardWorker
                     started_ = true;
                     started_at_ = std::chrono::steady_clock::now();
                 }
-                writer.write(block);
+                write_block(block);
                 bytes_written_ += geometry_.frame_bytes * block.frame_count;
                 ++blocks_written_;
             }
-            writer.close();
+            WriterCommandMessage stop;
+            stop.command = WriterCommand::Stop;
+            write_exact(socket_, &stop, sizeof(stop));
+            WriterResponseMessage response;
+            read_exact(socket_, &response, sizeof(response));
+            require_response(response, WriterResponse::Stopped);
+            if(response.blocks_written != blocks_written_ ||
+               response.bytes_written != bytes_written_)
+                throw std::runtime_error("HDF5 writer process reported inconsistent counters");
+            write_seconds_ = response.write_seconds;
+            ::close(socket_);
+            socket_ = -1;
+            reap_child(true);
             finished_at_ = std::chrono::steady_clock::now();
         }
         catch(...)
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            error_ = std::current_exception();
-            stopping_ = true;
+            if(socket_ >= 0)
+            {
+                ::close(socket_);
+                socket_ = -1;
+            }
+            reap_child(false);
+            std::deque<Block> abandoned;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                error_ = std::current_exception();
+                stopping_ = true;
+                abandoned.swap(queue_);
+            }
+            finished_at_ = std::chrono::steady_clock::now();
         }
         work_available_.notify_all();
         space_available_.notify_all();
@@ -561,6 +906,153 @@ class ShardWorker
         space_available_.notify_all();
         if(thread_.joinable())
             thread_.join();
+        if(socket_ >= 0)
+        {
+            ::close(socket_);
+            socket_ = -1;
+        }
+        reap_child(false);
+    }
+
+    void start_child(int ring_fd)
+    {
+        int sockets[2]{-1, -1};
+        if(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0)
+            throw_system_error("socketpair(HDF5 writer)");
+
+        int child_socket_copy = -1;
+        int ring_fd_copy = -1;
+        posix_spawn_file_actions_t actions;
+        bool actions_initialized = false;
+        try
+        {
+            child_socket_copy = ::fcntl(sockets[1], F_DUPFD_CLOEXEC, 64);
+            ring_fd_copy = ::fcntl(ring_fd, F_DUPFD_CLOEXEC, 64);
+            if(child_socket_copy < 0 || ring_fd_copy < 0)
+                throw_system_error("fcntl(writer descriptors)");
+            int status = ::posix_spawn_file_actions_init(&actions);
+            if(status != 0)
+                throw std::system_error(status, std::generic_category(),
+                                        "posix_spawn_file_actions_init");
+            actions_initialized = true;
+            status = ::posix_spawn_file_actions_adddup2(&actions, child_socket_copy,
+                                                        k_writer_control_fd);
+            if(status == 0)
+                status =
+                    ::posix_spawn_file_actions_adddup2(&actions, ring_fd_copy, k_writer_ring_fd);
+            if(status != 0)
+                throw std::system_error(status, std::generic_category(),
+                                        "posix_spawn_file_actions_adddup2");
+
+            char executable[] = "/proc/self/exe";
+            char child_option[] = "--writer-child";
+            char *child_argv[]{executable, child_option, nullptr};
+            status = ::posix_spawn(&child_pid_, executable, &actions, nullptr, child_argv, environ);
+            if(status != 0)
+                throw std::system_error(status, std::generic_category(), "posix_spawn");
+            process_id_ = child_pid_;
+
+            ::posix_spawn_file_actions_destroy(&actions);
+            actions_initialized = false;
+            ::close(child_socket_copy);
+            child_socket_copy = -1;
+            ::close(ring_fd_copy);
+            ring_fd_copy = -1;
+            ::close(sockets[1]);
+            sockets[1] = -1;
+            socket_ = sockets[0];
+            sockets[0] = -1;
+
+            WriterConfigMessage config;
+            if(filename_.string().size() > std::numeric_limits<std::uint32_t>::max() ||
+               index_ > std::numeric_limits<std::uint32_t>::max())
+                throw std::runtime_error("writer filename or index is too large");
+            config.filename_size = static_cast<std::uint32_t>(filename_.string().size());
+            config.shard_index = static_cast<std::uint32_t>(index_);
+            config.local_frames = local_frames_;
+            config.writer_count = options_.writers;
+            config.frames_per_block = options_.frames_per_block;
+            config.blocks_per_stripe = options_.blocks_per_stripe;
+            config.ring_bytes = ring_bytes_;
+            config.frame_bytes = geometry_.frame_bytes;
+            config.slot_bytes = geometry_.slot_bytes;
+            config.element_type = static_cast<std::uint32_t>(geometry_.element_type);
+            config.element_size = geometry_.element_size;
+            config.rank = static_cast<std::uint32_t>(geometry_.frame_dimensions.size());
+            config.chunked = options_.chunked ? 1U : 0U;
+            for(std::size_t i = 0; i < geometry_.frame_dimensions.size(); ++i)
+                config.dimensions[i] = geometry_.frame_dimensions[i];
+            write_exact(socket_, &config, sizeof(config));
+            write_exact(socket_, filename_.string().data(), filename_.string().size());
+            WriterResponseMessage response;
+            read_exact(socket_, &response, sizeof(response));
+            require_response(response, WriterResponse::Ready);
+        }
+        catch(...)
+        {
+            if(actions_initialized)
+                ::posix_spawn_file_actions_destroy(&actions);
+            if(child_socket_copy >= 0)
+                ::close(child_socket_copy);
+            if(ring_fd_copy >= 0)
+                ::close(ring_fd_copy);
+            if(sockets[0] >= 0)
+                ::close(sockets[0]);
+            if(sockets[1] >= 0)
+                ::close(sockets[1]);
+            if(socket_ >= 0)
+            {
+                ::close(socket_);
+                socket_ = -1;
+            }
+            reap_child(false);
+            throw;
+        }
+    }
+
+    void write_block(const Block &block)
+    {
+        if(block.frames.size() != block.frame_count ||
+           block.frame_count > std::numeric_limits<std::uint32_t>::max())
+            throw std::runtime_error("invalid block submitted to HDF5 writer process");
+        WriterCommandMessage command;
+        command.command = WriterCommand::Write;
+        command.frame_count = static_cast<std::uint32_t>(block.frame_count);
+        command.endian = static_cast<std::uint32_t>(block.endian);
+        command.local_first_frame = block.local_first_frame;
+        std::vector<std::uint64_t> offsets;
+        offsets.reserve(block.frames.size());
+        const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(ring_base_);
+        for(const FrameView &frame : block.frames)
+        {
+            const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(frame.data());
+            if(address < base || address - base > ring_bytes_ ||
+               geometry_.frame_bytes > ring_bytes_ - (address - base))
+                throw std::runtime_error("received frame is outside the shared receive ring");
+            offsets.push_back(address - base);
+        }
+        write_exact(socket_, &command, sizeof(command));
+        write_exact(socket_, offsets.data(), offsets.size() * sizeof(offsets[0]));
+        WriterResponseMessage response;
+        read_exact(socket_, &response, sizeof(response));
+        require_response(response, WriterResponse::Complete);
+    }
+
+    void reap_child(bool require_success)
+    {
+        if(child_pid_ <= 0)
+            return;
+        int status = 0;
+        pid_t result;
+        do
+        {
+            result = ::waitpid(child_pid_, &status, 0);
+        } while(result < 0 && errno == EINTR);
+        child_pid_ = -1;
+        if(result < 0 && require_success)
+            throw_system_error("waitpid(HDF5 writer)");
+        if(require_success && (!WIFEXITED(status) || WEXITSTATUS(status) != 0))
+            throw std::runtime_error("HDF5 writer process exited unsuccessfully");
     }
 
     std::filesystem::path filename_;
@@ -568,6 +1060,11 @@ class ShardWorker
     std::uint64_t local_frames_;
     Geometry geometry_;
     Options options_;
+    const std::byte *ring_base_{nullptr};
+    std::uint64_t ring_bytes_{0};
+    int socket_{-1};
+    pid_t child_pid_{-1};
+    pid_t process_id_{-1};
     mutable std::mutex mutex_;
     std::condition_variable work_available_;
     std::condition_variable space_available_;
@@ -577,6 +1074,7 @@ class ShardWorker
     std::exception_ptr error_;
     std::uint64_t bytes_written_{0};
     std::uint64_t blocks_written_{0};
+    double write_seconds_{0.0};
     std::size_t peak_queue_{0};
     bool started_{false};
     std::chrono::steady_clock::time_point started_at_{};
@@ -605,9 +1103,8 @@ std::vector<std::uint64_t> local_frame_counts(const Options &options)
     for(std::uint64_t block = 0; block < blocks; ++block)
     {
         const BlockLocation location = locate_block(block, options);
-        result[location.writer] =
-            std::max(result[location.writer],
-                     (location.local_block + 1) * options.frames_per_block);
+        result[location.writer] = std::max(result[location.writer],
+                                           (location.local_block + 1) * options.frames_per_block);
     }
     return result;
 }
@@ -615,12 +1112,14 @@ std::vector<std::uint64_t> local_frame_counts(const Options &options)
 class ParallelShardWriter
 {
   public:
-    ParallelShardWriter(const Options &options, const Geometry &geometry) :
-        options_(options), geometry_(geometry), local_frames_(local_frame_counts(options))
+    ParallelShardWriter(const Options &options, const Geometry &geometry, int ring_fd,
+                        const std::byte *ring_base, std::uint64_t ring_bytes)
+        : options_(options), geometry_(geometry), local_frames_(local_frame_counts(options))
     {
         for(std::size_t i = 0; i < options_.writers; ++i)
             workers_.push_back(std::make_unique<ShardWorker>(shard_path(options_, i), i,
-                                                             local_frames_[i], geometry_, options_));
+                                                             local_frames_[i], geometry_, options_,
+                                                             ring_fd, ring_base, ring_bytes));
     }
 
     void submit(std::uint64_t global_block, std::vector<FrameView> frames, Endian endian)
@@ -650,6 +1149,14 @@ class ParallelShardWriter
     double seconds() const noexcept
     {
         return started_ ? std::chrono::duration<double>(finished_at_ - started_at_).count() : 0.0;
+    }
+
+    double write_seconds() const noexcept
+    {
+        double result = 0.0;
+        for(const auto &worker : workers_)
+            result += worker->write_seconds();
+        return result;
     }
 
     const std::vector<std::unique_ptr<ShardWorker>> &workers() const noexcept { return workers_; }
@@ -699,10 +1206,10 @@ void create_master(const Options &options, const Geometry &geometry)
                 const hsize_t local_start = location.local_block * options.frames_per_block;
                 std::vector<hsize_t> local_dimensions = dimensions;
                 local_dimensions.front() = shard_frames[location.writer];
-                source_space = checked_id(
-                    H5Screate_simple(static_cast<int>(local_dimensions.size()),
-                                     local_dimensions.data(), nullptr),
-                    "H5Screate_simple(VDS source)");
+                source_space =
+                    checked_id(H5Screate_simple(static_cast<int>(local_dimensions.size()),
+                                                local_dimensions.data(), nullptr),
+                               "H5Screate_simple(VDS source)");
                 std::vector<hsize_t> local_offset(local_dimensions.size(), 0);
                 local_offset.front() = local_start;
                 check_hdf5(H5Sselect_hyperslab(source_space, H5S_SELECT_SET, local_offset.data(),
@@ -725,9 +1232,9 @@ void create_master(const Options &options, const Geometry &geometry)
             }
         }
 
-        const hid_t file = checked_id(H5Fcreate(options.output.c_str(), H5F_ACC_EXCL, H5P_DEFAULT,
-                                                H5P_DEFAULT),
-                                      "H5Fcreate(master)");
+        const hid_t file =
+            checked_id(H5Fcreate(options.output.c_str(), H5F_ACC_EXCL, H5P_DEFAULT, H5P_DEFAULT),
+                       "H5Fcreate(master)");
         hid_t dataset = -1;
         try
         {
@@ -777,10 +1284,8 @@ void prepare_outputs(const Options &options)
     }
 }
 
-void validate_frame(const FrameView &frame,
-                    const TangoBulk::BulkQueryResult &publisher,
-                    const Geometry &geometry,
-                    std::optional<Endian> &endian)
+void validate_frame(const FrameView &frame, const TangoBulk::BulkQueryResult &publisher,
+                    const Geometry &geometry, std::optional<Endian> &endian)
 {
     if(frame.memory_kind() != MemoryKind::Host || frame.element_type() != geometry.element_type ||
        frame.element_size() != geometry.element_size || frame.rank() != publisher.rank ||
@@ -808,6 +1313,13 @@ void print_usage(const char *program)
 
 int main(int argc, char *argv[])
 {
+    if(argc == 2 && std::string(argv[1]) == "--writer-child")
+    {
+        std::signal(SIGINT, SIG_IGN);
+        std::signal(SIGTERM, SIG_IGN);
+        return writer_child_main();
+    }
+
     Options options;
     try
     {
@@ -833,14 +1345,9 @@ int main(int argc, char *argv[])
                 {publisher.status, "publisher is not ready", "BulkQuery"});
         const Geometry geometry = geometry_from_publisher(publisher);
 
-        hbool_t hdf5_thread_safe = 0;
-        check_hdf5(H5is_library_threadsafe(&hdf5_thread_safe), "H5is_library_threadsafe");
-        if(options.writers > 1 && hdf5_thread_safe == 0)
-            throw std::runtime_error(
-                "multiple writer threads require a thread-safe HDF5 build; use --writers 1");
-
         const std::uint64_t block_bytes = geometry.frame_bytes * options.frames_per_block;
-        if(geometry.frame_bytes != 0 && block_bytes / geometry.frame_bytes != options.frames_per_block)
+        if(geometry.frame_bytes != 0 &&
+           block_bytes / geometry.frame_bytes != options.frames_per_block)
             throw std::runtime_error("block byte size overflows");
         if(publisher.max_frame_bytes % geometry.element_size != 0)
             throw std::runtime_error("publisher slot size is not an exact number of elements");
@@ -856,20 +1363,18 @@ int main(int argc, char *argv[])
         const std::uint64_t available_slots =
             std::min<std::uint64_t>(publisher.ring_depth, slots_in_budget);
         if(options.ring_depth > available_slots)
-            throw std::runtime_error("requested receive ring exceeds publisher or pinned-memory limit");
+            throw std::runtime_error(
+                "requested receive ring exceeds publisher or pinned-memory limit");
         config.ring_depth = static_cast<std::uint32_t>(options.ring_depth);
         config.credit_window = std::min(publisher.credit_window, config.ring_depth);
         config.delivery_queue_depth = config.ring_depth;
         if(options.frames_per_block > config.credit_window)
             throw std::runtime_error("--frames-per-block exceeds the available credit window");
-        if(config.max_frame_bytes >
-           std::numeric_limits<std::uint64_t>::max() / config.ring_depth)
+        if(config.max_frame_bytes > std::numeric_limits<std::uint64_t>::max() / config.ring_depth)
             throw std::runtime_error("receive-ring byte size overflows");
         const std::uint64_t receive_bytes = config.max_frame_bytes * config.ring_depth;
-        auto receive_ring = std::shared_ptr<void>(
-            new std::byte[static_cast<std::size_t>(receive_bytes)],
-            [](void *memory) { delete[] static_cast<std::byte *>(memory); });
-        config.receive_buffer = receive_ring;
+        SharedReceiveRing receive_ring(receive_bytes);
+        config.receive_buffer = receive_ring.memory();
         config.receive_buffer_bytes = receive_bytes;
         config.receive_memory_kind = MemoryKind::Host;
 
@@ -877,12 +1382,12 @@ int main(int argc, char *argv[])
                   << " rank=" << publisher.rank << " shape=";
         for(std::size_t i = 0; i < publisher.rank; ++i)
             std::cout << (i == 0 ? "[" : ",") << publisher.shape[i];
-        std::cout << "] frame_bytes=" << geometry.frame_bytes
-                  << " block_bytes=" << block_bytes
+        std::cout << "] frame_bytes=" << geometry.frame_bytes << " block_bytes=" << block_bytes
                   << " zero_copy_ring_bytes=" << receive_bytes
                   << " retained_frame_limit=" << config.credit_window << std::endl;
 
-        ParallelShardWriter writer(options, geometry);
+        ParallelShardWriter writer(options, geometry, receive_ring.fd(), receive_ring.data(),
+                                   receive_ring.bytes());
         TangoBulk::BulkSubscriber subscriber(proxy, config);
         std::uint64_t received = 0;
         std::uint64_t submitted_blocks = 0;
@@ -890,28 +1395,25 @@ int main(int argc, char *argv[])
         std::vector<FrameView> block;
         block.reserve(options.frames_per_block);
 
-        subscriber.set_frame_callback(
-            [&](FrameView frame)
+        subscriber.set_frame_callback([&](FrameView frame) {
+            if(received >= options.frames)
+                return;
+            validate_frame(frame, publisher, geometry, stream_endian);
+            block.push_back(std::move(frame));
+            ++received;
+            if(block.size() == options.frames_per_block)
             {
-                if(received >= options.frames)
-                    return;
-                validate_frame(frame, publisher, geometry, stream_endian);
-                block.push_back(std::move(frame));
-                ++received;
-                if(block.size() == options.frames_per_block)
-                {
-                    writer.submit(submitted_blocks++, std::move(block), *stream_endian);
-                    block.clear();
-                    block.reserve(options.frames_per_block);
-                }
-            });
+                writer.submit(submitted_blocks++, std::move(block), *stream_endian);
+                block.clear();
+                block.reserve(options.frames_per_block);
+            }
+        });
         subscriber.set_state_callback(
-            [](TangoBulk::SubscriberState state, const TangoBulk::BulkError &error)
-            {
+            [](TangoBulk::SubscriberState state, const TangoBulk::BulkError &error) {
                 std::cout << "state: " << TangoBulk::to_string(state);
                 if(error.status != TangoBulk::Status::Ok)
-                    std::cout << " (" << TangoBulk::to_string(error.status) << ": "
-                              << error.message << ")";
+                    std::cout << " (" << TangoBulk::to_string(error.status) << ": " << error.message
+                              << ")";
                 std::cout << std::endl;
             });
 
@@ -934,8 +1436,11 @@ int main(int argc, char *argv[])
         const std::uint64_t bytes = received * geometry.frame_bytes;
         const double gb_per_second =
             seconds > 0.0 ? static_cast<double>(bytes) / seconds / 1'000'000'000.0 : 0.0;
+        const double hdf5_write_concurrency =
+            seconds > 0.0 ? writer.write_seconds() / seconds : 0.0;
         std::cout << "wrote " << received << " frames, " << bytes << " bytes in " << seconds
-                  << " s: " << gb_per_second << " GB/s\n";
+                  << " s: " << gb_per_second
+                  << " GB/s hdf5_write_concurrency=" << hdf5_write_concurrency << '\n';
         for(std::size_t i = 0; i < writer.workers().size(); ++i)
         {
             const ShardWorker &worker = *writer.workers()[i];
@@ -943,13 +1448,15 @@ int main(int argc, char *argv[])
                                            ? static_cast<double>(worker.bytes_written()) /
                                                  worker.seconds() / 1'000'000'000.0
                                            : 0.0;
-            std::cout << "writer=" << i << " blocks=" << worker.blocks_written()
-                      << " bytes=" << worker.bytes_written()
+            std::cout << "writer=" << i << " pid=" << worker.process_id()
+                      << " blocks=" << worker.blocks_written() << " bytes=" << worker.bytes_written()
                       << " seconds=" << worker.seconds() << " GB/s=" << worker_rate
+                      << " write_seconds=" << worker.write_seconds()
                       << " peak_queue=" << worker.peak_queue() << " file="
                       << shard_path(options, i) << '\n';
         }
         std::cout << "master=" << options.output << " writers=" << options.writers
+                  << " writer_mode=processes"
                   << " frames_per_block=" << options.frames_per_block
                   << " blocks_per_stripe=" << options.blocks_per_stripe
                   << " queue_depth=" << options.queue_depth << std::endl;

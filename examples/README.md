@@ -65,10 +65,12 @@ the publisher gets its slots back immediately rather than one lease TTL later.
 
 The HDF5 client is a zero-copy throughput spike built from ordinary synchronous HDF5 calls. It
 queries the device for frame shape and type before subscribing, receives into a caller-owned
-registered ring, and distributes blocks of retained receive-slot views across independent shard
-files. Every shard has one dedicated writer thread and a bounded queue; no two threads ever write
-the same HDF5 file. HDF5 reads directly from those registered slots, and the subscriber credit is
-returned only after the corresponding synchronous write completes.
+registered shared-memory ring, and distributes blocks of retained receive-slot views across
+independent shard files. Every shard has one dedicated writer process and a bounded coordinator
+queue; no two processes ever write the same HDF5 file. Separate processes avoid serialization by
+the thread-safe HDF5 library's process-wide API lock. HDF5 reads directly from the shared
+registered slots, and the subscriber credit is returned only after the writer process confirms
+that the corresponding synchronous write completed.
 
 Blocks are striped round-robin by default so sequential acquisition keeps all writers active. Once
 the shard queues drain, the client creates the requested output file as a VDS master whose
@@ -91,7 +93,10 @@ default block-aligned chunks, and use `--stream NAME` for another stream.
 `--frames-per-block` must not exceed the publisher's granted credit window; otherwise a complete
 block could never reach a writer. Queue backpressure blocks the manual subscriber dispatch loop,
 and the publisher's ring/credit window provides the hard bound on retained image memory. The final
-report includes aggregate and per-writer throughput, block counts, and peak queue occupancy.
+report includes aggregate and per-writer throughput, child process IDs, time spent inside
+`H5Dwrite`, and peak queue occupancy. `hdf5_write_concurrency` is the sum of every child's
+`H5Dwrite` time divided by aggregate acquisition time: values above one directly show overlapping
+HDF5 calls in separate processes.
 
 The example publisher keeps its normal 32-slot/16-credit defaults, but larger benchmark rings can
 be requested without recompiling it:

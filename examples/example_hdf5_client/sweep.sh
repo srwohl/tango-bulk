@@ -69,7 +69,7 @@ csv_row "$CSV" \
     timestamp_utc host kernel filesystem output_dir tag gpfs_block_size gpfs_stripe_width \
     placement_note publisher_credit_window run repeat frames writers queue_depth \
     frames_per_block frame_bytes block_bytes ring_depth blocks_per_stripe layout status exit_code \
-    bytes write_seconds gbps wall_seconds sync_seconds peak_queue_max log
+    bytes write_seconds gbps hdf5_write_concurrency wall_seconds sync_seconds peak_queue_max log
 
 host=$(hostname)
 kernel=$(uname -sr)
@@ -110,6 +110,7 @@ while [ "$repeat" -le "$REPEATS" ]; do
                             block_bytes=
                             write_seconds=
                             gbps=
+                            hdf5_write_concurrency=
                             wall_seconds=
                             sync_seconds=
                             peak_queue_max=
@@ -179,6 +180,15 @@ while [ "$repeat" -le "$REPEATS" ]; do
                                     bytes=$(printf '%s\n' "$summary" | awk '{print $4}')
                                     write_seconds=$(printf '%s\n' "$summary" | awk '{print $7}')
                                     gbps=$(printf '%s\n' "$summary" | awk '{print $9}')
+                                    hdf5_write_concurrency=$(printf '%s\n' "$summary" | awk '
+                                        {
+                                            for (i = 1; i <= NF; ++i) {
+                                                if ($i ~ /^hdf5_write_concurrency=/) {
+                                                    split($i, value, "="); print value[2]; exit
+                                                }
+                                            }
+                                        }
+                                    ')
                                 fi
                                 peak_queue_max=$(awk '
                                     /peak_queue=/ {
@@ -204,12 +214,13 @@ while [ "$repeat" -le "$REPEATS" ]; do
                                 "$PUBLISHER_CREDIT_WINDOW" "$run" "$repeat" "$FRAMES" "$writers" \
                                 "$queue_depth" "$frames_per_block" "$frame_bytes" "$block_bytes" \
                                 "$ring_depth" "$blocks_per_stripe" "$layout" "$status" \
-                                "$exit_code" "$bytes" "$write_seconds" "$gbps" "$wall_seconds" \
-                                "$sync_seconds" "$peak_queue_max" "$log"
-                            printf 'run=%s repeat=%s writers=%s queue=%s block=%s ring=%s stripe=%s layout=%s status=%s gbps=%s\n' \
+                                "$exit_code" "$bytes" "$write_seconds" "$gbps" \
+                                "$hdf5_write_concurrency" "$wall_seconds" "$sync_seconds" \
+                                "$peak_queue_max" "$log"
+                            printf 'run=%s repeat=%s writers=%s queue=%s block=%s ring=%s stripe=%s layout=%s status=%s gbps=%s hdf5_concurrency=%s\n' \
                                 "$run" "$repeat" "$writers" "$queue_depth" "$frames_per_block" \
                                 "$ring_depth" "$blocks_per_stripe" "$layout" "$status" \
-                                "${gbps:-n/a}"
+                                "${gbps:-n/a}" "${hdf5_write_concurrency:-n/a}"
                             active_run_dir=
                             rm -f "$timing" "$sync_timing"
                             if [ "$COOLDOWN_SECONDS" != 0 ]; then sleep "$COOLDOWN_SECONDS"; fi

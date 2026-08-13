@@ -38,13 +38,17 @@ target_link_libraries(tango-bulk-example-preview PRIVATE tango-bulk::tango)
 add_executable(tango-bulk-example-client example_client/example_client.cpp)
 target_link_libraries(tango-bulk-example-client PRIVATE tango-bulk::tango)
 
-# Independent shard workers use ordinary synchronous HDF5 calls.  The master
-# file uses VDS, available since HDF5 1.10.
+# Independent shard processes use ordinary synchronous HDF5 calls without
+# sharing HDF5's process-wide lock.  The master file uses VDS, available since
+# HDF5 1.10.
 if(HDF5_VERSION VERSION_GREATER_EQUAL 1.10)
     add_executable(tango-bulk-example-hdf5-client
                    example_hdf5_client/example_hdf5_client.cpp)
     target_link_libraries(tango-bulk-example-hdf5-client
                           PRIVATE tango-bulk::tango HDF5::HDF5)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(tango-bulk-example-hdf5-client PRIVATE rt)
+    endif()
     tango_bulk_apply_warnings(tango-bulk-example-hdf5-client)
 else()
     message(WARNING
