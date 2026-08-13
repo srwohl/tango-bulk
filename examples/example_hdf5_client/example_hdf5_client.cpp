@@ -818,8 +818,14 @@ class ShardWorker
         rethrow_if_failed();
     }
 
-    std::uint64_t bytes_written() const noexcept { return bytes_written_; }
-    std::uint64_t blocks_written() const noexcept { return blocks_written_; }
+    std::uint64_t bytes_written() const noexcept
+    {
+        return bytes_written_.load(std::memory_order_relaxed);
+    }
+    std::uint64_t blocks_written() const noexcept
+    {
+        return blocks_written_.load(std::memory_order_relaxed);
+    }
     std::size_t peak_queue() const noexcept { return peak_queue_; }
     pid_t process_id() const noexcept { return process_id_; }
     double write_seconds() const noexcept { return write_seconds_; }
@@ -857,8 +863,9 @@ class ShardWorker
                     started_at_ = std::chrono::steady_clock::now();
                 }
                 write_block(block);
-                bytes_written_ += geometry_.frame_bytes * block.frame_count;
-                ++blocks_written_;
+                bytes_written_.fetch_add(geometry_.frame_bytes * block.frame_count,
+                                         std::memory_order_relaxed);
+                blocks_written_.fetch_add(1, std::memory_order_relaxed);
             }
             WriterCommandMessage stop;
             stop.command = WriterCommand::Stop;
@@ -866,8 +873,8 @@ class ShardWorker
             WriterResponseMessage response;
             read_exact(socket_, &response, sizeof(response));
             require_response(response, WriterResponse::Stopped);
-            if(response.blocks_written != blocks_written_ ||
-               response.bytes_written != bytes_written_)
+            if(response.blocks_written != blocks_written() ||
+               response.bytes_written != bytes_written())
                 throw std::runtime_error("HDF5 writer process reported inconsistent counters");
             write_seconds_ = response.write_seconds;
             ::close(socket_);
@@ -1072,8 +1079,8 @@ class ShardWorker
     std::thread thread_;
     bool stopping_{false};
     std::exception_ptr error_;
-    std::uint64_t bytes_written_{0};
-    std::uint64_t blocks_written_{0};
+    std::atomic<std::uint64_t> bytes_written_{0};
+    std::atomic<std::uint64_t> blocks_written_{0};
     double write_seconds_{0.0};
     std::size_t peak_queue_{0};
     bool started_{false};
@@ -1156,6 +1163,14 @@ class ParallelShardWriter
         double result = 0.0;
         for(const auto &worker : workers_)
             result += worker->write_seconds();
+        return result;
+    }
+
+    std::uint64_t completed_bytes() const noexcept
+    {
+        std::uint64_t result = 0;
+        for(const auto &worker : workers_)
+            result += worker->bytes_written();
         return result;
     }
 
@@ -1418,8 +1433,36 @@ int main(int argc, char *argv[])
             });
 
         subscriber.start();
+        const auto acquisition_started = std::chrono::steady_clock::now();
+        auto progress_at = acquisition_started;
+        std::uint64_t progress_bytes = 0;
         while(running.load() && received < options.frames)
+        {
             subscriber.poll(std::chrono::milliseconds{50});
+            const auto now = std::chrono::steady_clock::now();
+            const double interval_seconds =
+                std::chrono::duration<double>(now - progress_at).count();
+            if(interval_seconds >= 1.0)
+            {
+                const std::uint64_t completed_bytes = writer.completed_bytes();
+                const double elapsed_seconds =
+                    std::chrono::duration<double>(now - acquisition_started).count();
+                const double interval_gb_per_second =
+                    static_cast<double>(completed_bytes - progress_bytes) / interval_seconds /
+                    1'000'000'000.0;
+                const double average_gb_per_second =
+                    elapsed_seconds > 0.0
+                        ? static_cast<double>(completed_bytes) / elapsed_seconds / 1'000'000'000.0
+                        : 0.0;
+                std::cout << "progress elapsed_s=" << elapsed_seconds
+                          << " interval_s=" << interval_seconds
+                          << " completed_bytes=" << completed_bytes
+                          << " interval_GBps=" << interval_gb_per_second
+                          << " average_GBps=" << average_gb_per_second << std::endl;
+                progress_at = now;
+                progress_bytes = completed_bytes;
+            }
+        }
         subscriber.stop();
         writer.close();
 

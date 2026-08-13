@@ -69,7 +69,8 @@ csv_row "$CSV" \
     timestamp_utc host kernel filesystem output_dir tag gpfs_block_size gpfs_stripe_width \
     placement_note publisher_credit_window run repeat frames writers queue_depth \
     frames_per_block frame_bytes block_bytes ring_depth blocks_per_stripe layout status exit_code \
-    bytes write_seconds gbps hdf5_write_concurrency wall_seconds sync_seconds peak_queue_max log
+    bytes write_seconds gbps hdf5_write_concurrency sustained_samples sustained_gbps_mean \
+    sustained_gbps_min sustained_gbps_max wall_seconds sync_seconds peak_queue_max log
 
 host=$(hostname)
 kernel=$(uname -sr)
@@ -111,6 +112,10 @@ while [ "$repeat" -le "$REPEATS" ]; do
                             write_seconds=
                             gbps=
                             hdf5_write_concurrency=
+                            sustained_samples=
+                            sustained_gbps_mean=
+                            sustained_gbps_min=
+                            sustained_gbps_max=
                             wall_seconds=
                             sync_seconds=
                             peak_queue_max=
@@ -197,6 +202,30 @@ while [ "$repeat" -le "$REPEATS" ]; do
                                     }
                                     END { if (max != "") print max }
                                 ' "$log")
+                                sustained=$(awk '
+                                    /^progress / {
+                                        value = ""
+                                        for (i = 1; i <= NF; ++i) {
+                                            if ($i ~ /^interval_GBps=/) {
+                                                split($i, field, "="); value = field[2] + 0
+                                            }
+                                        }
+                                        if (value != "") {
+                                            ++n; sum += value
+                                            if (n == 1 || value < min) min = value
+                                            if (n == 1 || value > max) max = value
+                                        }
+                                    }
+                                    END {
+                                        if (n != 0) printf "%d %.6f %.6f %.6f", n, sum / n, min, max
+                                    }
+                                ' "$log")
+                                if [ -n "$sustained" ]; then
+                                    sustained_samples=$(printf '%s\n' "$sustained" | awk '{print $1}')
+                                    sustained_gbps_mean=$(printf '%s\n' "$sustained" | awk '{print $2}')
+                                    sustained_gbps_min=$(printf '%s\n' "$sustained" | awk '{print $3}')
+                                    sustained_gbps_max=$(printf '%s\n' "$sustained" | awk '{print $4}')
+                                fi
                                 if [ "$exit_code" -ne 0 ] || [ -z "$gbps" ]; then
                                     status=failed
                                     failures=$((failures + 1))
@@ -215,12 +244,16 @@ while [ "$repeat" -le "$REPEATS" ]; do
                                 "$queue_depth" "$frames_per_block" "$frame_bytes" "$block_bytes" \
                                 "$ring_depth" "$blocks_per_stripe" "$layout" "$status" \
                                 "$exit_code" "$bytes" "$write_seconds" "$gbps" \
-                                "$hdf5_write_concurrency" "$wall_seconds" "$sync_seconds" \
+                                "$hdf5_write_concurrency" "$sustained_samples" \
+                                "$sustained_gbps_mean" "$sustained_gbps_min" \
+                                "$sustained_gbps_max" "$wall_seconds" "$sync_seconds" \
                                 "$peak_queue_max" "$log"
-                            printf 'run=%s repeat=%s writers=%s queue=%s block=%s ring=%s stripe=%s layout=%s status=%s gbps=%s hdf5_concurrency=%s\n' \
+                            printf 'run=%s repeat=%s writers=%s queue=%s block=%s ring=%s stripe=%s layout=%s status=%s gbps=%s hdf5_concurrency=%s sustained_mean=%s sustained_min=%s sustained_max=%s\n' \
                                 "$run" "$repeat" "$writers" "$queue_depth" "$frames_per_block" \
                                 "$ring_depth" "$blocks_per_stripe" "$layout" "$status" \
-                                "${gbps:-n/a}" "${hdf5_write_concurrency:-n/a}"
+                                "${gbps:-n/a}" "${hdf5_write_concurrency:-n/a}" \
+                                "${sustained_gbps_mean:-n/a}" "${sustained_gbps_min:-n/a}" \
+                                "${sustained_gbps_max:-n/a}"
                             active_run_dir=
                             rm -f "$timing" "$sync_timing"
                             if [ "$COOLDOWN_SECONDS" != 0 ]; then sleep "$COOLDOWN_SECONDS"; fi
