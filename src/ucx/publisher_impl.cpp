@@ -1734,6 +1734,13 @@ std::vector<std::byte> BulkPublisher::Impl::handle_open(const std::byte *data,
         session->stream_id = Protocol::generate_stream_id();
         session->probe_token = Protocol::generate_probe_token();
         session->geometry = geometry;
+        // CreditWindow is live transport state, not merely publisher
+        // capacity.  BulkOpen may clamp both values to what this subscriber
+        // requested, so retaining the server-wide defaults here would let the
+        // publisher put more sequences in flight than fit in the client's
+        // receive ring.  Those frames collide with occupied slots and create a
+        // permanent hole in the subscriber's cumulative credit sequence.
+        session->window = CreditWindow(geometry.ring_depth, geometry.credit_window);
         session->receive_memory_kind = request.requested_memory_kind;
         session->ep = endpoint;
         session->probe_sent = false;

@@ -112,6 +112,47 @@ TEST_CASE("Slots recycle: sequence s lands in slot s % ring_depth", "[m2][slice]
     CHECK(eventually([&] { return slice.publisher.source().retained() == 0; }));
 }
 
+TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring",
+          "[m2][slice]")
+{
+    PublisherConfig pub = publisher_config();
+    pub.ring_depth = 8;
+    pub.credit_window = 4;
+
+    SubscriberConfig sub = subscriber_config();
+    sub.ring_depth = 2;
+    sub.credit_window = 2;
+
+    Slice slice(pub, sub);
+    REQUIRE(slice.subscriber.granted_ring_depth() == 2);
+
+    // Fill beyond the client's negotiated window before polling.  BestEffort
+    // may skip frames for this session, but it must not assign them sequences:
+    // doing so sends 2 and 3 into slots still occupied by 0 and 1.
+    for(unsigned seed = 0; seed < 4; ++seed)
+        REQUIRE(slice.publish(4096, seed) == PublishResult::Accepted);
+
+    std::vector<FrameView> first = collect(slice.subscriber, 2);
+    REQUIRE(first.size() == 2);
+    CHECK(first[0].sequence() == 0);
+    CHECK(first[1].sequence() == 1);
+    first.clear();
+    REQUIRE(eventually([&] { return slice.publisher.counters().frames_credited == 2; }));
+
+    // Once those two credits return, sequence assignment resumes contiguously.
+    // A publisher still using its configured width of 4 produces 4 and 5 here,
+    // leaving the subscriber's ReleaseTracker permanently waiting for 2.
+    REQUIRE(slice.publish(4096, 4) == PublishResult::Accepted);
+    REQUIRE(slice.publish(4096, 5) == PublishResult::Accepted);
+
+    std::vector<FrameView> second = collect(slice.subscriber, 2);
+    REQUIRE(second.size() == 2);
+    CHECK(second[0].sequence() == 2);
+    CHECK(second[1].sequence() == 3);
+    second.clear();
+    CHECK(eventually([&] { return slice.publisher.counters().frames_credited == 4; }));
+}
+
 TEST_CASE("A retained view withholds exactly one credit", "[m2][slice]")
 {
     Slice slice;
