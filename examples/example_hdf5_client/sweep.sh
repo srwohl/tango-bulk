@@ -12,7 +12,6 @@ CLIENT=${CLIENT:-build/examples/tango-bulk-example-hdf5-client}
 DEVICE=${DEVICE:?set DEVICE to the Tango device URI or name}
 OUTPUT_DIR=${OUTPUT_DIR:?set OUTPUT_DIR to the filesystem being measured}
 FRAMES=${FRAMES:-1024}
-FRAME_BYTES=${FRAME_BYTES:-8388608}
 WRITERS=${WRITERS:-"1 2 4"}
 QUEUE_DEPTHS=${QUEUE_DEPTHS:-"1 2"}
 FRAMES_PER_BLOCKS=${FRAMES_PER_BLOCKS:-"4 8"}
@@ -69,7 +68,7 @@ csv_row()
 csv_row "$CSV" \
     timestamp_utc host kernel filesystem output_dir tag gpfs_block_size gpfs_stripe_width \
     placement_note publisher_credit_window run repeat frames writers queue_depth \
-    frames_per_block block_bytes ring_depth blocks_per_stripe layout status exit_code \
+    frames_per_block frame_bytes block_bytes ring_depth blocks_per_stripe layout status exit_code \
     bytes write_seconds gbps wall_seconds sync_seconds peak_queue_max log
 
 host=$(hostname)
@@ -103,11 +102,12 @@ while [ "$repeat" -le "$REPEATS" ]; do
                             sync_timing=$RESULTS_DIR/$run_name.sync-time
                             active_run_dir=$OUTPUT_DIR/tango-bulk-hdf5-$SWEEP_ID-$run_name
                             master=$active_run_dir/capture.h5
-                            block_bytes=$((frames_per_block * FRAME_BYTES))
                             timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
                             status=ok
                             exit_code=0
                             bytes=
+                            frame_bytes=
+                            block_bytes=
                             write_seconds=
                             gbps=
                             wall_seconds=
@@ -153,6 +153,27 @@ while [ "$repeat" -le "$REPEATS" ]; do
                                     $layout_arg >> "$log" 2>&1
                                 exit_code=$?
                                 wall_seconds=$(cat "$timing" 2>/dev/null || true)
+                                geometry=$(awk '/^publisher geometry:/{print; exit}' "$log")
+                                if [ -n "$geometry" ]; then
+                                    frame_bytes=$(printf '%s\n' "$geometry" | awk '
+                                        {
+                                            for (i = 1; i <= NF; ++i) {
+                                                if ($i ~ /^frame_bytes=/) {
+                                                    split($i, value, "="); print value[2]; exit
+                                                }
+                                            }
+                                        }
+                                    ')
+                                    block_bytes=$(printf '%s\n' "$geometry" | awk '
+                                        {
+                                            for (i = 1; i <= NF; ++i) {
+                                                if ($i ~ /^block_bytes=/) {
+                                                    split($i, value, "="); print value[2]; exit
+                                                }
+                                            }
+                                        }
+                                    ')
+                                fi
                                 summary=$(awk '/^wrote [0-9]+ frame/{print; exit}' "$log")
                                 if [ -n "$summary" ]; then
                                     bytes=$(printf '%s\n' "$summary" | awk '{print $4}')
@@ -181,10 +202,10 @@ while [ "$repeat" -le "$REPEATS" ]; do
                                 "$timestamp" "$host" "$kernel" "$filesystem" "$OUTPUT_DIR" \
                                 "$TAG" "$GPFS_BLOCK_SIZE" "$GPFS_STRIPE_WIDTH" "$PLACEMENT_NOTE" \
                                 "$PUBLISHER_CREDIT_WINDOW" "$run" "$repeat" "$FRAMES" "$writers" \
-                                "$queue_depth" "$frames_per_block" "$block_bytes" "$ring_depth" \
-                                "$blocks_per_stripe" "$layout" "$status" "$exit_code" "$bytes" \
-                                "$write_seconds" "$gbps" "$wall_seconds" "$sync_seconds" \
-                                "$peak_queue_max" "$log"
+                                "$queue_depth" "$frames_per_block" "$frame_bytes" "$block_bytes" \
+                                "$ring_depth" "$blocks_per_stripe" "$layout" "$status" \
+                                "$exit_code" "$bytes" "$write_seconds" "$gbps" "$wall_seconds" \
+                                "$sync_seconds" "$peak_queue_max" "$log"
                             printf 'run=%s repeat=%s writers=%s queue=%s block=%s ring=%s stripe=%s layout=%s status=%s gbps=%s\n' \
                                 "$run" "$repeat" "$writers" "$queue_depth" "$frames_per_block" \
                                 "$ring_depth" "$blocks_per_stripe" "$layout" "$status" \

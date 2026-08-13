@@ -106,7 +106,8 @@ be requested without recompiling it:
 dimensions into isolated acquisitions and writes one CSV row plus one full client log per run.
 Successful data files are removed by default; set `KEEP_OUTPUTS=1` to retain them. `OUTPUT_DIR` is
 the filesystem under test, while `RESULTS_DIR` defaults to the current directory, so logging does
-not add traffic to the GPFS mount.
+not add traffic to the GPFS mount. Frame and block byte sizes are queried from the device and
+recorded automatically; they are not sweep inputs.
 
 ```sh
 DEVICE='tango://localhost:10000/bulk/example/gpfs#dbase=no' \
