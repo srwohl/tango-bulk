@@ -390,17 +390,33 @@ class Hdf5ShardWriter
             check_hdf5(H5Sselect_hyperslab(file_space, H5S_SELECT_SET, file_start.data(), nullptr,
                                            file_count.data(), nullptr),
                        "H5Sselect_hyperslab(file)");
-            const hsize_t slot_elements = geometry_.slot_bytes / geometry_.element_size;
-            const hsize_t frame_elements = geometry_.frame_bytes / geometry_.element_size;
-            const hsize_t memory_extent =
-                slot_elements * static_cast<hsize_t>(run_frames - 1) + frame_elements;
-            memory_space = checked_id(H5Screate_simple(1, &memory_extent, nullptr),
-                                      "H5Screate_simple(receive slots)");
-            const hsize_t memory_start = 0;
-            const hsize_t memory_count = run_frames;
-            check_hdf5(H5Sselect_hyperslab(memory_space, H5S_SELECT_SET, &memory_start,
-                                           &slot_elements, &memory_count, &frame_elements),
-                       "H5Sselect_hyperslab(receive slots)");
+            if(geometry_.slot_bytes == geometry_.frame_bytes)
+            {
+                // This is the normal image-stream case: adjacent receive slots
+                // are also adjacent frame payloads.  Describe them as the
+                // dense N-D array HDF5 is about to write.  Expressing the same
+                // memory as one enormous 1-D hyperslab makes HDF5 expand the
+                // selection element by element during chunk setup; a block of
+                // four 14 MB frames can spend minutes in H5S__hyper_iter_next.
+                memory_space = checked_id(
+                    H5Screate_simple(static_cast<int>(file_count.size()), file_count.data(),
+                                     nullptr),
+                    "H5Screate_simple(contiguous receive slots)");
+            }
+            else
+            {
+                const hsize_t slot_elements = geometry_.slot_bytes / geometry_.element_size;
+                const hsize_t frame_elements = geometry_.frame_bytes / geometry_.element_size;
+                const hsize_t memory_extent =
+                    slot_elements * static_cast<hsize_t>(run_frames - 1) + frame_elements;
+                memory_space = checked_id(H5Screate_simple(1, &memory_extent, nullptr),
+                                          "H5Screate_simple(receive slots)");
+                const hsize_t memory_start = 0;
+                const hsize_t memory_count = run_frames;
+                check_hdf5(H5Sselect_hyperslab(memory_space, H5S_SELECT_SET, &memory_start,
+                                               &slot_elements, &memory_count, &frame_elements),
+                           "H5Sselect_hyperslab(receive slots)");
+            }
             check_hdf5(H5Dwrite(dataset_, hdf5_type(geometry_.element_type, block.endian),
                                 memory_space, file_space, H5P_DEFAULT,
                                 block.frames[begin].data()),
