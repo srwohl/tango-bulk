@@ -96,7 +96,9 @@ and the publisher's ring/credit window provides the hard bound on retained image
 report includes aggregate and per-writer throughput, child process IDs, time spent inside
 `H5Dwrite`, and peak queue occupancy. `hdf5_write_concurrency` is the sum of every child's
 `H5Dwrite` time divided by aggregate acquisition time: values above one directly show overlapping
-HDF5 calls in separate processes.
+HDF5 calls in separate processes. During acquisition the client also prints one-second
+`progress` samples based on completed HDF5 blocks. The sweep records their mean, minimum, maximum,
+and sample count so longer runs expose transient or sustained throughput collapse.
 
 The example publisher keeps its normal 32-slot/16-credit defaults, but larger benchmark rings can
 be requested without recompiling it:
