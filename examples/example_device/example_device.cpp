@@ -46,6 +46,42 @@ constexpr std::uint64_t k_width = 2048;
 constexpr std::uint64_t k_height = 2048;
 constexpr std::uint64_t k_frame_bytes = k_width * k_height * 2; ///< 8 MiB of u16
 
+struct ExampleOptions
+{
+    std::uint32_t ring_depth{32};
+    std::uint32_t credit_window{16};
+};
+
+ExampleOptions options;
+
+std::vector<char *> parse_options(int argc, char *argv[])
+{
+    std::vector<char *> tango_arguments{argv[0]};
+    for(int i = 1; i < argc; ++i)
+    {
+        const std::string argument(argv[i]);
+        const auto parse_value = [&](const char *name) -> std::uint32_t
+        {
+            if(i + 1 >= argc)
+                throw std::runtime_error(std::string(name) + " requires a value");
+            const unsigned long value = std::stoul(argv[++i]);
+            if(value == 0 || value > k_max_ring_depth)
+                throw std::runtime_error(std::string(name) + " is outside the supported range");
+            return static_cast<std::uint32_t>(value);
+        };
+
+        if(argument == "--publisher-ring-depth")
+            options.ring_depth = parse_value("--publisher-ring-depth");
+        else if(argument == "--publisher-credit-window")
+            options.credit_window = parse_value("--publisher-credit-window");
+        else
+            tango_arguments.push_back(argv[i]);
+    }
+    if(options.credit_window > options.ring_depth)
+        throw std::runtime_error("publisher credit window cannot exceed ring depth");
+    return tango_arguments;
+}
+
 enum class ConfigurationAttribute
 {
     FrameWidth,
@@ -75,14 +111,22 @@ class ExampleDetector : public TANGO_BASE_CLASS
         // The stream name a client asks for by name in its SubscriberConfig.  A
         // device with several detectors has several publishers, one per stream.
         config.stream_name = "image";
+        config.frame_metadata.element_type = ElementType::UInt16;
+        config.frame_metadata.rank = 2;
+        config.frame_metadata.shape[0] = k_height;
+        config.frame_metadata.shape[1] = k_width;
 
         // 6.1's defaults are 8 MiB x 32 = 256 MiB pinned, which is what this
         // geometry works out to.  Sizing the ring is the one decision a detector
         // integrator genuinely has to make: it is the depth of the buffer
         // between acquisition and a consumer that stops consuming.
         config.max_frame_bytes = k_frame_bytes;
-        config.ring_depth = 32;
-        config.credit_window = 16;
+        config.ring_depth = options.ring_depth;
+        config.credit_window = options.credit_window;
+        const std::uint64_t padded_ring_bytes =
+            (k_frame_bytes + 4096) * static_cast<std::uint64_t>(config.ring_depth);
+        if(config.pinned_memory_limit_bytes < padded_ring_bytes)
+            config.pinned_memory_limit_bytes = padded_ring_bytes;
 
         // How many clients may hold a session at once.  Above one because 4.4's
         // crash-and-restart case needs the old session and the new one to
@@ -378,6 +422,9 @@ int main(int argc, char *argv[])
 {
     try
     {
+        std::vector<char *> tango_arguments = parse_options(argc, argv);
+        argc = static_cast<int>(tango_arguments.size());
+        argv = tango_arguments.data();
         Tango::Util *util = Tango::Util::init(argc, argv);
 
         util->register_dserver_constructor(

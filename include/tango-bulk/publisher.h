@@ -34,6 +34,10 @@ const char *to_string(FanoutMode mode) noexcept;
 struct PublisherConfig
 {
     std::string stream_name; ///< 1..64 bytes, [A-Za-z0-9_.-]
+    /// Initial stream layout advertised by Open and Query.  Leave Unknown/rank
+    /// zero for an opaque byte stream; array publishers should declare their
+    /// real type and shape before accepting clients.
+    FrameMetadata frame_metadata{};
     std::uint64_t max_frame_bytes{8ull << 20};
     std::uint32_t ring_depth{32};
     std::uint32_t credit_window{16}; ///< MUST be <= ring_depth

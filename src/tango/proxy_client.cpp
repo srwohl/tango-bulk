@@ -1063,6 +1063,11 @@ BulkQueryResult bulk_query(Tango::DeviceProxy &proxy, const CommandNames &names)
     result.max_frame_bytes = decoded.geometry.max_frame_bytes;
     result.ring_depth = decoded.geometry.ring_depth;
     result.credit_window = decoded.geometry.credit_window;
+    result.element_type = decoded.geometry.element_type;
+    result.element_size = decoded.geometry.element_size;
+    result.rank = decoded.geometry.rank;
+    result.shape = decoded.geometry.shape;
+    result.strides = decoded.geometry.strides;
     result.counters = std::move(decoded.counters);
     return result;
 }

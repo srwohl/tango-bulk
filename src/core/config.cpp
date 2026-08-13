@@ -108,6 +108,13 @@ Status PublisherConfig::validate() const noexcept
         return common;
     }
 
+    if(frame_metadata.element_type != ElementType::Unknown || frame_metadata.rank != 0)
+    {
+        FrameMetadata resolved = frame_metadata;
+        if(const Status status = resolved.resolve(max_frame_bytes); status != Status::Ok)
+            return status;
+    }
+
     if(max_sessions < 1 || max_sessions > k_max_sessions)
     {
         return Status::DepthTooLarge;

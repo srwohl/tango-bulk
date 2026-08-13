@@ -13,6 +13,7 @@ The examples cover the whole M4 surface plus a file-backed detector:
 | `example_device/` | A device server that publishes a bulk stream. The integration is the three lines of §7.2, marked in the source. |
 | `example_hdf5_device/` | Replays an image stack from a NeXus/HDF5 dataset, using file metadata for frame geometry, numeric type, byte order, and default rate. |
 | `example_client/` | A subscriber driven by a stock `Tango::DeviceProxy`. Construct, two callbacks, `start()`, `stop()`. |
+| `example_hdf5_client/` | Copies received frames into bounded blocks, writes round-robin HDF5 shards in parallel, and exposes them through one VDS master file. |
 | `example_cuda_client/` | Discovers the stream geometry and receives directly into a CUDA allocation through UCX/GPUDirect RDMA. |
 | `example_preview/` | The compatibility path: the same bulk stream plus a decimated, rate-capped Tango image attribute with an ordinary change event (§7.5). |
 
@@ -59,6 +60,78 @@ Two terminals, no database, no configuration:
 
 The client prints a frame rate once a second and its counters on exit. `Ctrl-C` closes the session;
 the publisher gets its slots back immediately rather than one lease TTL later.
+
+## Writing a stream to parallel HDF5 shards
+
+The HDF5 client is a zero-copy throughput spike built from ordinary synchronous HDF5 calls. It
+queries the device for frame shape and type before subscribing, receives into a caller-owned
+registered ring, and distributes blocks of retained receive-slot views across independent shard
+files. Every shard has one dedicated writer thread and a bounded queue; no two threads ever write
+the same HDF5 file. HDF5 reads directly from those registered slots, and the subscriber credit is
+returned only after the corresponding synchronous write completes.
+
+Blocks are striped round-robin by default so sequential acquisition keeps all writers active. Once
+the shard queues drain, the client creates the requested output file as a VDS master whose
+`/images` dataset reconstructs global frame order. Each shard is also a valid standalone HDF5 file.
+
+```sh
+./build/examples/tango-bulk-example-hdf5-client \
+    "tango://localhost:10000/bulk/example/1#dbase=no" capture.h5 \
+    --frames 4096 --writers 4 --frames-per-block 32 \
+    --blocks-per-stripe 1 --queue-depth 4 --ring-depth 32 --overwrite
+```
+
+For `capture.h5`, the physical files are named `capture.part_000.h5`,
+`capture.part_001.h5`, and so on. Existing master or shard outputs are refused unless `--overwrite`
+is present. `--frames` must be a multiple of `--frames-per-block`; `--blocks-per-stripe` groups
+adjacent blocks onto one writer before moving to the next. `--batch-frames` remains accepted as an
+alias for `--frames-per-block`. Add `--contiguous` to compare contiguous shard datasets against the
+default block-aligned chunks, and use `--stream NAME` for another stream.
+
+`--frames-per-block` must not exceed the publisher's granted credit window; otherwise a complete
+block could never reach a writer. Queue backpressure blocks the manual subscriber dispatch loop,
+and the publisher's ring/credit window provides the hard bound on retained image memory. The final
+report includes aggregate and per-writer throughput, block counts, and peak queue occupancy.
+
+The example publisher keeps its normal 32-slot/16-credit defaults, but larger benchmark rings can
+be requested without recompiling it:
+
+```sh
+./build/examples/tango-bulk-example-device gpfs -nodb \
+    -dlist bulk/example/gpfs -ORBendPoint giop:tcp::10000 \
+    --publisher-ring-depth 128 --publisher-credit-window 64
+```
+
+`example_hdf5_client/sweep.sh` expands the writer, queue, block, ring, stripe, layout, and repeat
+dimensions into isolated acquisitions and writes one CSV row plus one full client log per run.
+Successful data files are removed by default; set `KEEP_OUTPUTS=1` to retain them. `OUTPUT_DIR` is
+the filesystem under test, while `RESULTS_DIR` defaults to the current directory, so logging does
+not add traffic to the GPFS mount.
+
+```sh
+DEVICE='tango://localhost:10000/bulk/example/gpfs#dbase=no' \
+OUTPUT_DIR=/path/to/gpfs/allocation \
+WRITERS='1 2 4 8' QUEUE_DEPTHS='1 2 4' \
+FRAMES_PER_BLOCKS='4 8 16' RING_DEPTHS='64 128' \
+BLOCKS_PER_STRIPES='1 4 16' REPEATS=3 FRAMES=4096 \
+PUBLISHER_CREDIT_WINDOW=64 \
+GPFS_BLOCK_SIZE=8MiB GPFS_STRIPE_WIDTH=8 \
+PLACEMENT_NOTE='fileset policy spreads shards across NSDs' \
+./examples/example_hdf5_client/sweep.sh
+```
+
+Use `DRY_RUN=1` to materialize and inspect the matrix without contacting the device. The GPFS block
+size, stripe width, placement note, filesystem type, host, kernel, and free-form `TAG` are repeated
+in every CSV row so result files remain interpretable after they leave the machine. Set the
+device's `frameRate` to `0` and `fillPayload` to false for a storage-bound sweep. The harness records
+application write time, total client wall time, and a separate filesystem-sync time; set
+`SYNC_AFTER_RUN=0` only when durability is deliberately outside the measurement.
+
+Before the GPFS allocation, obtain the filesystem block size (`mmlsfs <device> -B`, when permitted),
+the storage stripe width, and the site's file-placement policy. In particular, confirm whether
+separate shard files are automatically spread over NSDs or need a fileset/placement-policy hint.
+Record those answers through `GPFS_BLOCK_SIZE`, `GPFS_STRIPE_WIDTH`, and `PLACEMENT_NOTE` rather than
+baking site-specific assumptions into the sweep.
 
 The preview server is the same shape:
 

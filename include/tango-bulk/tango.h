@@ -8,6 +8,7 @@
 #include <tango-bulk/publisher.h>
 #include <tango-bulk/subscriber.h>
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -80,6 +81,15 @@ struct BulkQueryResult
     std::uint64_t max_frame_bytes{0};
     std::uint32_t ring_depth{0};
     std::uint32_t credit_window{0};
+
+    /// The declared frame layout.  These fields come from the publisher's
+    /// current geometry epoch; clients should not have to wait for a first
+    /// frame before sizing or laying out their destination.
+    ElementType element_type{ElementType::Unknown};
+    std::uint32_t element_size{0};
+    std::uint32_t rank{0};
+    std::array<std::uint64_t, k_max_rank> shape{};
+    std::array<std::uint64_t, k_max_rank> strides{};
 
     /// `key=value;` pairs.  Free-form by design: an operator reads it, and the
     /// set of counters may grow within a minor version.  It carries no UCX

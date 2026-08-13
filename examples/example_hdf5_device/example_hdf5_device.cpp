@@ -395,6 +395,13 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
 
         PublisherConfig config;
         config.stream_name = "image";
+        config.frame_metadata.element_type = replay_->description().element_type;
+        config.frame_metadata.element_size =
+            static_cast<std::uint32_t>(replay_->description().element_bytes);
+        config.frame_metadata.rank = static_cast<std::uint32_t>(replay_->frame_shape().size());
+        for(std::size_t i = 0; i < replay_->frame_shape().size(); ++i)
+            config.frame_metadata.shape[i] = replay_->frame_shape()[i];
+        config.frame_metadata.endian = replay_->description().endian;
         // The transport has a 4 KiB minimum slot size; small test images still
         // carry their exact payload_bytes in FrameMetadata.
         config.max_frame_bytes = std::max<std::uint64_t>(k_min_frame_bytes,

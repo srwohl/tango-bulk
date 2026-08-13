@@ -1320,12 +1320,14 @@ struct BulkPublisher::Impl
     {
         Protocol::GeometryBlock geometry;
         geometry.generation = generation;
-        geometry.element_type = ElementType::Byte;
-        geometry.element_size = 1;
-        geometry.rank = 0;
+        geometry.element_type = config.frame_metadata.element_type;
+        geometry.element_size = config.frame_metadata.element_size;
+        geometry.rank = config.frame_metadata.rank;
         geometry.max_frame_bytes = config.max_frame_bytes;
         geometry.ring_depth = config.ring_depth;
         geometry.credit_window = config.credit_window;
+        geometry.shape = config.frame_metadata.shape;
+        geometry.strides = config.frame_metadata.strides;
         return geometry;
     }
 
@@ -1387,6 +1389,24 @@ struct BulkPublisher::Impl
 
 BulkPublisher::BulkPublisher(PublisherConfig config)
 {
+    if(config.frame_metadata.element_type == ElementType::Unknown &&
+       config.frame_metadata.rank == 0)
+    {
+        config.frame_metadata.element_type = ElementType::Byte;
+        config.frame_metadata.element_size = 1;
+        config.frame_metadata.payload_bytes = config.max_frame_bytes;
+    }
+    else
+    {
+        const Status geometry_status = config.frame_metadata.resolve(config.max_frame_bytes);
+        if(geometry_status != Status::Ok)
+        {
+            throw BulkException(BulkError{geometry_status,
+                                          std::string("invalid publisher frame geometry: ") +
+                                              to_string(geometry_status),
+                                          "publisher"});
+        }
+    }
     const Status status = config.validate();
     if(status != Status::Ok)
     {
