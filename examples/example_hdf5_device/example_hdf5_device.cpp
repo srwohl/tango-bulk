@@ -16,11 +16,13 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -418,6 +420,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         attach_publisher(*this, *publisher_);
 
         running_ = true;
+        metrics_running_ = true;
         set_state(Tango::RUNNING);
         set_status("replaying " + configuration_.file + ":" + replay_->dataset_path() + "; " +
                    std::to_string(replay_->frame_count()) + " frames, " +
@@ -425,6 +428,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
                    to_string(configuration_.fanout_mode));
         loader_thread_ = std::thread([this] { loader_loop(); });
         replay_thread_ = std::thread([this] { replay_loop(); });
+        metrics_thread_ = std::thread([this] { metrics_loop(); });
     }
 
     void delete_device() override
@@ -435,6 +439,10 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
             loader_thread_.join();
         if(replay_thread_.joinable())
             replay_thread_.join();
+        metrics_running_ = false;
+        metrics_changed_.notify_all();
+        if(metrics_thread_.joinable())
+            metrics_thread_.join();
         {
             std::lock_guard<std::mutex> lock(ready_mutex_);
             ready_.clear();
@@ -583,6 +591,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
                     epoch = load_epoch_;
                 }
 
+                const auto lease_started = std::chrono::steady_clock::now();
                 BulkSource::Lease lease;
                 while(running_ && !lease)
                 {
@@ -592,6 +601,14 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
                 }
                 if(!running_)
                     break;
+                const auto lease_finished = std::chrono::steady_clock::now();
+                const double lease_microseconds =
+                    std::chrono::duration<double, std::micro>(lease_finished - lease_started)
+                        .count();
+                {
+                    std::lock_guard<std::mutex> lock(metrics_mutex_);
+                    lease_latencies_us_.push_back(lease_microseconds);
+                }
 
                 replay_->read_frame(dataset_frame, lease.data());
 
@@ -684,6 +701,8 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
                 if(result == PublishResult::Accepted)
                 {
                     ++event;
+                    published_frames_.fetch_add(1, std::memory_order_relaxed);
+                    published_bytes_.fetch_add(replay_->frame_bytes(), std::memory_order_relaxed);
                 }
                 else if(result == PublishResult::NoSession ||
                         result == PublishResult::CreditStalled)
@@ -730,12 +749,70 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         }
     }
 
+    static double percentile(const std::vector<double> &sorted, double fraction)
+    {
+        const std::size_t rank = static_cast<std::size_t>(
+            std::ceil(fraction * static_cast<double>(sorted.size())));
+        return sorted[std::max<std::size_t>(rank, 1) - 1];
+    }
+
+    void metrics_loop()
+    {
+        using Clock = std::chrono::steady_clock;
+        auto interval_started = Clock::now();
+
+        while(metrics_running_)
+        {
+            {
+                std::unique_lock<std::mutex> lock(metrics_wait_mutex_);
+                metrics_changed_.wait_for(lock, std::chrono::seconds(1),
+                                          [this] { return !metrics_running_; });
+            }
+
+            const auto now = Clock::now();
+            const double seconds = std::chrono::duration<double>(now - interval_started).count();
+            interval_started = now;
+            const std::uint64_t frames =
+                published_frames_.exchange(0, std::memory_order_relaxed);
+            const std::uint64_t bytes =
+                published_bytes_.exchange(0, std::memory_order_relaxed);
+            std::vector<double> latencies;
+            {
+                std::lock_guard<std::mutex> lock(metrics_mutex_);
+                latencies.swap(lease_latencies_us_);
+            }
+
+            std::ostringstream line;
+            line << std::fixed << std::setprecision(3) << "hdf5 replay metrics: fps="
+                 << (seconds > 0.0 ? static_cast<double>(frames) / seconds : 0.0)
+                 << " GB/s="
+                 << (seconds > 0.0 ? static_cast<double>(bytes) / seconds / 1'000'000'000.0
+                                    : 0.0)
+                 << " frames=" << frames << " lease_acquire_us=";
+            if(latencies.empty())
+            {
+                line << "n/a";
+            }
+            else
+            {
+                std::sort(latencies.begin(), latencies.end());
+                line << "p50=" << percentile(latencies, 0.50)
+                     << ",p95=" << percentile(latencies, 0.95)
+                     << ",p99=" << percentile(latencies, 0.99)
+                     << ",max=" << latencies.back() << ",samples=" << latencies.size();
+            }
+            std::clog << line.str() << std::endl;
+        }
+    }
+
     Options configuration_;
     std::unique_ptr<ReplayReader> replay_;
     std::unique_ptr<BulkPublisher> publisher_;
     std::thread loader_thread_;
     std::thread replay_thread_;
+    std::thread metrics_thread_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> metrics_running_{false};
     std::atomic<double> frame_rate_{100.0};
     std::mutex ready_mutex_;
     std::condition_variable ready_changed_;
@@ -744,6 +821,12 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
     std::uint64_t next_frame_to_load_{0};
     std::uint64_t load_epoch_{0};
     std::atomic<std::uint64_t> ready_frames_{0};
+    std::atomic<std::uint64_t> published_frames_{0};
+    std::atomic<std::uint64_t> published_bytes_{0};
+    std::mutex metrics_mutex_;
+    std::vector<double> lease_latencies_us_;
+    std::mutex metrics_wait_mutex_;
+    std::condition_variable metrics_changed_;
     Tango::DevULong64 frame_width_read_{0};
     Tango::DevULong64 frame_height_read_{0};
     Tango::DevULong64 dataset_frames_read_{0};
