@@ -735,6 +735,40 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         return UCS_OK;
     }
 
+    // The session contract, enforced.
+    //
+    // 6.2 makes the grant the contract: the array description is settled at
+    // Open and changing a term of it means closing and reopening. A frame that
+    // decodes cleanly and describes a *different* array is therefore not a
+    // malformed message, it is the publisher contradicting what it granted --
+    // and it is the one thing that would make `granted_geometry()` a hint
+    // rather than a guarantee, forcing every consumer to re-check the shape of
+    // every frame.
+    //
+    // Only checked when the grant is typed. A rank-0 `Byte` grant is the opaque
+    // tier -- bytes, length and ordering, with the per-frame hint free to say
+    // more -- so there is no contract to contradict.
+    if(const Protocol::GeometryBlock &granted = session_.granted_geometry(); granted.rank > 0)
+    {
+        if(frame.element_type != granted.element_type ||
+           frame.element_size != granted.element_size || frame.rank != granted.rank ||
+           frame.shape != granted.shape || frame.strides != granted.strides)
+        {
+            dropped_geometry_mismatch_.fetch_add(1, std::memory_order_relaxed);
+            tracker_.release(frame.sequence);
+
+            // Retired rather than dropped. A publisher that has started sending
+            // a different array will keep doing it, so discarding frames one at
+            // a time would spend the whole session on a contract that no longer
+            // holds -- and would do it silently. Closing and reopening is what
+            // 6.2 says a changed term means, and BoundedRetry does exactly that.
+            fail(Status::GeometryMismatch,
+                 "a frame described a different array from the one this session "
+                 "granted; the publisher changed a contract term without reopening");
+            return UCS_OK;
+        }
+    }
+
     // Past here the sequence is in *this* window, so dropping the frame has to
     // release it.  Nothing else ever will -- a dropped frame is never committed
     // and so never gets a view -- and credit advances only across a contiguous
@@ -1033,6 +1067,8 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
     out.frames_dropped_bad_header = dropped_bad_header_.load(std::memory_order_relaxed);
     out.frames_dropped_oversize = dropped_oversize_.load(std::memory_order_relaxed);
     out.frames_dropped_duplicate_seq = dropped_duplicate_seq_.load(std::memory_order_relaxed);
+    out.frames_dropped_geometry_mismatch =
+        dropped_geometry_mismatch_.load(std::memory_order_relaxed);
     out.credits_returned = arena_->credits_returned();
     out.credit_messages_sent = credit_messages_sent_.load(std::memory_order_relaxed);
     out.views_outstanding = arena_->views_outstanding();

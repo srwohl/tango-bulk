@@ -61,6 +61,7 @@ void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexc
     total.frames_dropped_bad_header += part.frames_dropped_bad_header;
     total.frames_dropped_oversize += part.frames_dropped_oversize;
     total.frames_dropped_duplicate_seq += part.frames_dropped_duplicate_seq;
+    total.frames_dropped_geometry_mismatch += part.frames_dropped_geometry_mismatch;
     total.credits_returned += part.credits_returned;
     total.credit_messages_sent += part.credit_messages_sent;
     total.sessions_opened += part.sessions_opened;
