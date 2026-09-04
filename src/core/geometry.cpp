@@ -57,15 +57,57 @@ Status validate_shape_and_strides(std::uint32_t rank,
         return Status::GeometryMismatch;
     }
 
+    // The reachable span: the distance from the first byte of the array to one
+    // past its last byte.
+    //
+    // Checking each axis independently -- shape[i] * strides[i] <= limit -- is
+    // not the same bound and accepts geometries that read past the payload.
+    // rank 2, shape (2, 2), element_size 2, limit 8, strides (4, 4): both
+    // per-axis products are 8 and pass, but the highest-indexed element begins
+    // at (2-1)*4 + (2-1)*4 = 8 and ends at 10. A PEP 3118 or DLPack export
+    // built from that description reads two bytes it does not own.
+    //
+    // The true bound is where the highest-indexed element starts, plus one
+    // element. It is tighter than the per-axis rule for the case above, and
+    // looser for a padded layout -- trailing padding after the last element is
+    // never read, so requiring room for it rejected descriptions that were
+    // always safe.
+    bool empty = false;
     for(std::uint32_t i = 0; i < rank; ++i)
     {
-        std::uint64_t extent = 0;
-        if(wire::mul_overflow(strides[i], shape[i], extent))
+        if(shape[i] == 0)
+        {
+            // No elements, so nothing is reachable and shape[i] - 1 below would
+            // wrap. An empty array is describable and is not a bounds error.
+            empty = true;
+            break;
+        }
+    }
+
+    if(!empty)
+    {
+        std::uint64_t span = 0;
+
+        for(std::uint32_t i = 0; i < rank; ++i)
+        {
+            std::uint64_t reach = 0;
+            if(wire::mul_overflow(shape[i] - 1, strides[i], reach))
+            {
+                return Status::GeometryMismatch;
+            }
+
+            if(wire::add_overflow(span, reach, span))
+            {
+                return Status::GeometryMismatch;
+            }
+        }
+
+        if(wire::add_overflow(span, element_size, span))
         {
             return Status::GeometryMismatch;
         }
 
-        if(extent > limit)
+        if(span > limit)
         {
             return Status::GeometryMismatch;
         }
