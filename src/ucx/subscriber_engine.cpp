@@ -275,7 +275,7 @@ Status SubscriberEngine::adopt_open_reply(const std::byte *data, std::size_t siz
     const Status status = session_.adopt_open_reply(data, size, config_);
     if(status != Status::Ok)
     {
-        state_.store(SubscriberState::Failed, std::memory_order_release);
+        fail(status, "the publisher refused the Open, or its grant was unusable");
         return status;
     }
 
@@ -289,7 +289,8 @@ Status SubscriberEngine::adopt_open_reply(const std::byte *data, std::size_t siz
     }
     catch(const BulkException &)
     {
-        state_.store(SubscriberState::Failed, std::memory_order_release);
+        fail(Status::TransportFailure,
+             "could not create a UCX endpoint to the address the publisher returned");
         return Status::TransportFailure;
     }
 
@@ -323,7 +324,7 @@ Status SubscriberEngine::adopt_renew_reply(const std::byte *data, std::size_t si
     }
     if(outcome.session_lost)
     {
-        state_.store(SubscriberState::Failed, std::memory_order_release);
+        fail(outcome.status, "the publisher no longer recognises this session");
     }
 
     return outcome.status;
@@ -815,7 +816,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         {
             slot.occupied = false;
             transport_errors_.fetch_add(1, std::memory_order_relaxed);
-            state_.store(SubscriberState::Failed, std::memory_order_release);
+            fail(Status::TransportFailure, "a rendezvous receive could not be started");
             return UCS_OK;
         }
 
@@ -843,7 +844,9 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         slot.occupied = false;
         tracker_.release(frame.sequence);
         transport_errors_.fetch_add(1, std::memory_order_relaxed);
-        state_.store(SubscriberState::Failed, std::memory_order_release);
+        fail(Status::GeometryMismatch,
+             "the publisher sent an eager frame into a device ring, which it must "
+             "not: the two sides disagree about the memory kind");
         return UCS_OK;
     }
 
@@ -885,7 +888,9 @@ void SubscriberEngine::on_rndv_complete(void *request,
         // usable data path.  Tell the Tango control loop so BoundedRetry can
         // retire this session and reconnect instead of reporting Active while
         // no further frame or credit can move.
-        self->state_.store(SubscriberState::Failed, std::memory_order_release);
+        self->fail(Status::TransportFailure,
+                   "a rendezvous receive failed; the endpoint is no longer a usable "
+                   "data path");
     }
     else
     {
@@ -896,6 +901,32 @@ void SubscriberEngine::on_rndv_complete(void *request,
     {
         ucp_request_free(request);
     }
+}
+
+void SubscriberEngine::fail(Status status, const char *reason) noexcept
+{
+    // First reason wins. A failing transport tends to fail again on the way
+    // down, and the second reason is usually a consequence of the first.
+    const char *expected = nullptr;
+    if(failure_reason_.compare_exchange_strong(expected, reason, std::memory_order_acq_rel))
+    {
+        failure_status_.store(status, std::memory_order_release);
+    }
+
+    state_.store(SubscriberState::Failed, std::memory_order_release);
+}
+
+BulkError SubscriberEngine::last_error() const noexcept
+{
+    const char *reason = failure_reason_.load(std::memory_order_acquire);
+    if(reason == nullptr)
+    {
+        return BulkError{};
+    }
+
+    // Allocates, and may only do so because this runs on the control thread --
+    // never on the engine, which is why fail() takes a literal.
+    return BulkError{failure_status_.load(std::memory_order_acquire), reason, "transport"};
 }
 
 void SubscriberEngine::commit(std::size_t slot_index) noexcept

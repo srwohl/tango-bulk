@@ -168,6 +168,12 @@ class FakeTransport final : public detail::SubscriberTransport
         return 0;
     }
 
+    BulkError last_error() const noexcept override
+    {
+        return failed_ ? BulkError{Status::TransportFailure, "the fake was told to fail", "transport"}
+                       : BulkError{};
+    }
+
     Protocol::GeometryBlock granted_geometry() const noexcept override
     {
         return granted_;
@@ -192,6 +198,7 @@ class FakeTransport final : public detail::SubscriberTransport
 
     void fail() noexcept
     {
+        failed_ = true;
         state_.store(SubscriberState::Failed, std::memory_order_release);
     }
 
@@ -200,6 +207,7 @@ class FakeTransport final : public detail::SubscriberTransport
     std::atomic<SubscriberState> state_{SubscriberState::Opening};
     std::uint32_t generation_{0};
     Protocol::GeometryBlock granted_{};
+    std::atomic<bool> failed_{false};
 };
 
 /// A factory over a script, and the last transport it built -- so a test can
