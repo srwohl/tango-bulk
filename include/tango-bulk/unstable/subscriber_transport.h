@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#ifndef TANGO_BULK_SRC_CORE_SUBSCRIBER_TRANSPORT_H
-#define TANGO_BULK_SRC_CORE_SUBSCRIBER_TRANSPORT_H
+#ifndef TANGO_BULK_UNSTABLE_SUBSCRIBER_TRANSPORT_H
+#define TANGO_BULK_UNSTABLE_SUBSCRIBER_TRANSPORT_H
 
 #include <tango-bulk/counters.h>
 #include <tango-bulk/errors.h>
@@ -15,6 +15,11 @@
 #include <memory>
 #include <vector>
 
+/// UNSTABLE. Installed so that bindings and out-of-tree clients can reach the
+/// data-plane seam, and free to change without a version bump until the RFC
+/// settles. Nothing under `unstable/` is covered by the package's version
+/// compatibility promise; move a header out of here to promise otherwise.
+///
 /// The interface where the two halves of `BulkSubscriber` meet.
 ///
 /// 2.4 gives `BulkSubscriber` a `Tango::DeviceProxy &` constructor parameter and
@@ -90,4 +95,4 @@ std::unique_ptr<SubscriberTransport> make_subscriber_transport(SubscriberConfig 
 
 } // namespace TangoBulk::detail
 
-#endif // TANGO_BULK_SRC_CORE_SUBSCRIBER_TRANSPORT_H
+#endif // TANGO_BULK_UNSTABLE_SUBSCRIBER_TRANSPORT_H

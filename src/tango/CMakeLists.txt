@@ -23,7 +23,7 @@ target_include_directories(
 #
 # tango-bulk::ucx is PRIVATE, and the distinction is the whole point of the
 # layering rule.  BulkSubscriber has to *construct* a transport, which happens
-# through the factory in core/subscriber_transport.h whose definition lives in
+# through the factory in tango-bulk/unstable/subscriber_transport.h, whose definition lives in
 # the UCX library -- so this target links it.  PRIVATE means CMake records the
 # dependency as $<LINK_ONLY:>, so a device server linking tango-bulk::tango gets
 # the symbols and not one UCX include directory.  UCX::ucp is itself PRIVATE to
