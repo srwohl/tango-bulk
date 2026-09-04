@@ -873,6 +873,12 @@ SubscriberState SessionSupervisor::state() const noexcept
     return impl_->state.load(std::memory_order_acquire);
 }
 
+Protocol::GeometryBlock SessionSupervisor::granted_geometry() const noexcept
+{
+    const Impl::Ref live = impl_->borrow();
+    return live ? live->granted_geometry() : Protocol::GeometryBlock{};
+}
+
 std::uint32_t SessionSupervisor::generation() const noexcept
 {
     const Impl::Ref live = impl_->borrow();

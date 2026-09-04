@@ -121,6 +121,18 @@ class FakeTransport final : public detail::SubscriberTransport
         // This is the knob a real one does not have.
         state_.store(script_.probes() ? SubscriberState::Active : SubscriberState::Probing,
                      std::memory_order_release);
+
+        granted_ = Protocol::GeometryBlock{};
+        granted_.generation = 1;
+        granted_.element_type = ElementType::UInt16;
+        granted_.element_size = 2;
+        granted_.rank = 2;
+        granted_.max_frame_bytes = 64u << 10;
+        granted_.ring_depth = 4;
+        granted_.credit_window = 2;
+        granted_.shape = {8, 8, 0, 0};
+        granted_.strides = {16, 2, 0, 0};
+
         generation_ = 1;
         return Status::Ok;
     }
@@ -156,6 +168,11 @@ class FakeTransport final : public detail::SubscriberTransport
         return 0;
     }
 
+    Protocol::GeometryBlock granted_geometry() const noexcept override
+    {
+        return granted_;
+    }
+
     SubscriberState state() const noexcept override
     {
         return state_.load(std::memory_order_acquire);
@@ -182,6 +199,7 @@ class FakeTransport final : public detail::SubscriberTransport
     Script &script_;
     std::atomic<SubscriberState> state_{SubscriberState::Opening};
     std::uint32_t generation_{0};
+    Protocol::GeometryBlock granted_{};
 };
 
 /// A factory over a script, and the last transport it built -- so a test can

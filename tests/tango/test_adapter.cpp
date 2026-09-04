@@ -283,6 +283,54 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
     REQUIRE(eventually([&proxy] { return bulk_query(proxy).active_sessions == 0; }));
 }
 
+TEST_CASE("The granted geometry reaches the application", "[tango][m4]")
+{
+    // End to end: the geometry the publisher granted crosses the coordination
+    // plane, the session client, the transport seam and the adapter, and comes
+    // out the far side intact. Everything but ring depth, frame size and the
+    // lease terms used to be discarded at the first of those, so there was no
+    // way for an application to describe the array it was about to receive.
+    Tango::DeviceProxy proxy(DeviceServer::instance().device());
+
+    const BulkQueryResult reported = bulk_query(proxy);
+    REQUIRE(reported.status == Status::Ok);
+
+    Sink sink;
+    BulkSubscriber subscriber(proxy, subscriber_config());
+    sink.attach(subscriber);
+    subscriber.start();
+
+    REQUIRE(subscriber.state() == SubscriberState::Active);
+
+    const Protocol::GeometryBlock granted = subscriber.granted_geometry();
+
+    // A real epoch, which is what says a grant was adopted at all.
+    CHECK(granted.generation != 0);
+    CHECK(granted.generation == subscriber.generation());
+
+    // The array description is the publisher's and is not clamped, so it must
+    // match what an operator sees through the discovery path exactly.
+    CHECK(granted.element_type == reported.element_type);
+    CHECK(granted.element_size == reported.element_size);
+    CHECK(granted.rank == reported.rank);
+    CHECK(granted.shape == reported.shape);
+    CHECK(granted.strides == reported.strides);
+
+    // The sizing terms ARE clamped, downward and never up (3.5 step 5).
+    CHECK(granted.max_frame_bytes <= reported.max_frame_bytes);
+    CHECK(granted.ring_depth <= reported.ring_depth);
+    CHECK(granted.credit_window <= granted.ring_depth);
+
+    // And the whole block validates, which is what a binding would rely on
+    // before laying out a destination from it.
+    CHECK(granted.validate() == Status::Ok);
+
+    subscriber.stop();
+
+    // Once there is no session there is no geometry -- not the last one.
+    CHECK(subscriber.granted_geometry().generation == 0);
+}
+
 TEST_CASE("The renew timer keeps a session past its lease", "[tango][m4]")
 {
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
