@@ -22,6 +22,7 @@ add_library(
     pinned_budget.cpp
     protocol.cpp
     session_client.cpp
+    session_supervisor.cpp
     session_id.cpp)
 add_library(tango-bulk::core ALIAS tango-bulk-core)
 
@@ -31,7 +32,13 @@ target_include_directories(
            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-target_link_libraries(tango-bulk-core PUBLIC tango-bulk::settings)
+# Threads is PRIVATE and new here.  SessionSupervisor owns a control thread and
+# a dispatch thread, which is the first time this layer has owned any -- the
+# rest of core is pure computation, and cpu_topology only ever *bound* threads
+# somebody else made.  It stays testable in milliseconds with no external
+# resource, which is the property that actually matters, because both of its
+# dependencies are injected.
+target_link_libraries(tango-bulk-core PUBLIC tango-bulk::settings PRIVATE Threads::Threads)
 
 tango_bulk_apply_warnings(tango-bulk-core)
 
