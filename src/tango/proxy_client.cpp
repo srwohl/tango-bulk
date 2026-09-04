@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include <core/subscriber_transport.h>
+#include <tango-bulk/unstable/subscriber_transport.h>
 
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/tango.h>

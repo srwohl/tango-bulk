@@ -14,7 +14,7 @@
 #include <core/lease_pool.h>
 #include <core/receive_slot.h>
 #include <core/session_client.h>
-#include <core/subscriber_transport.h>
+#include <tango-bulk/unstable/subscriber_transport.h>
 
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/subscriber.h>
@@ -32,7 +32,7 @@
 /// seeing `tango/*`; docs/EXTRACTION.md deviation 2 resolves the pair by putting
 /// the transport engine in this layer and `BulkSubscriber` in the Tango layer,
 /// meeting at an interface.  This is that engine, and the interface it meets is
-/// `detail::SubscriberTransport` in `core/subscriber_transport.h`.
+/// `detail::SubscriberTransport` in `tango-bulk/unstable/subscriber_transport.h`.
 ///
 /// M4 built the other half: `BulkSubscriber` in `src/tango/proxy_client.cpp` is
 /// a shell over this class, reached through that interface and constructed

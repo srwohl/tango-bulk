@@ -1017,7 +1017,7 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
 
 std::unique_ptr<SubscriberTransport> make_subscriber_transport(SubscriberConfig config)
 {
-    // Declared in `core/subscriber_transport.h` and defined here, which is the
+    // Declared in `tango-bulk/unstable/subscriber_transport.h` and defined here, which is the
     // point of the seam: `BulkSubscriber` constructs a transport without naming
     // the concrete type, and therefore without compiling against `ucp/*`.
     return std::make_unique<SubscriberEngine>(std::move(config));
