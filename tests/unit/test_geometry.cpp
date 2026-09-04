@@ -219,6 +219,97 @@ TEST_CASE("shape and stride products are overflow-checked", "[core][geometry]")
     }
 }
 
+TEST_CASE("the reachable span is bounded, not the per-axis extent", "[core][geometry]")
+{
+    // The defect this rule replaced: checking shape[i] * strides[i] <= limit for
+    // each axis independently is a different bound, and a strictly weaker one.
+    SECTION("a geometry whose last element ends past the payload is refused")
+    {
+        FrameMetadata meta;
+        meta.element_type = ElementType::UInt16;
+        meta.element_size = 2;
+        meta.rank = 2;
+        meta.shape = {2, 2, 0, 0};
+        meta.strides = {4, 4, 0, 0};
+        meta.payload_bytes = 8;
+
+        // Every per-axis product is 2 * 4 == 8, and elements * element_size is
+        // also 8, so the old rule accepted this. The highest-indexed element
+        // begins at (2-1)*4 + (2-1)*4 == 8 and ends at 10: an export built from
+        // this description reads two bytes past the payload.
+        CHECK(meta.validate(8) == Status::GeometryMismatch);
+
+        // One more byte of payload and the same description is sound.
+        meta.payload_bytes = 10;
+        CHECK(meta.validate(10) == Status::Ok);
+    }
+
+    SECTION("a C-contiguous layout fits exactly, with nothing to spare")
+    {
+        FrameMetadata meta;
+        meta.element_type = ElementType::UInt16;
+        meta.element_size = 2;
+        meta.rank = 2;
+        meta.shape = {480, 640, 0, 0};
+        meta.strides = {640 * 2, 2, 0, 0};
+        meta.payload_bytes = 480 * 640 * 2;
+
+        CHECK(meta.validate(meta.payload_bytes) == Status::Ok);
+        CHECK(meta.validate(meta.payload_bytes - 1) == Status::FrameTooLarge);
+    }
+
+    SECTION("trailing row padding is not required to fit")
+    {
+        // A padded layout: 640 pixels in a 700-pixel pitch. The old rule needed
+        // room for shape[0] * pitch -- including the padding after the LAST row,
+        // which nothing ever reads. The span ends at the last element.
+        FrameMetadata meta;
+        meta.element_type = ElementType::UInt16;
+        meta.element_size = 2;
+        meta.rank = 2;
+        meta.shape = {480, 640, 0, 0};
+        meta.strides = {700 * 2, 2, 0, 0};
+
+        const std::uint64_t span = 479 * 700 * 2 + 639 * 2 + 2;
+        meta.payload_bytes = span;
+
+        CHECK(meta.validate(span) == Status::Ok);
+        CHECK(span < 480ull * 700 * 2); // strictly less than the old requirement
+    }
+
+    SECTION("an empty axis reaches nothing and does not wrap")
+    {
+        // shape[i] - 1 would underflow to ~0 on a zero extent, so the empty case
+        // is answered before the span is computed.
+        GeometryBlock g = valid();
+        g.shape = {0, 1024, 0, 0};
+        g.strides = {2048, 2, 0, 0};
+        CHECK(g.validate() == Status::Ok);
+    }
+
+    SECTION("the span itself is overflow-checked")
+    {
+        GeometryBlock g = valid();
+        g.rank = 2;
+        g.shape = {2, 2, 0, 0};
+
+        // (shape - 1) * stride does not overflow on either axis, but their sum
+        // does. A rule that checked each axis alone would never see it.
+        g.strides = {1ull << 63, 1ull << 63, 0, 0};
+        CHECK(g.validate() == Status::GeometryMismatch);
+    }
+
+    SECTION("a rank-0 opaque frame still needs room for one element")
+    {
+        FrameMetadata meta;
+        meta.element_type = ElementType::Byte;
+        meta.element_size = 1;
+        meta.rank = 0;
+        meta.payload_bytes = 4096;
+        CHECK(meta.validate(4096) == Status::Ok);
+    }
+}
+
 TEST_CASE("geometry equality compares every field", "[core][geometry]")
 {
     // The epoch interlock compares geometries, so a field left out of the
