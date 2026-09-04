@@ -356,6 +356,7 @@ class SubscriberEngine final : public SubscriberTransport
     std::atomic<std::uint64_t> dropped_oversize_{0};
     std::atomic<std::uint64_t> dropped_stale_epoch_{0};
     std::atomic<std::uint64_t> dropped_duplicate_seq_{0};
+    std::atomic<std::uint64_t> dropped_geometry_mismatch_{0};
     std::atomic<std::uint64_t> credit_messages_sent_{0};
     std::atomic<std::uint64_t> delivery_high_water_{0};
     std::atomic<std::uint64_t> transport_errors_{0};

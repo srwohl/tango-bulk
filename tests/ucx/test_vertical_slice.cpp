@@ -335,6 +335,84 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
     CHECK(slice.publisher.counters().dropped_queue_full >= 1);
 }
 
+TEST_CASE("A frame that contradicts the granted geometry retires the session",
+          "[m2][slice]")
+{
+    // 6.2 makes the grant the contract: the array description is settled at
+    // Open, and changing a term of it means closing and reopening. Nothing on
+    // the producer side enforces that -- publish() resolves a frame's metadata
+    // against max_frame_bytes and the lease capacity, and never against the
+    // publisher's own declared geometry -- so a publisher will happily send an
+    // array it did not grant. This is the check that makes granted_geometry() a
+    // guarantee rather than a hint.
+    PublisherConfig publisher_cfg = publisher_config();
+    publisher_cfg.frame_metadata.element_type = ElementType::UInt8;
+    publisher_cfg.frame_metadata.element_size = 1;
+    publisher_cfg.frame_metadata.rank = 1;
+    publisher_cfg.frame_metadata.shape[0] = k_frame_bytes;
+
+    BulkPublisher publisher(publisher_cfg);
+    detail::SubscriberEngine subscriber(subscriber_config());
+    open_session(publisher, subscriber);
+
+    REQUIRE(subscriber.granted_geometry().rank == 1);
+    REQUIRE(subscriber.granted_geometry().element_type == ElementType::UInt8);
+
+    // A conforming frame first, so the failure below cannot be blamed on the
+    // path never having worked.
+    {
+        auto lease = publisher.source().try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, 1);
+        REQUIRE(publisher.publish(std::move(lease), meta_for(k_frame_bytes, 1)) ==
+                PublishResult::Accepted);
+    }
+
+    FrameView received;
+    REQUIRE(eventually([&] {
+        subscriber.poll(10ms, [&](FrameView view) { received = std::move(view); });
+        return static_cast<bool>(received);
+    }));
+    received.reset();
+    CHECK(subscriber.state() == SubscriberState::Active);
+
+    // Now the same stream, described as a different array: UInt16 over half as
+    // many elements. It decodes perfectly and it is not what was agreed.
+    {
+        auto lease = publisher.source().try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, 2);
+
+        FrameMetadata lying;
+        lying.element_type = ElementType::UInt16;
+        lying.element_size = 2;
+        lying.rank = 1;
+        lying.shape[0] = k_frame_bytes / 2;
+        lying.event_counter = 2;
+
+        REQUIRE(publisher.publish(std::move(lease), lying) == PublishResult::Accepted);
+    }
+
+    REQUIRE(eventually([&] {
+        subscriber.poll(10ms, [](FrameView) {});
+        return subscriber.state() == SubscriberState::Failed;
+    }));
+
+    // Counted as its own thing, not as a malformed header: it decoded, and the
+    // problem is that it disagreed.
+    CHECK(subscriber.counters().frames_dropped_geometry_mismatch == 1);
+    CHECK(subscriber.counters().frames_dropped_bad_header == 0);
+
+    // And the reason reaches the layer above, which is what lets an application
+    // tell a broken contract from a broken link.
+    const BulkError why = subscriber.last_error();
+    CHECK(why.status == Status::GeometryMismatch);
+    CHECK(why.message.find("different array") != std::string::npos);
+
+    // The contradicting frame was never delivered.
+    CHECK(subscriber.counters().frames_delivered == 1);
+}
+
 TEST_CASE("Views outlive the subscriber that delivered them", "[m2][slice]")
 {
     // 9.3's last criterion is "ASan/UBSan clean ... including teardown with
