@@ -49,6 +49,33 @@ enum class SubscriberState : std::uint32_t
 
 const char *to_string(SubscriberState state) noexcept;
 
+/// A subscription's state, coarsened to what an application should act on.
+///
+/// Distinct from `Protocol::SessionState`, which is the publisher's
+/// wire-level view of one session (Armed, Active, Closed). This is the
+/// client's view of its own subscription, and it is the shape
+/// RFC_BULK_DATA_PLANE.md 6.5 argues a control surface should publish.
+///
+/// Deliberately coarser than `SubscriberState`: probing and reconnection are
+/// internal interlocks, and publishing them commits this library to supporting
+/// them for as long as anything reads them.
+enum class SubscriptionState : std::uint32_t
+{
+    NoSession = 0,
+    Opening = 1,
+    Active = 2,
+};
+
+const char *to_string(SubscriptionState state) noexcept;
+
+/// Project a `SubscriberState` onto the three states the RFC publishes.
+///
+/// Lossy, and worth being explicit about which way: `Closed` and `Failed` both
+/// become `NoSession`, so this projection cannot tell an orderly shutdown from a
+/// subscriber that gave up reconnecting. `SubscriberState` remains the
+/// diagnostic answer, and nothing in this library reports the projection yet.
+SubscriptionState to_subscription_state(SubscriberState state) noexcept;
+
 enum class DeliveryMode : std::uint32_t
 {
     DispatchThread = 0, ///< library-owned thread invokes the callback (default)
@@ -74,7 +101,17 @@ struct SubscriberConfig
     ReconnectPolicy reconnect_policy{ReconnectPolicy::BoundedRetry};
     std::uint32_t reconnect_max_attempts{10};
     std::uint32_t reconnect_backoff_ms{500}; ///< exponential, capped at lease TTL
-    std::uint32_t command_timeout_ms{5'000};
+    std::uint32_t command_timeout_ms{5'000}; ///< one Tango command round trip
+
+    /// How long to wait for the publisher's `Probe` after `Open` is granted.
+    ///
+    /// Split from `command_timeout_ms`, which it used to share: one bounds a
+    /// Tango call, the other bounds a UCX round trip that the publisher
+    /// initiates, and they are only alike in having had the same default. A
+    /// client whose UCX endpoint the publisher cannot reach spends this budget
+    /// once per reconnect attempt before it is told, so lowering it is what
+    /// makes an unreachable fabric quick to diagnose rather than slow.
+    std::uint32_t probe_timeout_ms{5'000};
     std::uint64_t pinned_memory_limit_bytes{1ull << 30};
     std::string ucx_tls;
     int engine_cpu_affinity{-1};
