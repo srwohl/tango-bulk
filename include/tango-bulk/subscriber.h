@@ -152,7 +152,11 @@ class BulkSubscriber
 
     /// Manual mode only.  Returns the number of frames dispatched, invoking the
     /// frame callback on the CALLING thread.  Throws if delivery_mode != Manual.
-    std::size_t poll(std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+    /// `max_frames` of 0 means "everything queued", which is the default and
+    /// what this always did. Pass 1 to take a single frame and leave the rest
+    /// queued, rather than withholding up to queue_depth credits in one call.
+    std::size_t poll(std::chrono::milliseconds timeout = std::chrono::milliseconds{0},
+                     std::size_t max_frames = 0);
 
     SubscriberState state() const noexcept;
     std::uint32_t generation() const noexcept;

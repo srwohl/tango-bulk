@@ -182,7 +182,9 @@ class FakeTransport final : public detail::SubscriberTransport
         return 20;
     }
 
-    std::size_t poll(std::chrono::milliseconds timeout, const FrameCallback &) override
+    std::size_t poll(std::chrono::milliseconds timeout,
+                     const FrameCallback &,
+                     std::size_t = 0) override
     {
         std::this_thread::sleep_for(std::min(timeout, std::chrono::milliseconds{2}));
         return 0;

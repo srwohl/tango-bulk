@@ -1012,7 +1012,9 @@ void SubscriberEngine::commit(std::size_t slot_index) noexcept
 
 // -- application thread -----------------------------------------------------
 
-std::size_t SubscriberEngine::poll(std::chrono::milliseconds timeout, const FrameCallback &cb)
+std::size_t SubscriberEngine::poll(std::chrono::milliseconds timeout,
+                                   const FrameCallback &cb,
+                                   std::size_t max_frames)
 {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::size_t dispatched = 0;
@@ -1020,7 +1022,11 @@ std::size_t SubscriberEngine::poll(std::chrono::milliseconds timeout, const Fram
     for(;;)
     {
         FrameView view;
-        while(delivery_.try_pop(view))
+
+        // The budget is tested before try_pop, not after: popping a frame this
+        // call has no room for would deliver it nowhere and destroy it, which
+        // returns its credit and loses the frame.
+        while((max_frames == 0 || dispatched < max_frames) && delivery_.try_pop(view))
         {
             frames_delivered_.fetch_add(1, std::memory_order_relaxed);
             ++dispatched;

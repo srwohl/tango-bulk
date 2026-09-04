@@ -308,7 +308,7 @@ void BulkSubscriber::stop() noexcept
     impl.supervisor.reset();
 }
 
-std::size_t BulkSubscriber::poll(std::chrono::milliseconds timeout)
+std::size_t BulkSubscriber::poll(std::chrono::milliseconds timeout, std::size_t max_frames)
 {
     Impl &impl = *impl_;
 
@@ -325,7 +325,7 @@ std::size_t BulkSubscriber::poll(std::chrono::milliseconds timeout)
         return 0;
     }
 
-    return impl.supervisor->poll(timeout);
+    return impl.supervisor->poll(timeout, max_frames);
 }
 
 SubscriberState BulkSubscriber::state() const noexcept

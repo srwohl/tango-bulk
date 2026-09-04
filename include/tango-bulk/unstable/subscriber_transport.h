@@ -73,7 +73,17 @@ class SubscriberTransport
     /// `timeout`; returns how many it dispatched.  Never the engine thread --
     /// that is 5.2's guarantee, and it is structural: the engine holds no
     /// `std::function` at all.
-    virtual std::size_t poll(std::chrono::milliseconds timeout, const FrameCallback &cb) = 0;
+    /// `max_frames` of 0 means "everything queued", which is what this did
+    /// before the parameter existed and remains the default.
+    ///
+    /// It is the parameter that lets one frame be taken at a time. Draining
+    /// unconditionally means a single call can withhold up to `queue_depth`
+    /// credits at once, and it is why a consumer that wants exactly one frame
+    /// -- a `read()`, a `try_read()`, an iterator step -- could not be built on
+    /// top of this without a second delivery path of its own.
+    virtual std::size_t poll(std::chrono::milliseconds timeout,
+                             const FrameCallback &cb,
+                             std::size_t max_frames = 0) = 0;
 
     /// The geometry this session was granted: element type, rank, shape,
     /// strides, maximum frame size, ring depth and credit window.
