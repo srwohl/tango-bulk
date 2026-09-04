@@ -56,9 +56,8 @@ using CoordinationChannel =
 /// Required rather than defaulted, which is worth explaining because the
 /// omission looks like one: a default argument here would name
 /// `make_subscriber_transport`, whose definition lives in `tango-bulk-ucx`, and
-/// that would put an unresolved UCX symbol into `libtango-bulk-core.so`. Use
-/// `open_session()` in <tango-bulk/unstable/session.h> to get the shipping
-/// transport without naming it.
+/// that would put an unresolved UCX symbol into `libtango-bulk-core.so`. Call
+/// `open_session()` below to get the shipping transport without naming it.
 ///
 /// Called once per session, so once more on every reconnect. A retired
 /// transport is never reused: a failed UCX endpoint is not a usable data path
@@ -134,6 +133,21 @@ class SessionSupervisor
 
     std::unique_ptr<Impl> impl_;
 };
+
+/// `SessionSupervisor::open()` with the shipping UCX transport.
+///
+/// Declared here, defined in `src/ucx/session.cpp` -- the same arrangement as
+/// `make_subscriber_transport()`, and for the same reason: naming the factory
+/// is a UCX-layer privilege, so this header can offer it without core
+/// referencing it.
+///
+/// This is the front door. The four-argument form exists so that a test can
+/// substitute a transport it can make misbehave on demand; every other caller
+/// wants this one, which asks only for the two things it genuinely has to
+/// supply.
+std::unique_ptr<SessionSupervisor> open_session(SubscriberConfig config,
+                                                CoordinationChannel channel,
+                                                SessionCallbacks callbacks);
 
 } // namespace TangoBulk::detail
 
