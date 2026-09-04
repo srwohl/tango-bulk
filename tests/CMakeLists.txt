@@ -21,6 +21,7 @@ add_executable(
     unit/test_errors.cpp
     unit/test_frame_view.cpp
     unit/test_geometry.cpp
+    unit/test_session_supervisor.cpp
     unit/test_identifiers.cpp
     unit/test_protocol_golden.cpp
     unit/test_protocol_layout.cpp

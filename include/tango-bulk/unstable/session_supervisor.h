@@ -34,11 +34,15 @@ namespace TangoBulk::detail
 
 /// Carries one coordination message to the publisher and brings back the reply.
 ///
-/// **Called only from the supervisor's control thread, never concurrently.**
-/// That is a promise this class makes to its callers, not an accident of the
-/// current implementation: a Python adapter acquires the GIL inside this call,
-/// and bounding when that can happen is what makes the renewal-latency
-/// question analysable at all.
+/// **Never called concurrently.** That is a promise this class makes to its
+/// callers, not an accident of the current implementation: a Python adapter
+/// acquires the GIL inside this call, and bounding when that can happen is what
+/// makes the renewal-latency question analysable at all.
+///
+/// It is not, however, always the same thread. The first open runs on whichever
+/// thread called `open()`, because that is what lets a failure be reported by
+/// throwing; every call after it runs on the control thread. So an adapter may
+/// not stash thread-local state here, but it never needs a lock either.
 ///
 /// Returns the encoded reply. MUST throw `BulkException` if it cannot deliver
 /// the message or obtain a reply -- an unreachable device, a wrong reply type,
