@@ -153,4 +153,43 @@ const char *to_string(SubscriberState state) noexcept
     return "Unknown";
 }
 
+const char *to_string(SubscriptionState state) noexcept
+{
+    switch(state)
+    {
+    case SubscriptionState::NoSession:
+        return "NoSession";
+    case SubscriptionState::Opening:
+        return "Opening";
+    case SubscriptionState::Active:
+        return "Active";
+    }
+
+    return "Unknown";
+}
+
+SubscriptionState to_subscription_state(SubscriberState state) noexcept
+{
+    switch(state)
+    {
+    case SubscriberState::Active:
+        return SubscriptionState::Active;
+
+    // Every state in which a session exists or is being obtained. `Probing` is
+    // included because the grant is already held: the publisher has allocated
+    // for this client, which is what an operator watching "opening" needs to
+    // know.
+    case SubscriberState::Opening:
+    case SubscriberState::Probing:
+    case SubscriberState::Reconnecting:
+        return SubscriptionState::Opening;
+
+    case SubscriberState::Closed:
+    case SubscriberState::Failed:
+        return SubscriptionState::NoSession;
+    }
+
+    return SubscriptionState::NoSession;
+}
+
 } // namespace TangoBulk
