@@ -7,6 +7,7 @@
 
 #include <tango-bulk/counters.h>
 #include <tango-bulk/errors.h>
+#include <tango-bulk/protocol.h>
 #include <tango-bulk/subscriber.h>
 
 #include <chrono>
@@ -73,6 +74,17 @@ class SubscriberTransport
     /// that is 5.2's guarantee, and it is structural: the engine holds no
     /// `std::function` at all.
     virtual std::size_t poll(std::chrono::milliseconds timeout, const FrameCallback &cb) = 0;
+
+    /// The geometry this session was granted: element type, rank, shape,
+    /// strides, maximum frame size, ring depth and credit window.
+    ///
+    /// All-zero before a grant is adopted; `generation` is the field to test,
+    /// since 0 is never a legal epoch on the wire.
+    ///
+    /// By value rather than by reference: a reconnect replaces the whole
+    /// transport, so a reference handed to an application thread would outlive
+    /// what it points at. The block is 96 bytes of POD.
+    virtual Protocol::GeometryBlock granted_geometry() const noexcept = 0;
 
     virtual SubscriberState state() const noexcept = 0;
     virtual std::uint32_t generation() const noexcept = 0;

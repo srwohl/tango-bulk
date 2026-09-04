@@ -343,6 +343,12 @@ std::uint32_t BulkSubscriber::generation() const noexcept
     return impl_->supervisor ? impl_->supervisor->generation() : 0;
 }
 
+Protocol::GeometryBlock BulkSubscriber::granted_geometry() const noexcept
+{
+    return impl_->supervisor ? impl_->supervisor->granted_geometry()
+                             : Protocol::GeometryBlock{};
+}
+
 SubscriberCounters BulkSubscriber::counters() const noexcept
 {
     return impl_->supervisor ? impl_->supervisor->counters() : impl_->retired;

@@ -9,6 +9,7 @@
 #include <tango-bulk/errors.h>
 #include <tango-bulk/frame.h>
 #include <tango-bulk/limits.h>
+#include <tango-bulk/protocol.h>
 #include <tango-bulk/publisher.h> // DropPolicy
 
 #include <chrono>
@@ -156,6 +157,15 @@ class BulkSubscriber
     SubscriberState state() const noexcept;
     std::uint32_t generation() const noexcept;
     SubscriberCounters counters() const noexcept;
+
+    /// The geometry granted to the live session: element type, rank, shape,
+    /// strides, frame size, ring depth, credit window.
+    ///
+    /// Settled at `Open` and fixed for the session's life, so an application can
+    /// lay out its destination before the first frame arrives rather than
+    /// reading the shape off one. All-zero when nothing is open; `generation` is
+    /// the field to test, because 0 is never a legal epoch.
+    Protocol::GeometryBlock granted_geometry() const noexcept;
 
   private:
     /// The one thing outside this class that reaches into it: the command-name

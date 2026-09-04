@@ -128,6 +128,16 @@ class SessionSupervisor
     std::size_t poll(std::chrono::milliseconds timeout);
 
     SubscriberState state() const noexcept;
+
+    /// The geometry of the session that is live now.
+    ///
+    /// This is the source for a binding's stream schema: element type, rank,
+    /// shape and strides, settled at `Open` and fixed for the life of the
+    /// session, so a consumer never has to wait for a first frame to learn how
+    /// to lay out its destination. All-zero when no session is open --
+    /// `generation` is the field to test.
+    Protocol::GeometryBlock granted_geometry() const noexcept;
+
     std::uint32_t generation() const noexcept;
     SubscriberCounters counters() const noexcept;
 

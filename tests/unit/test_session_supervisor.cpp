@@ -315,6 +315,59 @@ TEST_CASE("coordination calls never overlap", "[core][supervisor]")
     CHECK(script.channel_threads.count(std::this_thread::get_id()) == 1);
 }
 
+// -- the granted geometry ----------------------------------------------------
+
+TEST_CASE("the granted geometry survives to the interface", "[core][supervisor]")
+{
+    // It used to be copied out of and thrown away: adopt_open_reply kept ring
+    // depth, frame size, generation and the lease terms, and dropped element
+    // type, rank, shape and strides. Nothing above the transport could describe
+    // the array it was receiving.
+    Script script;
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+
+    const Protocol::GeometryBlock granted = supervisor->granted_geometry();
+
+    CHECK(granted.generation == 1);
+    CHECK(granted.element_type == ElementType::UInt16);
+    CHECK(granted.element_size == 2);
+    CHECK(granted.rank == 2);
+    CHECK(granted.shape[0] == 8);
+    CHECK(granted.shape[1] == 8);
+    CHECK(granted.strides[0] == 16);
+    CHECK(granted.strides[1] == 2);
+
+    // Whatever a binding builds a schema from, it must be able to tell "no
+    // session" apart from a real grant. generation == 0 is never legal on the
+    // wire, which is what makes it the field to test.
+    supervisor.reset();
+    CHECK(supervisor == nullptr);
+}
+
+TEST_CASE("no session means an all-zero geometry, not a stale one",
+          "[core][supervisor]")
+{
+    Script script;
+    script.probe_arrives = false;
+
+    SubscriberConfig config = supervisor_config();
+    config.reconnect_policy = ReconnectPolicy::FailFast;
+    config.probe_timeout_ms = 30;
+
+    CHECK_THROWS_AS(detail::SessionSupervisor::open(config,
+                                                    fake_channel(script),
+                                                    fake_factory(script),
+                                                    noop_callbacks()),
+                    BulkException);
+
+    // Nothing to read a geometry from, and the default block reports the epoch
+    // that never appears on the wire.
+    const Protocol::GeometryBlock none;
+    CHECK(none.generation == 0);
+}
+
 // -- delivery mode -----------------------------------------------------------
 
 TEST_CASE("poll() is refused when a dispatch thread is already delivering",

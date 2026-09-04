@@ -177,6 +177,11 @@ class SubscriberEngine final : public SubscriberTransport
     /// thread.  Either way it is never the engine thread (5.2).
     std::size_t poll(std::chrono::milliseconds timeout, const FrameCallback &cb) override;
 
+    Protocol::GeometryBlock granted_geometry() const noexcept override
+    {
+        return session_.granted_geometry();
+    }
+
     SubscriberState state() const noexcept override
     {
         return state_.load(std::memory_order_acquire);
