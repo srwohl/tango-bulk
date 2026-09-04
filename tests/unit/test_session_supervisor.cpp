@@ -288,6 +288,90 @@ TEST_CASE("teardown during a reconnect backoff neither hangs nor reopens",
     CHECK(script.opens.load() == opens_before);
 }
 
+// -- geometry drift across a reconnect ---------------------------------------
+
+TEST_CASE("a reopened session that describes a different array is refused",
+          "[core][supervisor]")
+{
+    // The silent version of this is how a client ends up interpreting
+    // 1024x1024 frames as 2048x2048: the stream drops, it reconnects, the
+    // detector has been reconfigured meanwhile, and the new grant is adopted
+    // under buffers laid out for the old one.
+    Script script;
+    {
+        std::lock_guard<std::mutex> lock(script.mutex);
+        script.renew_results = {Status::SessionExpired}; // force one reconnect
+        script.reshape_after_first = true;
+    }
+
+    SubscriberConfig config = supervisor_config();
+    config.delivery_mode = DeliveryMode::DispatchThread;
+    config.reconnect_max_attempts = 10;
+
+    std::mutex seen_mutex;
+    BulkError final_error;
+    detail::SessionCallbacks callbacks = noop_callbacks();
+    callbacks.on_state = [&](SubscriberState state, const BulkError &error) {
+        if(state == SubscriberState::Failed)
+        {
+            std::lock_guard<std::mutex> lock(seen_mutex);
+            final_error = error;
+        }
+    };
+
+    auto supervisor = detail::SessionSupervisor::open(
+        config, fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    REQUIRE(supervisor->granted_geometry().shape[0] == 8);
+
+    REQUIRE(eventually([&supervisor] { return supervisor->state() == SubscriberState::Failed; }));
+
+    CHECK(supervisor->counters().geometry_changes == 1);
+
+    // Terminal, and quickly. Retrying cannot help -- neither side changes
+    // between attempts -- so it must not spend ten attempts finding that out.
+    CHECK(supervisor->counters().reconnects <= 1);
+
+    // state() flips inside transition(); the callback carrying the reason is
+    // queued and delivered by the dispatch thread afterwards. Waiting for the
+    // state and then reading the error is a race, and reading it first is how
+    // this test failed the first time it ran.
+    REQUIRE(eventually([&] {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        return final_error.status != Status::Ok;
+    }));
+
+    {
+        std::lock_guard<std::mutex> lock(seen_mutex);
+        CHECK(final_error.status == Status::GeometryMismatch);
+        CHECK(final_error.message.find("different array") != std::string::npos);
+    }
+
+    // The new grant was never adopted, so nothing describes the new shape.
+    CHECK(supervisor->granted_geometry().generation == 0);
+}
+
+TEST_CASE("a reopened session with the same array is adopted normally",
+          "[core][supervisor]")
+{
+    // The counterpart, so the check above cannot pass by refusing everything.
+    Script script;
+    {
+        std::lock_guard<std::mutex> lock(script.mutex);
+        script.renew_results = {Status::SessionExpired};
+        script.reshape_after_first = false;
+    }
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+
+    REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
+    REQUIRE(eventually([&supervisor] { return supervisor->state() == SubscriberState::Active; }));
+
+    CHECK(supervisor->counters().geometry_changes == 0);
+    CHECK(supervisor->granted_geometry().shape[0] == 8);
+}
+
 // -- threading ---------------------------------------------------------------
 
 TEST_CASE("coordination calls never overlap", "[core][supervisor]")

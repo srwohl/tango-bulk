@@ -340,6 +340,47 @@ TEST_CASE("geometry equality compares every field", "[core][geometry]")
 // FrameMetadata
 // ---------------------------------------------------------------------------
 
+TEST_CASE("describes_same_array ignores the epoch and the sizing terms",
+          "[core][geometry]")
+{
+    GeometryBlock a = valid();
+    GeometryBlock b = valid();
+    CHECK(describes_same_array(a, b));
+
+    SECTION("a new epoch is not a new array")
+    {
+        b.generation = a.generation + 1;
+        CHECK(describes_same_array(a, b));
+        CHECK(a != b); // operator== is the stricter question, and still says so
+    }
+
+    SECTION("a smaller ring is not a new array")
+    {
+        b.ring_depth = a.ring_depth / 2;
+        b.credit_window = 1;
+        b.max_frame_bytes = a.max_frame_bytes / 2;
+        CHECK(describes_same_array(a, b));
+    }
+
+    SECTION("a different shape is")
+    {
+        b.shape = {512, 2048, 0, 0};
+        CHECK_FALSE(describes_same_array(a, b));
+    }
+
+    SECTION("so is a different element type")
+    {
+        b.element_type = ElementType::Int16;
+        CHECK_FALSE(describes_same_array(a, b));
+    }
+
+    SECTION("so are different strides at the same shape")
+    {
+        b.strides = {4096, 2, 0, 0};
+        CHECK_FALSE(describes_same_array(a, b));
+    }
+}
+
 TEST_CASE("resolve fills in what the producer left out", "[core][geometry]")
 {
     FrameMetadata meta;
