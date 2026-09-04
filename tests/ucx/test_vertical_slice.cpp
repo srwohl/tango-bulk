@@ -335,6 +335,72 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
     CHECK(slice.publisher.counters().dropped_queue_full >= 1);
 }
 
+TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
+          "[m2][slice]")
+{
+    // Draining unconditionally means one call can hold queue_depth credits at
+    // once. A consumer that wants exactly one frame -- a read(), an iterator
+    // step -- needs to be able to say so, or it needs a delivery path of its
+    // own, which is how a binding ends up with two.
+    BulkPublisher publisher(publisher_config());
+    detail::SubscriberEngine subscriber(subscriber_config());
+    open_session(publisher, subscriber);
+
+    constexpr int k_published = 4;
+    for(int i = 0; i < k_published; ++i)
+    {
+        auto lease = publisher.source().try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, static_cast<unsigned>(i));
+        REQUIRE(publisher.publish(std::move(lease),
+                                  meta_for(k_frame_bytes, static_cast<std::uint64_t>(i))) ==
+                PublishResult::Accepted);
+    }
+
+    REQUIRE(eventually(
+        [&] { return subscriber.counters().frames_received >= k_published; }));
+
+    // One at a time, and the frame is released before the next call so the
+    // credit accounting is about the budget rather than about retention.
+    for(int i = 0; i < k_published; ++i)
+    {
+        std::size_t seen = 0;
+        const std::size_t dispatched =
+            subscriber.poll(50ms, [&](FrameView view) { ++seen; view.reset(); }, 1);
+
+        CHECK(dispatched == 1);
+        CHECK(seen == 1);
+        CHECK(subscriber.counters().frames_delivered ==
+              static_cast<std::uint64_t>(i) + 1);
+    }
+
+    // Nothing left, and asking for one more does not invent a frame.
+    CHECK(subscriber.poll(10ms, [](FrameView) {}, 1) == 0);
+
+    // The default is still drain-everything, which is what every existing
+    // caller relies on.
+    for(int i = 0; i < k_published; ++i)
+    {
+        auto lease = publisher.source().try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, static_cast<unsigned>(i));
+        REQUIRE(publisher.publish(std::move(lease),
+                                  meta_for(k_frame_bytes,
+                                           static_cast<std::uint64_t>(k_published + i))) ==
+                PublishResult::Accepted);
+    }
+
+    REQUIRE(eventually([&] {
+        return subscriber.counters().frames_received >= 2 * k_published;
+    }));
+
+    std::size_t drained = 0;
+    REQUIRE(eventually([&] {
+        drained += subscriber.poll(50ms, [](FrameView view) { view.reset(); });
+        return drained == k_published;
+    }));
+}
+
 TEST_CASE("A frame that contradicts the granted geometry retires the session",
           "[m2][slice]")
 {

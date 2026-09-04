@@ -726,7 +726,8 @@ struct SessionSupervisor::Impl
         return delivered;
     }
 
-    std::size_t deliver_frames(std::chrono::milliseconds timeout) noexcept
+    std::size_t deliver_frames(std::chrono::milliseconds timeout,
+                               std::size_t max_frames = 0) noexcept
     {
         const Ref live = borrow();
         if(!live)
@@ -738,7 +739,7 @@ struct SessionSupervisor::Impl
         std::size_t delivered = 0;
         try
         {
-            delivered = live->poll(timeout, frame_callback);
+            delivered = live->poll(timeout, frame_callback, max_frames);
         }
         catch(...)
         {
@@ -921,7 +922,7 @@ std::unique_ptr<SessionSupervisor> SessionSupervisor::open(SubscriberConfig conf
     throw BulkException(error);
 }
 
-std::size_t SessionSupervisor::poll(std::chrono::milliseconds timeout)
+std::size_t SessionSupervisor::poll(std::chrono::milliseconds timeout, std::size_t max_frames)
 {
     Impl &impl = *impl_;
 
@@ -934,7 +935,7 @@ std::size_t SessionSupervisor::poll(std::chrono::milliseconds timeout)
     }
 
     impl.drain_transitions();
-    const std::size_t frames = impl.deliver_frames(timeout);
+    const std::size_t frames = impl.deliver_frames(timeout, max_frames);
     impl.drain_transitions();
     return frames;
 }

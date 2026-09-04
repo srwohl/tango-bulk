@@ -175,7 +175,9 @@ class SubscriberEngine final : public SubscriberTransport
     /// dispatched.  Which thread that is belongs to the layer above: a test
     /// calls this directly, and `BulkSubscriber` calls it from its dispatch
     /// thread.  Either way it is never the engine thread (5.2).
-    std::size_t poll(std::chrono::milliseconds timeout, const FrameCallback &cb) override;
+    std::size_t poll(std::chrono::milliseconds timeout,
+                     const FrameCallback &cb,
+                     std::size_t max_frames = 0) override;
 
     Protocol::GeometryBlock granted_geometry() const noexcept override
     {

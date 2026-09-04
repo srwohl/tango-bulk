@@ -125,7 +125,7 @@ class SessionSupervisor
     /// `DeliveryMode::Manual` only. Invokes the frame callback on the CALLING
     /// thread and returns how many frames it dispatched. Throws if the
     /// configuration asked for a dispatch thread, which is already delivering.
-    std::size_t poll(std::chrono::milliseconds timeout);
+    std::size_t poll(std::chrono::milliseconds timeout, std::size_t max_frames = 0);
 
     SubscriberState state() const noexcept;
 
