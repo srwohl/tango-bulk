@@ -286,9 +286,13 @@ struct SessionSupervisor::Impl
 
             if(observed == SubscriberState::Failed || !running.load(std::memory_order_acquire))
             {
-                error = BulkError{Status::TransportFailure,
-                                  "the transport failed before the probe was answered",
-                                  "subscriber"};
+                error = live ? live->last_error() : BulkError{};
+                if(error.status == Status::Ok)
+                {
+                    error = BulkError{Status::TransportFailure,
+                                      "the transport failed before the probe was answered",
+                                      "subscriber"};
+                }
                 break;
             }
 
@@ -360,6 +364,7 @@ struct SessionSupervisor::Impl
             }
 
             SubscriberState observed = SubscriberState::Failed;
+            BulkError reported;
             {
                 const Ref live = borrow();
                 if(!live)
@@ -368,12 +373,26 @@ struct SessionSupervisor::Impl
                     return false;
                 }
                 observed = live->state();
+
+                // Read while the borrow is still held: the reason belongs to
+                // the transport, and the transport can be swapped the moment it
+                // is given back.
+                if(observed == SubscriberState::Failed)
+                {
+                    reported = live->last_error();
+                }
             }
 
             if(observed == SubscriberState::Failed)
             {
-                error = BulkError{
-                    Status::TransportFailure, "the transport reported a failure", "subscriber"};
+                // Say what happened rather than that something did. Which
+                // condition retired the session decides whether reconnecting
+                // can help, and that is the application's to know.
+                error = reported.status != Status::Ok
+                            ? reported
+                            : BulkError{Status::TransportFailure,
+                                        "the transport reported a failure",
+                                        "subscriber"};
                 return false;
             }
 

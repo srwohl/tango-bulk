@@ -86,6 +86,18 @@ class SubscriberTransport
     /// what it points at. The block is 96 bytes of POD.
     virtual Protocol::GeometryBlock granted_geometry() const noexcept = 0;
 
+    /// Why the transport reached `Failed`, valid once it has.
+    ///
+    /// Six different conditions retire a session -- a refused grant, an
+    /// unreachable endpoint, a lost lease, a rendezvous that could not start or
+    /// could not finish, a peer that contradicted the contract it granted -- and
+    /// without this they all reach the application as one sentence. Which of
+    /// them happened decides whether reconnecting can possibly help, so it is
+    /// the application's to know.
+    ///
+    /// `Status::Ok` with an empty message while the transport is healthy.
+    virtual BulkError last_error() const noexcept = 0;
+
     virtual SubscriberState state() const noexcept = 0;
     virtual std::uint32_t generation() const noexcept = 0;
     virtual SubscriberCounters counters() const noexcept = 0;

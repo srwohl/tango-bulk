@@ -182,6 +182,8 @@ class SubscriberEngine final : public SubscriberTransport
         return session_.granted_geometry();
     }
 
+    BulkError last_error() const noexcept override;
+
     SubscriberState state() const noexcept override
     {
         return state_.load(std::memory_order_acquire);
@@ -278,6 +280,15 @@ class SubscriberEngine final : public SubscriberTransport
 
     void commit(std::size_t slot_index) noexcept;
 
+    /// Retire the session, and say why.
+    ///
+    /// `reason` MUST be a string literal or otherwise outlive the engine: this
+    /// is called from inside `ucp_worker_progress`, where allocating would be a
+    /// far worse bug than the one being reported. Only the first reason is
+    /// kept -- what failed first is what an operator needs; everything after it
+    /// is likely to be a consequence.
+    void fail(Status status, const char *reason) noexcept;
+
     SubscriberConfig config_;
     std::shared_ptr<UcxContext> context_;
     std::unique_ptr<UcxWorker> worker_;
@@ -316,6 +327,12 @@ class SubscriberEngine final : public SubscriberTransport
     /// engine thread as its last act, read by the destructor after the join.
     std::atomic<bool> quiesced_{false};
     std::atomic<SubscriberState> state_{SubscriberState::Closed};
+
+    /// Set by `fail()`, read by `last_error()` on the control thread. A raw
+    /// pointer to a literal rather than a string, so the AM callback can set it
+    /// without allocating.
+    std::atomic<const char *> failure_reason_{nullptr};
+    std::atomic<Status> failure_status_{Status::Ok};
 
     ucp_ep_h endpoint_{nullptr};
 
