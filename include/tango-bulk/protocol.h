@@ -208,6 +208,16 @@ struct GeometryBlock
 
     friend bool operator==(const GeometryBlock &a, const GeometryBlock &b) noexcept;
     friend bool operator!=(const GeometryBlock &a, const GeometryBlock &b) noexcept;
+
+    /// Whether two grants describe the same array: element type, element size,
+    /// rank, shape and strides.
+    ///
+    /// Deliberately narrower than operator==, which also compares the epoch and
+    /// the sizing terms. A reopened session may legitimately be granted a
+    /// smaller ring or a new generation without any consumer's layout becoming
+    /// wrong; a different shape or element type is exactly the case where it
+    /// does.
+    friend bool describes_same_array(const GeometryBlock &a, const GeometryBlock &b) noexcept;
 };
 
 inline constexpr std::size_t k_geometry_block_bytes = 96;

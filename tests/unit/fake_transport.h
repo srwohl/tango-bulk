@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <array>
 #include <deque>
 #include <mutex>
 #include <set>
@@ -46,6 +47,10 @@ struct Script
     /// Whether a granted session ever reaches `Active`. False models a
     /// publisher that answered `Open` but cannot reach this client's endpoint.
     bool probe_arrives{true};
+
+    /// Set to make every grant after the first describe a different array, as a
+    /// detector reconfigured between sessions would.
+    bool reshape_after_first{false};
 
     /// Set to make the coordination channel throw, as an unreachable device
     /// does. Counted down; zero means "answer normally".
@@ -94,6 +99,17 @@ struct Script
         std::lock_guard<std::mutex> lock(mutex);
         return probe_arrives;
     }
+
+    /// True from the second grant onward, once reshape_after_first is set.
+    bool reshaped()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const bool answer = reshape_after_first && grants_made > 0;
+        ++grants_made;
+        return answer;
+    }
+
+    int grants_made{0};
 };
 
 class FakeTransport final : public detail::SubscriberTransport
@@ -122,6 +138,8 @@ class FakeTransport final : public detail::SubscriberTransport
         state_.store(script_.probes() ? SubscriberState::Active : SubscriberState::Probing,
                      std::memory_order_release);
 
+        const bool reshaped = script_.reshaped();
+
         granted_ = Protocol::GeometryBlock{};
         granted_.generation = 1;
         granted_.element_type = ElementType::UInt16;
@@ -130,8 +148,10 @@ class FakeTransport final : public detail::SubscriberTransport
         granted_.max_frame_bytes = 64u << 10;
         granted_.ring_depth = 4;
         granted_.credit_window = 2;
-        granted_.shape = {8, 8, 0, 0};
-        granted_.strides = {16, 2, 0, 0};
+        granted_.shape = reshaped ? std::array<std::uint64_t, k_max_rank>{4, 16, 0, 0}
+                                  : std::array<std::uint64_t, k_max_rank>{8, 8, 0, 0};
+        granted_.strides = reshaped ? std::array<std::uint64_t, k_max_rank>{32, 2, 0, 0}
+                                    : std::array<std::uint64_t, k_max_rank>{16, 2, 0, 0};
 
         generation_ = 1;
         return Status::Ok;

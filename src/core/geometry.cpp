@@ -210,6 +210,12 @@ bool operator!=(const GeometryBlock &a, const GeometryBlock &b) noexcept
     return !(a == b);
 }
 
+bool describes_same_array(const GeometryBlock &a, const GeometryBlock &b) noexcept
+{
+    return a.element_type == b.element_type && a.element_size == b.element_size &&
+           a.rank == b.rank && a.shape == b.shape && a.strides == b.strides;
+}
+
 } // namespace Protocol
 
 Status FrameMetadata::resolve(std::uint64_t max_frame_bytes) noexcept

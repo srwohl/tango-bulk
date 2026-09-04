@@ -260,6 +260,26 @@ struct SessionSupervisor::Impl
             return false;
         }
 
+        // A reopened session may be granted a different array than the one the
+        // application laid its buffers out for. Adopting it silently is how a
+        // client ends up interpreting 1024x1024 frames as 2048x2048; the epoch
+        // and the sizing terms are allowed to move, the description is not.
+        if(retired_geometry.generation != 0 &&
+           !describes_same_array(retired_geometry, fresh->granted_geometry()))
+        {
+            geometry_changes.fetch_add(1, std::memory_order_relaxed);
+            error = BulkError{Status::GeometryMismatch,
+                              "the reopened session describes a different array than the one "
+                              "that was retired; the application must open a new subscription "
+                              "with the new contract in hand",
+                              "subscriber"};
+
+            // Not adopted: this transport is closed rather than published, so
+            // no frame from it can reach a callback expecting the old shape.
+            fresh.reset();
+            return false;
+        }
+
         publish_transport(std::move(fresh));
         transition(SubscriberState::Probing, BulkError{});
 
@@ -554,6 +574,24 @@ struct SessionSupervisor::Impl
             {
                 return true;
             }
+
+            if(error.status == Status::GeometryMismatch)
+            {
+                // The reopened session describes a different array. Retrying
+                // cannot help -- neither side changes between attempts, so the
+                // next grant is the same different array -- and BoundedRetry
+                // would spend every remaining attempt and a backoff apiece
+                // discovering that.
+                //
+                // This is also where a frame-level contradiction ends up. That
+                // retires its session and reconnects once, which is right: the
+                // publisher may have genuinely reopened with a new contract,
+                // and reopening is how the client finds out what it now is.
+                // Then this stops, and says so in the more accurate of the two
+                // messages.
+                transition(SubscriberState::Failed, error);
+                return false;
+            }
         }
 
         return false;
@@ -620,6 +658,14 @@ struct SessionSupervisor::Impl
                 // not reset the counters an operator is watching.
                 accumulate(retired, transport->counters());
                 last_lease_ttl_ms = std::max(last_lease_ttl_ms, transport->lease_ttl_ms());
+
+                // And keep what it was describing, so the next grant can be
+                // compared against it rather than silently replacing it.
+                const Protocol::GeometryBlock going = transport->granted_geometry();
+                if(going.generation != 0)
+                {
+                    retired_geometry = going;
+                }
             }
 
             previous = std::move(transport);
@@ -779,6 +825,10 @@ struct SessionSupervisor::Impl
     std::uint32_t last_lease_ttl_ms{0};
     SubscriberCounters retired{};
 
+    /// What the last session was describing. All-zero until one is retired,
+    /// which is why the comparison is skipped on a first open.
+    Protocol::GeometryBlock retired_geometry{};
+
     std::mutex queue_mutex;
     std::deque<Transition> transitions;
 
@@ -787,6 +837,7 @@ struct SessionSupervisor::Impl
 
     std::atomic<std::uint64_t> correlation{0};
     std::atomic<std::uint64_t> reconnects{0};
+    std::atomic<std::uint64_t> geometry_changes{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -918,6 +969,7 @@ SubscriberCounters SessionSupervisor::counters() const noexcept
     }
 
     total.reconnects = impl_->reconnects.load(std::memory_order_relaxed);
+    total.geometry_changes += impl_->geometry_changes.load(std::memory_order_relaxed);
     return total;
 }
 
