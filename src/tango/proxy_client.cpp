@@ -2,62 +2,44 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include <tango-bulk/unstable/subscriber_transport.h>
+#include <tango-bulk/unstable/session_supervisor.h>
 
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/tango.h>
 
 #include <tango/tango.h>
 
-#include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstring>
-#include <deque>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
-/// `BulkSubscriber`: the client half of the Tango adapter.
+/// `BulkSubscriber`: the Tango adapter, and nothing else.
 ///
-/// This class owns no UCX: the transport is `detail::SubscriberEngine` behind
-/// `detail::SubscriberTransport`, one layer down and one library over.  What
-/// lives here is everything that needs a `DeviceProxy` -- the `Open`/`Renew`/
-/// `Close` round trips, the renew timer, the reconnect policy -- plus the
-/// dispatch thread that keeps user callbacks off the engine (5.2).
+/// Everything that was session policy -- the control loop, the renew timer, the
+/// reconnect policy, the transport slot, the three threads -- is now
+/// `detail::SessionSupervisor` in `core/`, which knows nothing about Tango. What
+/// is left here is the part that could never move: turning a coordination
+/// message into a `command_inout` on a borrowed `DeviceProxy`, and turning what
+/// comes back (or what is thrown) into bytes and a `BulkError`.
 ///
-/// Three threads, and which one may touch what is the whole design (5.1):
+/// The public interface is unchanged. Two things about it are worth stating,
+/// because they are the reason this class still exists rather than being
+/// replaced by the supervisor:
 ///
-///   * **control** -- the only thread that calls the proxy.  Opens, renews,
-///     closes, reconnects.  Never touches UCX and never invokes a user callback.
-///   * **dispatch** -- the only thread that invokes `FrameCallback` and
-///     `StateCallback`.  Never touches Tango and never touches UCX.
-///   * **engine** -- inside the transport, invisible from here.
-///
-/// The consequence worth stating: a stuck Tango call cannot stall frame
-/// delivery, because delivery does not run on the thread that makes it.  It can
-/// only, eventually, expire the lease -- which is exactly the failure mode 7.4
-/// asks for.
+///   * 2.4 documents that constructing a subscriber that is never started must
+///     cost nothing but memory, so a client can build one per stream and start
+///     a subset. A `SessionSupervisor` *is* its session and has no unstarted
+///     form -- so the two-phase shape lives here, as a `unique_ptr` that is null
+///     until `start()`.
+///   * That pointer is also the answer to "have you started?", which
+///     `set_command_names()` needs. There is no second flag to disagree with it.
 namespace TangoBulk
 {
 namespace
 {
-
-using namespace std::chrono_literals;
-
-/// The longest the control thread sleeps without looking around.
-///
-/// A renew interval is seconds; a transport failure should be noticed sooner
-/// than that, so the wait is chopped into quanta and the renewal is scheduled
-/// against a deadline rather than against the sleep.
-constexpr auto k_control_quantum = 100ms;
-
-/// How long a dispatch-thread poll blocks before looking at the run flag.
-constexpr auto k_dispatch_quantum = 20ms;
 
 /// Scope a Tango timeout and put back what the application had.
 ///
@@ -109,664 +91,95 @@ std::string describe(const Tango::DevFailed &failure)
            std::string(failure.errors[0].desc.in());
 }
 
-void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexcept
-{
-    total.frames_received += part.frames_received;
-    total.frames_delivered += part.frames_delivered;
-    total.frames_dropped_queue_full += part.frames_dropped_queue_full;
-    total.frames_dropped_stale_epoch += part.frames_dropped_stale_epoch;
-    total.frames_dropped_bad_header += part.frames_dropped_bad_header;
-    total.frames_dropped_oversize += part.frames_dropped_oversize;
-    total.frames_dropped_duplicate_seq += part.frames_dropped_duplicate_seq;
-    total.credits_returned += part.credits_returned;
-    total.credit_messages_sent += part.credit_messages_sent;
-    total.sessions_opened += part.sessions_opened;
-    total.renewals_sent += part.renewals_sent;
-    total.renewals_failed += part.renewals_failed;
-    total.geometry_changes += part.geometry_changes;
-    total.transport_errors += part.transport_errors;
-
-    // Gauges, not counters: they describe the transport that is live now, so
-    // the newest value wins rather than the sum.
-    total.views_outstanding = part.views_outstanding;
-    total.delivery_queue_depth = part.delivery_queue_depth;
-    total.delivery_queue_high_water =
-        std::max(total.delivery_queue_high_water, part.delivery_queue_high_water);
-    total.pinned_bytes = part.pinned_bytes;
-}
-
 } // namespace
 
 // ---------------------------------------------------------------------------
 
 struct BulkSubscriber::Impl
 {
-    struct Transition
-    {
-        SubscriberState state{SubscriberState::Closed};
-        BulkError error;
-    };
-
-    /// A transport borrowed for the duration of one call.
-    ///
-    /// The dispatch thread polls the transport while the control thread may be
-    /// replacing it, so a `shared_ptr` alone will not do: dropping the last
-    /// reference *is* the destruction, and the engine must not be destroyed on
-    /// the dispatch thread from inside its own `poll()`.  A borrow keeps the
-    /// slot's own reference alive too -- `publish_transport()` waits for every
-    /// borrow to be given back before it swaps -- so the destructor always runs
-    /// on the control thread.
-    class Ref
-    {
-      public:
-        Ref() noexcept = default;
-
-        Ref(Impl &owner, std::shared_ptr<detail::SubscriberTransport> transport) noexcept :
-            owner_(&owner),
-            transport_(std::move(transport))
-        {
-        }
-
-        ~Ref()
-        {
-            reset();
-        }
-
-        Ref(Ref &&other) noexcept :
-            owner_(other.owner_),
-            transport_(std::move(other.transport_))
-        {
-            other.owner_ = nullptr;
-        }
-
-        Ref &operator=(Ref &&other) noexcept
-        {
-            if(this != &other)
-            {
-                reset();
-                owner_ = other.owner_;
-                transport_ = std::move(other.transport_);
-                other.owner_ = nullptr;
-            }
-            return *this;
-        }
-
-        Ref(const Ref &) = delete;
-        Ref &operator=(const Ref &) = delete;
-
-        void reset() noexcept
-        {
-            if(owner_ == nullptr)
-            {
-                return;
-            }
-
-            // The reference goes first, the borrow count second: after the
-            // count reaches zero no borrower may still hold a pointer, which is
-            // precisely what publish_transport() waits on.
-            transport_.reset();
-            owner_->end_borrow();
-            owner_ = nullptr;
-        }
-
-        explicit operator bool() const noexcept
-        {
-            return static_cast<bool>(transport_);
-        }
-
-        detail::SubscriberTransport *operator->() const noexcept
-        {
-            return transport_.get();
-        }
-
-      private:
-        Impl *owner_{nullptr};
-        std::shared_ptr<detail::SubscriberTransport> transport_;
-    };
-
     Impl(Tango::DeviceProxy &device_proxy, SubscriberConfig cfg) :
         proxy(device_proxy),
         config(std::move(cfg))
     {
     }
 
-    // -- coordination, control thread only ----------------------------------
-
-    std::vector<std::byte> command(const std::string &name, const std::vector<std::byte> &request)
+    /// Which command carries which coordination message.
+    ///
+    /// The whole of what `CommandNames` is for, and the whole of why it never
+    /// crosses the seam: below this function the message is a `CoordType`, and
+    /// what a particular device happens to call it is not a fact the session
+    /// policy could use.
+    const std::string &name_for(Protocol::CoordType kind) const
     {
-        std::vector<unsigned char> in(request.size());
-        if(!request.empty())
+        switch(kind)
         {
-            std::memcpy(in.data(), request.data(), request.size());
+        case Protocol::CoordType::Open:
+            return names.open;
+        case Protocol::CoordType::Renew:
+            return names.renew;
+        case Protocol::CoordType::Close:
+            return names.close;
+        case Protocol::CoordType::Query:
+            return names.query;
+        default:
+            break;
         }
 
-        Tango::DeviceData argument;
-        argument << in;
-
-        // 7.4: only command_inout, set_timeout_millis, get_timeout_millis, name
-        // and status.  No subscribe_event, no callback registration, no second
-        // connection.
-        const ScopedTimeout guard(proxy, config.command_timeout_ms);
-        Tango::DeviceData reply = proxy.command_inout(name, argument);
-
-        std::vector<unsigned char> out;
-        if(!(reply >> out))
-        {
-            throw BulkException(BulkError{
-                Status::MalformedMessage, name + " did not return a DevVarCharArray", "tango"});
-        }
-
-        std::vector<std::byte> bytes(out.size());
-        if(!out.empty())
-        {
-            std::memcpy(bytes.data(), out.data(), out.size());
-        }
-        return bytes;
+        throw BulkException(BulkError{
+            Status::Internal, "no bulk command carries this coordination message", "tango"});
     }
 
-    /// Open a session, from `make_open_request` through to `Active`.
+    /// The coordination channel, and the only Tango in the data path's lifetime.
     ///
-    /// Every failure path leaves no transport behind: a half-open subscriber
-    /// with a registered ring and no session is exactly the resource leak the
-    /// lease exists to prevent on the other side.
-    bool open_session(BulkError &error) noexcept
+    /// Called on the supervisor's control thread and never concurrently, which
+    /// is what lets it scope the caller's proxy timeout without racing anyone
+    /// for it.
+    ///
+    /// 7.4: a `DevFailed` is a recovery hint, never cleanup authority.  It is
+    /// translated here rather than passed upward, so that the supervisor's
+    /// interface deals in `BulkException` and its implementation never names a
+    /// Tango type.
+    std::vector<std::byte> command(Protocol::CoordType kind,
+                                   const std::vector<std::byte> &request)
     {
-        std::shared_ptr<detail::SubscriberTransport> fresh;
+        const std::string &name = name_for(kind);
 
         try
         {
-            fresh = detail::make_subscriber_transport(config);
-        }
-        catch(const BulkException &e)
-        {
-            error = e.error();
-            return false;
-        }
-        catch(const std::exception &e)
-        {
-            error = BulkError{Status::Internal, e.what(), "subscriber"};
-            return false;
-        }
-
-        try
-        {
-            const std::vector<std::byte> request =
-                fresh->make_open_request(next_correlation_id());
-            const std::vector<std::byte> reply = command(names.open, request);
-
-            const Status status = fresh->adopt_open_reply(reply.data(), reply.size());
-            if(status != Status::Ok)
+            std::vector<unsigned char> in(request.size());
+            if(!request.empty())
             {
-                error = BulkError{status,
-                                  std::string("BulkOpen was refused: ") + to_string(status),
-                                  "subscriber"};
-                return false;
+                std::memcpy(in.data(), request.data(), request.size());
             }
+
+            Tango::DeviceData argument;
+            argument << in;
+
+            // 7.4: only command_inout, set_timeout_millis, get_timeout_millis,
+            // name and status.  No subscribe_event, no callback registration, no
+            // second connection.
+            const ScopedTimeout guard(proxy, config.command_timeout_ms);
+            Tango::DeviceData reply = proxy.command_inout(name, argument);
+
+            std::vector<unsigned char> out;
+            if(!(reply >> out))
+            {
+                throw BulkException(BulkError{
+                    Status::MalformedMessage, name + " did not return a DevVarCharArray", "tango"});
+            }
+
+            std::vector<std::byte> bytes(out.size());
+            if(!out.empty())
+            {
+                std::memcpy(bytes.data(), out.data(), out.size());
+            }
+            return bytes;
         }
         catch(const Tango::DevFailed &failure)
         {
-            // 7.4: a DevFailed is a recovery hint, never cleanup authority.  It
-            // says this client should reconnect; it says nothing about what the
-            // publisher should release, which only the lease decides.
-            error = BulkError{Status::TransportFailure, describe(failure), "tango"};
-            return false;
+            throw BulkException(BulkError{Status::TransportFailure, describe(failure), "tango"});
         }
-        catch(const BulkException &e)
-        {
-            error = e.error();
-            return false;
-        }
-
-        publish_transport(std::move(fresh));
-        transition(SubscriberState::Probing, BulkError{});
-
-        // 4.1: `Probing` until the publisher's `Probe` is answered.  Waiting for
-        // it here rather than reporting `Active` optimistically is what makes
-        // the state mean "frames can flow", which is the only reading that is
-        // useful to an application.
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(config.command_timeout_ms);
-
-        for(;;)
-        {
-            const Ref live = borrow();
-            const SubscriberState observed = live ? live->state() : SubscriberState::Failed;
-
-            if(observed == SubscriberState::Active)
-            {
-                transition(SubscriberState::Active, BulkError{});
-                return true;
-            }
-
-            if(observed == SubscriberState::Failed || !running.load(std::memory_order_acquire))
-            {
-                error = BulkError{Status::TransportFailure,
-                                  "the transport failed before the probe was answered",
-                                  "subscriber"};
-                break;
-            }
-
-            if(std::chrono::steady_clock::now() >= deadline)
-            {
-                error = BulkError{Status::TransportFailure,
-                                  "no Probe arrived within command_timeout_ms; the publisher "
-                                  "cannot reach this client's UCX endpoint",
-                                  "subscriber"};
-                break;
-            }
-
-            std::this_thread::sleep_for(1ms);
-        }
-
-        close_session();
-        return false;
     }
-
-    /// Best-effort `Close`, then drop the transport.
-    ///
-    /// Best-effort because 3.8 makes `Close` idempotent and the lease is the
-    /// backstop: a close that cannot be delivered costs the publisher one lease
-    /// TTL, not a leaked ring.  Sending it anyway is what turns the common case
-    /// -- an orderly client shutdown -- into an immediate release.
-    void close_session() noexcept
-    {
-        {
-            const Ref live = borrow();
-            if(live)
-            {
-                try
-                {
-                    const std::vector<std::byte> request =
-                        live->make_close_request(next_correlation_id());
-                    command(names.close, request);
-                }
-                catch(const Tango::DevFailed &)
-                {
-                    // The device is gone or unreachable.  The lease covers it.
-                }
-                catch(const std::exception &)
-                {
-                }
-            }
-        }
-
-        publish_transport(nullptr);
-    }
-
-    /// Renew on schedule until something ends the session.
-    ///
-    /// Returns true if `stop()` ended it, false if it was lost -- which is the
-    /// difference between "we are done" and "reconnect if the policy allows".
-    bool run_session(BulkError &error) noexcept
-    {
-        auto next_renew = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(current_renew_interval());
-
-        while(running.load(std::memory_order_acquire))
-        {
-            {
-                std::unique_lock<std::mutex> lock(mutex);
-                wake.wait_for(lock, k_control_quantum, [this] {
-                    return !running.load(std::memory_order_acquire);
-                });
-            }
-
-            if(!running.load(std::memory_order_acquire))
-            {
-                return true;
-            }
-
-            SubscriberState observed = SubscriberState::Failed;
-            {
-                const Ref live = borrow();
-                if(!live)
-                {
-                    error = BulkError{Status::Internal, "the transport disappeared", "subscriber"};
-                    return false;
-                }
-                observed = live->state();
-            }
-
-            if(observed == SubscriberState::Failed)
-            {
-                error = BulkError{
-                    Status::TransportFailure, "the transport reported a failure", "subscriber"};
-                return false;
-            }
-
-            if(std::chrono::steady_clock::now() < next_renew)
-            {
-                continue;
-            }
-
-            const Status status = renew_once(error);
-            if(status == Status::Ok)
-            {
-                next_renew = std::chrono::steady_clock::now() +
-                             std::chrono::milliseconds(current_renew_interval());
-                continue;
-            }
-
-            if(status == Status::RenewTooFrequent)
-            {
-                // 3.7: the lease is not shortened as a penalty, so the session is
-                // healthy and the only correct response is to renew less often.
-                // Backing off by one full interval is the smallest change that
-                // cannot loop.
-                next_renew = std::chrono::steady_clock::now() +
-                             std::chrono::milliseconds(current_renew_interval());
-                continue;
-            }
-
-            return false;
-        }
-
-        return true;
-    }
-
-    Status renew_once(BulkError &error) noexcept
-    {
-        const Ref live = borrow();
-        if(!live)
-        {
-            error = BulkError{Status::Internal, "the transport disappeared", "subscriber"};
-            return Status::Internal;
-        }
-
-        Status status = Status::Ok;
-
-        try
-        {
-            const std::vector<std::byte> request = live->make_renew_request(next_correlation_id());
-            const std::vector<std::byte> reply = command(names.renew, request);
-            status = live->adopt_renew_reply(reply.data(), reply.size());
-
-            if(status != Status::Ok)
-            {
-                error = BulkError{status,
-                                  std::string("BulkRenew was refused: ") + to_string(status),
-                                  "subscriber"};
-            }
-        }
-        catch(const Tango::DevFailed &failure)
-        {
-            error = BulkError{Status::TransportFailure, describe(failure), "tango"};
-            status = Status::TransportFailure;
-        }
-        catch(const BulkException &e)
-        {
-            error = e.error();
-            status = e.error().status;
-        }
-
-        return status;
-    }
-
-    std::uint32_t current_renew_interval() noexcept
-    {
-        // 3.7 lets the server change the interval at any renewal and requires
-        // the client to adopt the new value, so it is read from the transport
-        // rather than from the configuration.
-        const Ref live = borrow();
-        const std::uint32_t granted = live ? live->renew_interval_ms() : 0;
-        return granted == 0 ? 1'000u : granted;
-    }
-
-    // -- control thread -----------------------------------------------------
-
-    void control_loop() noexcept
-    {
-        std::uint32_t attempt = 0;
-
-        for(;;)
-        {
-            if(!running.load(std::memory_order_acquire))
-            {
-                break;
-            }
-
-            BulkError error;
-            if(run_session(error))
-            {
-                break; // stop() ended it.
-            }
-
-            close_session();
-
-            if(!running.load(std::memory_order_acquire))
-            {
-                break;
-            }
-
-            if(!reconnect(attempt, error))
-            {
-                break;
-            }
-
-            attempt = 0;
-        }
-
-        // Whatever ended the loop, the session does not outlive it.
-        close_session();
-    }
-
-    /// Reopen under the configured policy.  Returns false if the subscriber is
-    /// finished -- `Failed`, or stopped while backing off.
-    bool reconnect(std::uint32_t &attempt, BulkError error) noexcept
-    {
-        if(config.reconnect_policy != ReconnectPolicy::BoundedRetry)
-        {
-            // 4.1: FailFast makes any transition to `Reconnecting` a `Failed`,
-            // and Manual enters `Failed` and waits for the application to call
-            // start() again.  They differ in what the application does next, not
-            // in what happens here.
-            transition(SubscriberState::Failed, error);
-            return false;
-        }
-
-        while(running.load(std::memory_order_acquire))
-        {
-            if(attempt >= config.reconnect_max_attempts)
-            {
-                transition(SubscriberState::Failed,
-                           BulkError{error.status,
-                                     "reconnect attempts exhausted: " + error.message,
-                                     error.origin});
-                return false;
-            }
-
-            transition(SubscriberState::Reconnecting, error);
-            reconnects.fetch_add(1, std::memory_order_relaxed);
-
-            if(!backoff(attempt))
-            {
-                return false;
-            }
-
-            ++attempt;
-
-            transition(SubscriberState::Opening, BulkError{});
-            if(open_session(error))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /// Exponential from `reconnect_backoff_ms`, capped at the last known lease
-    /// TTL.  Returns false if `stop()` arrived during the wait.
-    ///
-    /// Capped at the TTL because backing off longer than a lease cannot help: by
-    /// then the publisher has reclaimed everything this client held, and the
-    /// reopen would be a fresh session either way.
-    bool backoff(std::uint32_t attempt) noexcept
-    {
-        std::uint64_t delay = config.reconnect_backoff_ms;
-        for(std::uint32_t i = 0; i < attempt && delay < last_lease_ttl_ms; ++i)
-        {
-            delay *= 2;
-        }
-        delay = std::min<std::uint64_t>(delay, std::max<std::uint32_t>(last_lease_ttl_ms, 1));
-
-        std::unique_lock<std::mutex> lock(mutex);
-        wake.wait_for(lock,
-                      std::chrono::milliseconds(delay),
-                      [this] { return !running.load(std::memory_order_acquire); });
-        return running.load(std::memory_order_acquire);
-    }
-
-    // -- the transport slot -------------------------------------------------
-
-    Ref borrow() noexcept
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-
-        // `swapping` is what makes this a handshake rather than a race.  Without
-        // it the dispatch thread re-borrows the instant it gives a borrow back
-        // -- it is a loop whose whole body is one poll -- and the control thread
-        // waiting for the count to reach zero has to win a scheduling coin flip
-        // against a thread that is already running and already holds the lock a
-        // microsecond later.  It loses that flip often enough to hang: observed
-        // as a subscriber that stayed `Active` after its stream was taken away,
-        // because the control thread never got past `close_session()` to say
-        // `Reconnecting`.
-        if(!transport || swapping)
-        {
-            return Ref{};
-        }
-
-        ++borrowed;
-        return Ref{*this, transport};
-    }
-
-    void end_borrow() noexcept
-    {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            --borrowed;
-        }
-        wake.notify_all();
-    }
-
-    void publish_transport(std::shared_ptr<detail::SubscriberTransport> next) noexcept
-    {
-        std::shared_ptr<detail::SubscriberTransport> previous;
-
-        {
-            std::unique_lock<std::mutex> lock(mutex);
-
-            // Closes the door first, then waits for the room to empty.
-            swapping = true;
-            wake.wait(lock, [this] { return borrowed == 0; });
-
-            if(transport)
-            {
-                // Fold the retiring transport's totals in, so a reconnect does
-                // not reset the counters an operator is watching.
-                accumulate(retired, transport->counters());
-                last_lease_ttl_ms = std::max(last_lease_ttl_ms, transport->lease_ttl_ms());
-            }
-
-            previous = std::move(transport);
-            transport = std::move(next);
-            swapping = false;
-        }
-
-        wake.notify_all();
-        // `previous` dies here, on the control thread, outside the lock.
-    }
-
-    // -- delivery -----------------------------------------------------------
-
-    void transition(SubscriberState next, BulkError error) noexcept
-    {
-        state.store(next, std::memory_order_release);
-
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex);
-            transitions.push_back(Transition{next, std::move(error)});
-        }
-        wake.notify_all();
-    }
-
-    /// Deliver queued state transitions on the calling thread.
-    std::size_t drain_transitions() noexcept
-    {
-        std::size_t delivered = 0;
-
-        for(;;)
-        {
-            Transition item;
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex);
-                if(transitions.empty())
-                {
-                    break;
-                }
-                item = std::move(transitions.front());
-                transitions.pop_front();
-            }
-
-            if(state_callback)
-            {
-                try
-                {
-                    state_callback(item.state, item.error);
-                }
-                catch(...)
-                {
-                    // A throwing user callback must not take the dispatch thread
-                    // with it; there is nobody above it to catch anything.
-                }
-            }
-            ++delivered;
-        }
-
-        return delivered;
-    }
-
-    std::size_t deliver_frames(std::chrono::milliseconds timeout) noexcept
-    {
-        const Ref live = borrow();
-        if(!live)
-        {
-            std::this_thread::sleep_for(std::min(timeout, k_dispatch_quantum));
-            return 0;
-        }
-
-        std::size_t delivered = 0;
-        try
-        {
-            delivered = live->poll(timeout, frame_callback);
-        }
-        catch(...)
-        {
-            // Same reasoning as above: a user callback that throws is contained
-            // here rather than unwinding through the transport.
-        }
-
-        return delivered;
-    }
-
-    void dispatch_loop() noexcept
-    {
-        while(running.load(std::memory_order_acquire))
-        {
-            drain_transitions();
-            deliver_frames(k_dispatch_quantum);
-        }
-
-        drain_transitions();
-    }
-
-    std::uint64_t next_correlation_id() noexcept
-    {
-        return correlation.fetch_add(1, std::memory_order_relaxed) + 1;
-    }
-
-    // -----------------------------------------------------------------------
 
     Tango::DeviceProxy &proxy; ///< BORROWED; the caller keeps it alive (7.4)
     SubscriberConfig config;
@@ -775,26 +188,18 @@ struct BulkSubscriber::Impl
     FrameCallback frame_callback;
     StateCallback state_callback;
 
-    std::atomic<SubscriberState> state{SubscriberState::Closed};
-    std::atomic<bool> running{false};
-    std::atomic<bool> started{false};
-
-    std::mutex mutex;
-    std::condition_variable wake;
-    std::shared_ptr<detail::SubscriberTransport> transport;
-    std::size_t borrowed{0};
-    bool swapping{false}; ///< a swap is waiting for the borrows to come back
-    std::uint32_t last_lease_ttl_ms{0};
+    /// What `state()` and `counters()` answer once the supervisor is gone.
+    ///
+    /// Destroying the supervisor is how a session stops, so both would otherwise
+    /// read zero after `stop()` -- and 2.4 says `state()` reports `Closed` there,
+    /// while an operator watching counters should not see them reset by a
+    /// shutdown any more than by a reconnect.
+    std::atomic<SubscriberState> last_state{SubscriberState::Closed};
     SubscriberCounters retired{};
 
-    std::mutex queue_mutex;
-    std::deque<Transition> transitions;
-
-    std::thread control;
-    std::thread dispatch;
-
-    std::atomic<std::uint64_t> correlation{0};
-    std::atomic<std::uint64_t> reconnects{0};
+    /// Null until `start()`, null again after `stop()`.  Also the answer to
+    /// "have you started?".
+    std::unique_ptr<detail::SessionSupervisor> supervisor;
 };
 
 // ---------------------------------------------------------------------------
@@ -821,7 +226,7 @@ BulkSubscriber::~BulkSubscriber()
 
 void BulkSubscriber::set_frame_callback(FrameCallback cb)
 {
-    if(impl_->started.load(std::memory_order_acquire))
+    if(impl_->supervisor)
     {
         throw BulkException(BulkError{
             Status::Internal, "set_frame_callback() must be called before start()", "subscriber"});
@@ -831,7 +236,7 @@ void BulkSubscriber::set_frame_callback(FrameCallback cb)
 
 void BulkSubscriber::set_state_callback(StateCallback cb)
 {
-    if(impl_->started.load(std::memory_order_acquire))
+    if(impl_->supervisor)
     {
         throw BulkException(BulkError{
             Status::Internal, "set_state_callback() must be called before start()", "subscriber"});
@@ -843,99 +248,64 @@ void BulkSubscriber::start()
 {
     Impl &impl = *impl_;
 
-    if(impl.started.exchange(true, std::memory_order_acq_rel))
+    if(impl.supervisor)
     {
         throw BulkException(
             BulkError{Status::Internal, "the subscriber is already started", "subscriber"});
     }
 
-    // 2.4: both callbacks MUST be set before start().  Refusing here is the only
-    // moment at which the omission is cheap to report -- afterwards it is a
-    // stream that silently goes nowhere.
+    // 2.4: both callbacks MUST be set before start().  The supervisor refuses an
+    // empty one too, but refusing here keeps the message about *this* class.
     if(!impl.frame_callback || !impl.state_callback)
     {
-        impl.started.store(false, std::memory_order_release);
         throw BulkException(BulkError{Status::Internal,
                                       "set_frame_callback() and set_state_callback() must both "
                                       "be called before start()",
                                       "subscriber"});
     }
 
-    impl.running.store(true, std::memory_order_release);
+    detail::SessionCallbacks callbacks;
+    callbacks.on_frame = impl.frame_callback;
 
-    if(impl.config.delivery_mode == DeliveryMode::DispatchThread)
-    {
-        impl.dispatch = std::thread([&impl] { impl.dispatch_loop(); });
-    }
+    // Wrapped so that `state()` keeps answering after the supervisor is gone.
+    // The supervisor is the authority while it exists; this only records what it
+    // last said, for the window afterwards.
+    callbacks.on_state = [&impl](SubscriberState next, const BulkError &error) {
+        impl.last_state.store(next, std::memory_order_release);
+        if(impl.state_callback)
+        {
+            impl.state_callback(next, error);
+        }
+    };
 
-    impl.transition(SubscriberState::Opening, BulkError{});
-
-    BulkError error;
-    if(impl.open_session(error))
-    {
-        impl.control = std::thread([&impl] { impl.control_loop(); });
-        return;
-    }
-
-    // The first open failed.  Under BoundedRetry that is the control thread's
-    // problem and start() returns; under the other two policies the caller is
-    // right here and gets told, which is what 2.4 means by "throws on open
-    // failure under FailFast".
-    if(impl.config.reconnect_policy == ReconnectPolicy::BoundedRetry)
-    {
-        impl.transition(SubscriberState::Reconnecting, error);
-        impl.control = std::thread([&impl] { impl.control_loop(); });
-        return;
-    }
-
-    impl.transition(SubscriberState::Failed, error);
-    impl.running.store(false, std::memory_order_release);
-    impl.wake.notify_all();
-
-    if(impl.dispatch.joinable())
-    {
-        impl.dispatch.join();
-    }
-
-    impl.started.store(false, std::memory_order_release);
-    throw BulkException(error);
+    // Throws under FailFast and Manual, which is what 2.4 asks of start().  The
+    // wrapped callback has already recorded `Failed` by then, so `state()`
+    // reports the diagnosis rather than the absence.
+    impl.supervisor = detail::open_session(
+        impl.config,
+        [&impl](Protocol::CoordType kind, const std::vector<std::byte> &request) {
+            return impl.command(kind, request);
+        },
+        std::move(callbacks));
 }
 
 void BulkSubscriber::stop() noexcept
 {
     Impl &impl = *impl_;
 
-    if(!impl.started.load(std::memory_order_acquire))
+    if(!impl.supervisor)
     {
         return; // 2.4: idempotent.
     }
 
-    impl.running.store(false, std::memory_order_release);
-    impl.wake.notify_all();
+    // Read before the destructor runs, because the destructor is what takes the
+    // counters away with it.  Nothing arrives between here and there: the
+    // session is still open, and stopping it is the next statement.
+    impl.retired = impl.supervisor->counters();
 
-    if(impl.control.joinable())
-    {
-        impl.control.join();
-    }
-    if(impl.dispatch.joinable())
-    {
-        impl.dispatch.join();
-    }
-
-    // The control thread closes the session on its way out; this covers the case
-    // where there never was one.
-    impl.close_session();
-
-    impl.transition(SubscriberState::Closed, BulkError{});
-
-    // Both delivery threads are joined, so the final transitions are delivered
-    // on the caller's thread.  That is a deliberate choice: a state callback
-    // that never reports `Closed` is worse than one that reports it from
-    // stop(), and the guarantee 5.2 actually makes is about the *engine*
-    // thread, which this is not.
-    impl.drain_transitions();
-
-    impl.started.store(false, std::memory_order_release);
+    // Closes the session, joins both threads, and reports `Closed` through the
+    // wrapped state callback on the way out.
+    impl.supervisor.reset();
 }
 
 std::size_t BulkSubscriber::poll(std::chrono::milliseconds timeout)
@@ -950,37 +320,32 @@ std::size_t BulkSubscriber::poll(std::chrono::milliseconds timeout)
                                       "subscriber"});
     }
 
-    impl.drain_transitions();
-    const std::size_t frames = impl.deliver_frames(timeout);
-    impl.drain_transitions();
-    return frames;
+    if(!impl.supervisor)
+    {
+        return 0;
+    }
+
+    return impl.supervisor->poll(timeout);
 }
 
 SubscriberState BulkSubscriber::state() const noexcept
 {
-    return impl_->state.load(std::memory_order_acquire);
+    const Impl &impl = *impl_;
+
+    // The supervisor is the authority while it exists: it stores its state when
+    // it changes, rather than when the change is delivered.
+    return impl.supervisor ? impl.supervisor->state()
+                           : impl.last_state.load(std::memory_order_acquire);
 }
 
 std::uint32_t BulkSubscriber::generation() const noexcept
 {
-    const Impl::Ref live = impl_->borrow();
-    return live ? live->generation() : 0;
+    return impl_->supervisor ? impl_->supervisor->generation() : 0;
 }
 
 SubscriberCounters BulkSubscriber::counters() const noexcept
 {
-    SubscriberCounters total = impl_->retired;
-
-    {
-        const Impl::Ref live = impl_->borrow();
-        if(live)
-        {
-            accumulate(total, live->counters());
-        }
-    }
-
-    total.reconnects = impl_->reconnects.load(std::memory_order_relaxed);
-    return total;
+    return impl_->supervisor ? impl_->supervisor->counters() : impl_->retired;
 }
 
 // ---------------------------------------------------------------------------
@@ -993,7 +358,7 @@ void set_command_names(BulkSubscriber &subscriber, const CommandNames &names)
     // while the class it configures stays in a header the UCX layer compiles.
     BulkSubscriber::Impl &impl = *subscriber.impl_;
 
-    if(impl.started.load(std::memory_order_acquire))
+    if(impl.supervisor)
     {
         throw BulkException(BulkError{Status::Internal,
                                       "set_command_names() must be called before start(): the "
