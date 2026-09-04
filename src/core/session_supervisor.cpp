@@ -699,9 +699,16 @@ struct SessionSupervisor::Impl
         return correlation.fetch_add(1, std::memory_order_relaxed) + 1;
     }
 
-    /// Stop everything and report `Closed`.  Idempotent, and safe to call on a
-    /// supervisor whose first open never succeeded.
-    void shutdown() noexcept
+    /// Stop everything.  Idempotent, and safe to call on a supervisor whose
+    /// first open never succeeded.
+    ///
+    /// `announce_closed` is false on exactly one path: a first open that failed
+    /// under a policy that reports rather than retries.  There the caller is
+    /// about to receive an exception and the last state it should observe is
+    /// `Failed`; following that with `Closed` would overwrite the diagnosis
+    /// with the fact that the failed thing is also no longer running, which the
+    /// caller can see for itself from the throw.
+    void shutdown(bool announce_closed) noexcept
     {
         running.store(false, std::memory_order_release);
         wake.notify_all();
@@ -719,7 +726,10 @@ struct SessionSupervisor::Impl
         // case where there never was one.
         close_session();
 
-        transition(SubscriberState::Closed, BulkError{});
+        if(announce_closed)
+        {
+            transition(SubscriberState::Closed, BulkError{});
+        }
 
         // Both delivery threads are joined, so the final transitions are
         // delivered on the caller's thread.  That is a deliberate choice: a
@@ -768,7 +778,7 @@ SessionSupervisor::SessionSupervisor(std::unique_ptr<Impl> impl) noexcept :
 
 SessionSupervisor::~SessionSupervisor()
 {
-    impl_->shutdown();
+    impl_->shutdown(true);
 }
 
 std::unique_ptr<SessionSupervisor> SessionSupervisor::open(SubscriberConfig config,
@@ -836,7 +846,7 @@ std::unique_ptr<SessionSupervisor> SessionSupervisor::open(SubscriberConfig conf
     }
 
     impl->transition(SubscriberState::Failed, error);
-    impl->shutdown();
+    impl->shutdown(false);
     throw BulkException(error);
 }
 

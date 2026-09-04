@@ -14,6 +14,7 @@ add_library(
     publisher_impl.cpp
     registered_memory.cpp
     registered_ring.cpp
+    session.cpp
     subscriber_engine.cpp
     ucx_context.cpp
     ucx_support.cpp)
