@@ -218,6 +218,12 @@ bool describes_same_array(const GeometryBlock &a, const GeometryBlock &b) noexce
 
 } // namespace Protocol
 
+bool describes_same_array(const FrameMetadata &a, const FrameMetadata &b) noexcept
+{
+    return a.element_type == b.element_type && a.element_size == b.element_size &&
+           a.rank == b.rank && a.shape == b.shape && a.strides == b.strides;
+}
+
 Status FrameMetadata::resolve(std::uint64_t max_frame_bytes) noexcept
 {
     FrameMetadata resolved = *this;

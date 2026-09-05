@@ -503,62 +503,106 @@ TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
     }));
 }
 
-TEST_CASE("A frame that contradicts the granted geometry retires the session",
-          "[m2][slice]")
+TEST_CASE("A publisher refuses to send an array it did not declare", "[m2][slice]")
 {
-    // 6.2 makes the grant the contract: the array description is settled at
-    // Open, and changing a term of it means closing and reopening. Nothing on
-    // the producer side enforces that -- publish() resolves a frame's metadata
-    // against max_frame_bytes and the lease capacity, and never against the
-    // publisher's own declared geometry -- so a publisher will happily send an
-    // array it did not grant. This is the check that makes granted_geometry() a
-    // guarantee rather than a hint.
-    PublisherConfig publisher_cfg = publisher_config();
-    publisher_cfg.frame_metadata.element_type = ElementType::UInt8;
-    publisher_cfg.frame_metadata.element_size = 1;
-    publisher_cfg.frame_metadata.rank = 1;
-    publisher_cfg.frame_metadata.shape[0] = k_frame_bytes;
+    // The producer half of 6.2. A device is far better placed to notice that it
+    // is publishing something it never declared than a consumer is to discover
+    // it after the bytes are on the wire and tear down a session over it.
+    PublisherConfig config = publisher_config();
+    config.frame_metadata.element_type = ElementType::UInt8;
+    config.frame_metadata.element_size = 1;
+    config.frame_metadata.rank = 1;
+    config.frame_metadata.shape[0] = k_frame_bytes;
 
-    BulkPublisher publisher(publisher_cfg);
+    BulkPublisher publisher(config);
     detail::SubscriberEngine subscriber(subscriber_config());
     open_session(publisher, subscriber);
 
-    REQUIRE(subscriber.granted_geometry().rank == 1);
-    REQUIRE(subscriber.granted_geometry().element_type == ElementType::UInt8);
-
-    // A conforming frame first, so the failure below cannot be blamed on the
-    // path never having worked.
+    // What it declared, accepted.
     {
         auto lease = publisher.source().try_acquire();
         REQUIRE(lease);
         fill(lease, k_frame_bytes, 1);
-        REQUIRE(publisher.publish(std::move(lease), meta_for(k_frame_bytes, 1)) ==
-                PublishResult::Accepted);
+        CHECK(publisher.publish(std::move(lease), meta_for(k_frame_bytes, 1)) ==
+              PublishResult::Accepted);
     }
 
-    FrameView received;
-    REQUIRE(eventually([&] {
-        subscriber.poll(10ms, [&](FrameView view) { received = std::move(view); });
-        return static_cast<bool>(received);
-    }));
-    received.reset();
-    CHECK(subscriber.state() == SubscriberState::Active);
-
-    // Now the same stream, described as a different array: UInt16 over half as
-    // many elements. It decodes perfectly and it is not what was agreed.
+    // The same bytes described as a different array: refused, and the lease is
+    // consumed rather than left engaged, exactly as any other BadMetadata.
     {
         auto lease = publisher.source().try_acquire();
         REQUIRE(lease);
         fill(lease, k_frame_bytes, 2);
 
-        FrameMetadata lying;
-        lying.element_type = ElementType::UInt16;
-        lying.element_size = 2;
-        lying.rank = 1;
-        lying.shape[0] = k_frame_bytes / 2;
-        lying.event_counter = 2;
+        FrameMetadata undeclared;
+        undeclared.element_type = ElementType::UInt16;
+        undeclared.element_size = 2;
+        undeclared.rank = 1;
+        undeclared.shape[0] = k_frame_bytes / 2;
 
-        REQUIRE(publisher.publish(std::move(lease), lying) == PublishResult::Accepted);
+        CHECK(publisher.publish(std::move(lease), undeclared) == PublishResult::BadMetadata);
+    }
+
+    CHECK(publisher.counters().dropped_bad_metadata == 1);
+
+    // The session is untouched: refusing one frame is not a reason to break a
+    // stream, which is exactly why catching it here beats catching it there.
+    CHECK(subscriber.state() == SubscriberState::Active);
+    CHECK(publisher.session_count() == 1);
+}
+
+TEST_CASE("A frame that contradicts the granted geometry retires the session",
+          "[m2][slice]")
+{
+    // The consumer half, and it needs a non-conforming peer to provoke -- which
+    // is the point. With the producer check in place, a publisher built from
+    // this library cannot contradict its own grant, so this defends against one
+    // that was not: a different implementation, an older version, a header that
+    // decodes cleanly and lies.
+    //
+    // Built by forging the OpenReply. tests/ucx already carries real protocol
+    // bytes by hand, so a peer that grants one thing and sends another is a
+    // decode, an edit and a re-encode -- no test hook in the library, and
+    // nothing the library could do to stop a peer behaving this way.
+    PublisherConfig config = publisher_config();
+    config.frame_metadata.element_type = ElementType::UInt8;
+    config.frame_metadata.element_size = 1;
+    config.frame_metadata.rank = 1;
+    config.frame_metadata.shape[0] = k_frame_bytes;
+
+    BulkPublisher publisher(config);
+    detail::SubscriberEngine subscriber(subscriber_config());
+
+    const std::vector<std::byte> honest = exchange_open(publisher, subscriber);
+
+    Protocol::Envelope envelope;
+    Protocol::OpenReply reply;
+    REQUIRE(Protocol::decode(honest.data(), honest.size(), reply, &envelope) == Status::Ok);
+    REQUIRE(reply.status == Status::Ok);
+
+    // Same payload size, different array: the grant now says UInt16 over half
+    // as many elements, which is not what the publisher will send.
+    reply.geometry.element_type = ElementType::UInt16;
+    reply.geometry.element_size = 2;
+    reply.geometry.rank = 1;
+    reply.geometry.shape = {k_frame_bytes / 2, 0, 0, 0};
+    reply.geometry.strides = {2, 0, 0, 0};
+    REQUIRE(reply.geometry.validate() == Status::Ok);
+
+    const std::vector<std::byte> forged = Protocol::encode(reply, envelope.correlation_id);
+    REQUIRE(subscriber.adopt_open_reply(forged.data(), forged.size()) == Status::Ok);
+    REQUIRE(await_armed(publisher, subscriber));
+
+    REQUIRE(subscriber.granted_geometry().element_type == ElementType::UInt16);
+
+    // The publisher sends what it actually declared, which now contradicts what
+    // this subscriber believes it was granted.
+    {
+        auto lease = publisher.source().try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, 3);
+        REQUIRE(publisher.publish(std::move(lease), meta_for(k_frame_bytes, 3)) ==
+                PublishResult::Accepted);
     }
 
     REQUIRE(eventually([&] {
@@ -570,15 +614,11 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
     // problem is that it disagreed.
     CHECK(subscriber.counters().frames_dropped_geometry_mismatch == 1);
     CHECK(subscriber.counters().frames_dropped_bad_header == 0);
+    CHECK(subscriber.counters().frames_delivered == 0);
 
-    // And the reason reaches the layer above, which is what lets an application
-    // tell a broken contract from a broken link.
     const BulkError why = subscriber.last_error();
     CHECK(why.status == Status::GeometryMismatch);
     CHECK(why.message.find("different array") != std::string::npos);
-
-    // The contradicting frame was never delivered.
-    CHECK(subscriber.counters().frames_delivered == 1);
 }
 
 TEST_CASE("Views outlive the subscriber that delivered them", "[m2][slice]")

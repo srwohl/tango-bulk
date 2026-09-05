@@ -1451,6 +1451,24 @@ PublishResult BulkPublisher::publish(BulkSource::Lease &&lease, const FrameMetad
         return PublishResult::BadMetadata;
     }
 
+    // 6.2: the geometry a session was granted is the contract, and this
+    // publisher granted it from `config.frame_metadata`. A frame describing a
+    // different array would contradict every session currently open, so it is
+    // refused here rather than sent -- the subscriber would have to retire its
+    // session over it, and a device is far better placed to notice that it is
+    // publishing something it never declared.
+    //
+    // Only when the declaration is typed. A rank-0 Byte declaration is the
+    // opaque tier -- bytes, length and ordering -- where a per-frame hint is
+    // free to say more than the contract does.
+    if(impl_->config.frame_metadata.rank > 0 &&
+       !describes_same_array(resolved, impl_->config.frame_metadata))
+    {
+        impl_->counters.dropped_bad_metadata.fetch_add(1, std::memory_order_relaxed);
+        lease.reset();
+        return PublishResult::BadMetadata;
+    }
+
     if(impl_->armed_sessions.load(std::memory_order_acquire) == 0)
     {
         // 4.2: arm-before-send.  A frame submitted to a session that is not
