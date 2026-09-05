@@ -102,6 +102,13 @@ struct FrameMetadata
     Status validate(std::uint64_t max_frame_bytes) const noexcept;
 };
 
+/// Whether two descriptions are of the same array: element type, element size,
+/// rank, shape and strides.
+///
+/// Not payload_bytes, timestamps, counters or quality -- those are what a frame
+/// is free to vary. This is the part a session contract fixes.
+bool describes_same_array(const FrameMetadata &a, const FrameMetadata &b) noexcept;
+
 namespace detail
 {
 class ReceiveSlotLease;
