@@ -4,6 +4,10 @@
 
 #include <ucx/subscriber_engine.h>
 
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+
 #include <ucx/locality.h>
 
 #include <core/cpu_topology.h>
@@ -185,6 +189,12 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
         pending_[i].slot_index = i;
     }
 
+    // A subscriber without a wakeup descriptor still works -- await_frame()
+    // falls back to a short sleep -- so a failure here is reported by the
+    // descriptor staying -1 rather than by refusing to open. Losing the wakeup
+    // path costs latency and interruptibility, not correctness.
+    wakeup_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
     register_am_handlers();
 
     // The engine thread starts in adopt_open_reply(), not here.
@@ -202,6 +212,17 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
 SubscriberEngine::~SubscriberEngine()
 {
     running_.store(false, std::memory_order_release);
+
+    // Wake a consumer blocked in await_frame() before joining, so teardown does
+    // not have to wait out somebody else's timeout.
+    consumer_waiting_.store(false, std::memory_order_release);
+    if(wakeup_fd_ >= 0)
+    {
+        const std::uint64_t one = 1;
+        const ssize_t written = ::write(wakeup_fd_, &one, sizeof(one));
+        static_cast<void>(written);
+    }
+
     if(engine_.joinable())
     {
         engine_.join();
@@ -363,6 +384,11 @@ void SubscriberEngine::engine_loop()
         {
             worked = true;
         }
+
+        // Out of the callback and into the loop, the same way credit and
+        // probe-acks are routed: a write() belongs nowhere near the inside of
+        // ucp_worker_progress.
+        signal_consumer();
 
         if(worked)
         {
@@ -937,6 +963,90 @@ void SubscriberEngine::on_rndv_complete(void *request,
     }
 }
 
+void SubscriberEngine::signal_consumer() noexcept
+{
+    if(wakeup_fd_ < 0 || delivery_.empty())
+    {
+        return;
+    }
+
+    // Only on the true-to-false transition. A consumer that is keeping up never
+    // sets the flag, so the case that matters -- consumer behind, queue never
+    // empty -- makes no syscall at all.
+    if(!consumer_waiting_.exchange(false, std::memory_order_acq_rel))
+    {
+        return;
+    }
+
+    const std::uint64_t one = 1;
+    const ssize_t written = ::write(wakeup_fd_, &one, sizeof(one));
+    static_cast<void>(written); // EAGAIN means it is already signalled
+}
+
+void SubscriberEngine::drain_wakeup() noexcept
+{
+    if(wakeup_fd_ < 0)
+    {
+        return;
+    }
+
+    // The descriptor is a notification, not a count -- the queue is the truth
+    // about how many frames there are, so one read clears however many writes.
+    std::uint64_t drained = 0;
+    const ssize_t got = ::read(wakeup_fd_, &drained, sizeof(drained));
+    static_cast<void>(got); // EAGAIN: nothing pending, which is fine
+}
+
+bool SubscriberEngine::await_frame(std::chrono::steady_clock::time_point deadline) noexcept
+{
+    const auto now = std::chrono::steady_clock::now();
+    if(now >= deadline)
+    {
+        return false;
+    }
+
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+
+    if(wakeup_fd_ < 0)
+    {
+        // No descriptor: the short sleep this replaced, and the same behaviour.
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        return true;
+    }
+
+    // Declare the intent to block BEFORE looking at the queue again. The other
+    // order loses wakeups: the engine could push and find the flag still clear
+    // between the check and the block, and nothing would write the descriptor.
+    arm_wakeup();
+
+    if(!delivery_.empty())
+    {
+        consumer_waiting_.store(false, std::memory_order_release);
+        return true;
+    }
+
+    pollfd descriptor{};
+    descriptor.fd = wakeup_fd_;
+    descriptor.events = POLLIN;
+
+    const int ready = ::poll(&descriptor, 1, remaining > 0 ? static_cast<int>(remaining) : 1);
+
+    // Whoever gets here first clears it; the engine may already have.
+    consumer_waiting_.store(false, std::memory_order_release);
+
+    if(ready > 0)
+    {
+        drain_wakeup();
+    }
+
+    // ready == 0 is the timeout and ready < 0 is EINTR -- a signal arriving,
+    // which is the whole reason a blocking read is now interruptible instead of
+    // swallowing Ctrl-C for a full poll timeout. Both mean "look again", and
+    // the caller's deadline decides whether to keep waiting.
+    return true;
+}
+
 void SubscriberEngine::fail(Status status, const char *reason) noexcept
 {
     // First reason wins. A failing transport tends to fail again on the way
@@ -1047,7 +1157,10 @@ std::size_t SubscriberEngine::poll(std::chrono::milliseconds timeout,
             break;
         }
 
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        if(!await_frame(deadline))
+        {
+            break;
+        }
     }
 
     return dispatched;

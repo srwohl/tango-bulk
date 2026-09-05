@@ -4,6 +4,9 @@
 
 #include "slice.h"
 
+#include <poll.h>
+#include <thread>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -333,6 +336,105 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
 
     REQUIRE(saw_queue_full);
     CHECK(slice.publisher.counters().dropped_queue_full >= 1);
+}
+
+TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
+          "[m2][slice]")
+{
+    // The ergonomic claim: an event loop that already owns the waiting -- epoll,
+    // select, asyncio's add_reader -- needs nothing from this layer but a
+    // descriptor and the arm/re-check protocol. If this works, `async for` is a
+    // pure-Python addition with no further C++.
+    BulkPublisher publisher(publisher_config());
+    detail::SubscriberEngine subscriber(subscriber_config());
+    open_session(publisher, subscriber);
+
+    REQUIRE(subscriber.fd() >= 0);
+
+    // Nothing queued, so an armed wait must time out rather than fire.
+    subscriber.arm_wakeup();
+    REQUIRE(subscriber.poll(0ms, [](FrameView) {}, 1) == 0);
+    {
+        pollfd pfd{};
+        pfd.fd = subscriber.fd();
+        pfd.events = POLLIN;
+        CHECK(::poll(&pfd, 1, 40) == 0);
+    }
+
+    // Arm, re-check, then block -- exactly the three steps fd() documents.
+    subscriber.arm_wakeup();
+    REQUIRE(subscriber.poll(0ms, [](FrameView) {}, 1) == 0);
+
+    std::thread producer([&] {
+        std::this_thread::sleep_for(60ms);
+        auto lease = publisher.source().try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, 9);
+        REQUIRE(publisher.publish(std::move(lease), meta_for(k_frame_bytes, 9)) ==
+                PublishResult::Accepted);
+    });
+
+    pollfd pfd{};
+    pfd.fd = subscriber.fd();
+    pfd.events = POLLIN;
+
+    const auto started = std::chrono::steady_clock::now();
+    const int ready = ::poll(&pfd, 1, 5000);
+    const auto waited = std::chrono::steady_clock::now() - started;
+    producer.join();
+
+    // Woken by the frame, not by the timeout.
+    REQUIRE(ready == 1);
+    CHECK((pfd.revents & POLLIN) != 0);
+    CHECK(waited < 3s);
+    subscriber.drain_wakeup();
+
+    FrameView got;
+    REQUIRE(eventually([&] {
+        subscriber.poll(10ms, [&](FrameView view) { got = std::move(view); }, 1);
+        return static_cast<bool>(got);
+    }));
+    CHECK(payload_matches(got, 9));
+    got.reset();
+}
+
+TEST_CASE("An unarmed descriptor is never signalled, which is what makes it free",
+          "[m2][slice]")
+{
+    // The other half of the contract, and the reason arming is in the interface
+    // rather than hidden: a consumer that is keeping up never arms, so the
+    // engine never writes, so the fast path costs no syscall at all. A test
+    // that only checked "the fd fires" would pass just as well against an
+    // engine that wrote on every frame.
+    BulkPublisher publisher(publisher_config());
+    detail::SubscriberEngine subscriber(subscriber_config());
+    open_session(publisher, subscriber);
+
+    for(int i = 0; i < 4; ++i)
+    {
+        auto lease = publisher.source().try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, static_cast<unsigned>(i));
+        REQUIRE(publisher.publish(std::move(lease),
+                                  meta_for(k_frame_bytes, static_cast<std::uint64_t>(i))) ==
+                PublishResult::Accepted);
+    }
+
+    REQUIRE(eventually([&] { return subscriber.counters().frames_received >= 4; }));
+
+    // Four frames queued and nobody armed: the descriptor stays quiet.
+    pollfd pfd{};
+    pfd.fd = subscriber.fd();
+    pfd.events = POLLIN;
+    CHECK(::poll(&pfd, 1, 60) == 0);
+
+    // And the frames are still there -- the descriptor is a notification
+    // sidecar, never the queue itself.
+    std::size_t drained = 0;
+    REQUIRE(eventually([&] {
+        drained += subscriber.poll(20ms, [](FrameView view) { view.reset(); });
+        return drained == 4;
+    }));
 }
 
 TEST_CASE("poll() takes at most max_frames, and withholds only their credit",

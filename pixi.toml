@@ -95,6 +95,38 @@ test-asan = { cmd = "ctest --test-dir build-asan --output-on-failure", depends-o
 ] }
 _build-asan = { cmd = "cmake --build build-asan", depends-on = ["_configure-asan"] }
 
+# ThreadSanitizer.  The transport slot, the two supervisor threads and the
+# wakeup descriptor are all lock-free handshakes, and -Werror has nothing to say
+# about any of them.
+#
+# Two things make this fiddly enough to be worth a task rather than a note.
+#
+# setarch -R is required.  Recent kernels randomise mmap far enough that TSan's
+# shadow mapping collides with a real one, and the failure is a startup abort --
+# "FATAL: ThreadSanitizer: unexpected memory mapping" -- with no hint that ASLR
+# is the cause.  It also means catch_discover_tests cannot enumerate the
+# binaries at build time, so these run the executables directly rather than
+# through ctest.
+#
+# The Tango adapter is off.  The fixture is a separate cppTango process, so it
+# is not the thing under test here, and instrumenting it only adds noise.
+_configure-tsan = { cmd = [
+    "cmake",
+    "$CMAKE_ARGS",
+    "-DCMAKE_CXX_COMPILER=$CXX",
+    "-GNinja",
+    "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+    "-DBUILD_TESTING=ON",
+    "-DTANGO_BULK_SANITIZERS=thread",
+    "-DTANGO_BULK_BUILD_TANGO_ADAPTER=OFF",
+    "-S.",
+    "-Bbuild-tsan",
+] }
+_build-tsan = { cmd = "cmake --build build-tsan --target tango-bulk-ucx-tests tango-bulk-unit-tests", depends-on = [
+    "_configure-tsan",
+] }
+test-tsan = { cmd = "scripts/run_tsan_tests.sh", depends-on = ["_build-tsan"] }
+
 # The layering check is a plain script so CI can run it without configuring or
 # building anything.
 layering = "python3 scripts/check_layering.py"
