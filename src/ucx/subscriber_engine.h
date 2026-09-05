@@ -175,6 +175,18 @@ class SubscriberEngine final : public SubscriberTransport
     /// dispatched.  Which thread that is belongs to the layer above: a test
     /// calls this directly, and `BulkSubscriber` calls it from its dispatch
     /// thread.  Either way it is never the engine thread (5.2).
+    int fd() const noexcept override
+    {
+        return wakeup_fd_;
+    }
+
+    void arm_wakeup() noexcept override
+    {
+        consumer_waiting_.store(true, std::memory_order_release);
+    }
+
+    void drain_wakeup() noexcept override;
+
     std::size_t poll(std::chrono::milliseconds timeout,
                      const FrameCallback &cb,
                      std::size_t max_frames = 0) override;
@@ -282,6 +294,20 @@ class SubscriberEngine final : public SubscriberTransport
 
     void commit(std::size_t slot_index) noexcept;
 
+    /// Signal a consumer that has declared itself about to block.
+    ///
+    /// Engine thread, from the loop rather than from an AM callback -- the same
+    /// routing credit and probe-acks already use, because a callback runs inside
+    /// `ucp_worker_progress` and this writes a descriptor.
+    ///
+    /// Writes only if `consumer_waiting_` was true, so a consumer that is keeping
+    /// up never causes a syscall.
+    void signal_consumer() noexcept;
+
+    /// Block until `deadline`, a frame arrives, or the wait is interrupted.
+    /// Consumer thread. Returns whether it is worth looking at the queue again.
+    bool await_frame(std::chrono::steady_clock::time_point deadline) noexcept;
+
     /// Retire the session, and say why.
     ///
     /// `reason` MUST be a string literal or otherwise outlive the engine: this
@@ -333,6 +359,19 @@ class SubscriberEngine final : public SubscriberTransport
     /// Set by `fail()`, read by `last_error()` on the control thread. A raw
     /// pointer to a literal rather than a string, so the AM callback can set it
     /// without allocating.
+    /// eventfd, or -1 if it could not be created.
+    ///
+    /// A transport without one still works: `await_frame` falls back to the
+    /// short sleep this replaced. Losing the wakeup path is a performance and
+    /// interruptibility regression, not a correctness one, so it must not stop
+    /// a subscriber from opening.
+    int wakeup_fd_{-1};
+
+    /// Set by a consumer immediately before it blocks, cleared by whichever of
+    /// the two gets there first. The engine writes the descriptor only on the
+    /// true-to-false transition, which is what makes the common case free.
+    std::atomic<bool> consumer_waiting_{false};
+
     std::atomic<const char *> failure_reason_{nullptr};
     std::atomic<Status> failure_status_{Status::Ok};
 

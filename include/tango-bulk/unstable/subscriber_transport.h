@@ -73,6 +73,41 @@ class SubscriberTransport
     /// `timeout`; returns how many it dispatched.  Never the engine thread --
     /// that is 5.2's guarantee, and it is structural: the engine holds no
     /// `std::function` at all.
+    /// A descriptor that becomes readable when a frame arrives, or -1 if this
+    /// transport has none.
+    ///
+    /// **It is only signalled while armed**, and that is not an implementation
+    /// detail to be discovered: the engine writes the descriptor only on the
+    /// arm-to-disarmed transition, which is exactly what makes a consumer that
+    /// is keeping up cost zero syscalls. Adding an unarmed descriptor to an
+    /// event loop produces something that never fires.
+    ///
+    /// The protocol, and all three steps are load-bearing:
+    ///
+    ///     transport.arm_wakeup();               // 1. declare the intent
+    ///     if (transport.poll(0ms, cb, 1) == 0)  // 2. re-check: a frame may
+    ///     {                                     //    have landed before (1)
+    ///         ::poll(&pfd, 1, timeout);         // 3. now it is safe to block
+    ///         transport.drain_wakeup();
+    ///     }
+    ///
+    /// Step 2 is what closes the lost-wakeup race. Without it the engine can
+    /// push a frame between the arm and the block, find nobody armed yet, write
+    /// nothing, and leave the consumer asleep with work waiting.
+    ///
+    /// `poll()` does all of this internally; this is for a caller that owns its
+    /// own event loop -- `epoll`, `select`, `loop.add_reader()` -- and needs the
+    /// waiting to happen somewhere else.
+    virtual int fd() const noexcept = 0;
+
+    /// Declare that this consumer is about to wait on `fd()`. Idempotent.
+    /// See `fd()` for why a re-check must follow it.
+    virtual void arm_wakeup() noexcept = 0;
+
+    /// Consume a signal after `fd()` becomes readable, so it does not persist.
+    /// A no-op when there is no descriptor or nothing pending.
+    virtual void drain_wakeup() noexcept = 0;
+
     /// `max_frames` of 0 means "everything queued", which is what this did
     /// before the parameter existed and remains the default.
     ///

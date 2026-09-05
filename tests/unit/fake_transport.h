@@ -182,6 +182,14 @@ class FakeTransport final : public detail::SubscriberTransport
         return 20;
     }
 
+    int fd() const noexcept override
+    {
+        return -1; // no data path, so nothing to wait on
+    }
+
+    void arm_wakeup() noexcept override {}
+    void drain_wakeup() noexcept override {}
+
     std::size_t poll(std::chrono::milliseconds timeout,
                      const FrameCallback &,
                      std::size_t = 0) override

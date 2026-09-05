@@ -35,7 +35,19 @@ target_include_directories(tango-bulk-unit-tests PRIVATE ${PROJECT_SOURCE_DIR}/s
 
 tango_bulk_apply_warnings(tango-bulk-unit-tests)
 
-catch_discover_tests(tango-bulk-unit-tests)
+# Catch2 enumerates test cases by RUNNING the binary at build time. Under
+# ThreadSanitizer that aborts before main -- TSan's shadow mapping collides with
+# a real one unless ASLR is off -- so discovery fails and takes the build with
+# it, for binaries that are otherwise perfectly good. `pixi run test-tsan` runs
+# them directly under setarch -R instead, so nothing is lost by skipping it.
+if(TANGO_BULK_SANITIZERS MATCHES "thread")
+    set(TANGO_BULK_SKIP_TEST_DISCOVERY ON)
+    message(STATUS "  Test discovery  skipped (thread sanitizer; use pixi run test-tsan)")
+endif()
+
+if(NOT TANGO_BULK_SKIP_TEST_DISCOVERY)
+    catch_discover_tests(tango-bulk-unit-tests)
+endif()
 
 # --- tests/ucx: loopback UCX, no Tango process -----------------------------
 
@@ -51,7 +63,9 @@ target_include_directories(tango-bulk-ucx-tests PRIVATE ${PROJECT_SOURCE_DIR}/sr
 
 tango_bulk_apply_warnings(tango-bulk-ucx-tests)
 
-catch_discover_tests(tango-bulk-ucx-tests)
+if(NOT TANGO_BULK_SKIP_TEST_DISCOVERY)
+    catch_discover_tests(tango-bulk-ucx-tests)
+endif()
 
 # --- tests/tango: stock-cppTango device fixture ----------------------------
 
