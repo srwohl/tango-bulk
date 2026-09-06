@@ -130,10 +130,9 @@ const char *to_string(CoordType type) noexcept;
 /// Unknown bits MUST be ignored rather than rejected: that is what lets a minor
 /// version add a capability without breaking an older server.
 inline constexpr std::uint32_t k_caps_credit_coalescing = 1u << 0;
-inline constexpr std::uint32_t k_caps_geometry_rearm = 1u << 1;
+// 1u << 1 was geometry rearm, cut with geometry epochs. Reserved, not reused.
 inline constexpr std::uint32_t k_caps_probe = 1u << 2;
-inline constexpr std::uint32_t k_caps_all = k_caps_credit_coalescing |
-                                            k_caps_geometry_rearm | k_caps_probe;
+inline constexpr std::uint32_t k_caps_all = k_caps_credit_coalescing | k_caps_probe;
 
 enum class Transport : std::uint32_t
 {
@@ -394,8 +393,10 @@ enum class DataType : std::uint16_t
     Credit = 2,
     Probe = 3,
     ProbeAck = 4,
-    Geometry = 5,
-    GeometryAck = 6,
+    // 5 and 6 were Geometry and GeometryAck. RFC 3 and 6.2 cut geometry epochs:
+    // a session contract is fixed at Open and changing it is close-and-reopen.
+    // Reserved rather than reused, so an old peer's message is unknown here
+    // rather than something else.
 };
 
 const char *to_string(DataType type) noexcept;
@@ -411,21 +412,16 @@ inline constexpr unsigned k_am_id_frame = 0;
 inline constexpr unsigned k_am_id_credit = 1;
 inline constexpr unsigned k_am_id_probe = 2;
 inline constexpr unsigned k_am_id_probe_ack = 3;
-inline constexpr unsigned k_am_id_geometry = 4;
-inline constexpr unsigned k_am_id_geometry_ack = 5;
 
 inline constexpr std::size_t k_frame_header_bytes = 160;
 inline constexpr std::size_t k_credit_bytes = 32;
 inline constexpr std::size_t k_probe_bytes = 32;
 inline constexpr std::size_t k_probe_ack_bytes = 32;
-inline constexpr std::size_t k_geometry_bytes = 128;
-inline constexpr std::size_t k_geometry_ack_bytes = 32;
 
 /// The largest data-plane header, which is what the engine must confirm the
 /// transport can carry.  The engine queries ucp_worker_attr_t.max_am_header at
 /// startup and fails construction if it is below this; discovering the limit at
 /// the first frame is not acceptable.
-inline constexpr std::size_t k_max_am_header_bytes = k_frame_header_bytes;
 
 /// Common 16-byte prefix, so an AM callback can classify and version-check
 /// before touching anything type-specific.
@@ -488,29 +484,12 @@ struct ProbeAckMessage
     std::uint64_t probe_token{0}; ///< echoed exactly
 };
 
-struct GeometryMessage
-{
-    std::uint32_t generation{0}; ///< the NEW epoch
-    StreamId stream_id{0};
-    std::uint64_t first_sequence{0}; ///< first seq that will be sent in the new epoch
-    GeometryBlock geometry{};
-};
-
-struct GeometryAckMessage
-{
-    std::uint32_t generation{0}; ///< the armed epoch
-    StreamId stream_id{0};
-    std::uint64_t first_sequence{0}; ///< echoed
-};
-
 /// Data-plane encode is allocation-free by construction: the result is a
 /// fixed-size array returned by value, ready to hand to UCX as an AM header.
 std::array<std::byte, k_frame_header_bytes> encode(const FrameHeader &msg) noexcept;
 std::array<std::byte, k_credit_bytes> encode(const CreditMessage &msg) noexcept;
 std::array<std::byte, k_probe_bytes> encode(const ProbeMessage &msg) noexcept;
 std::array<std::byte, k_probe_ack_bytes> encode(const ProbeAckMessage &msg) noexcept;
-std::array<std::byte, k_geometry_bytes> encode(const GeometryMessage &msg) noexcept;
-std::array<std::byte, k_geometry_ack_bytes> encode(const GeometryAckMessage &msg) noexcept;
 
 /// Data-plane decode runs inside an AM callback: no allocation, no throw, and it
 /// must never read past `size` even when `header_bytes` claims more.
@@ -518,8 +497,6 @@ Status decode(const std::byte *data, std::size_t size, FrameHeader &out) noexcep
 Status decode(const std::byte *data, std::size_t size, CreditMessage &out) noexcept;
 Status decode(const std::byte *data, std::size_t size, ProbeMessage &out) noexcept;
 Status decode(const std::byte *data, std::size_t size, ProbeAckMessage &out) noexcept;
-Status decode(const std::byte *data, std::size_t size, GeometryMessage &out) noexcept;
-Status decode(const std::byte *data, std::size_t size, GeometryAckMessage &out) noexcept;
 
 } // namespace TangoBulk::Protocol
 

@@ -143,13 +143,6 @@ class BulkPublisher
     /// on QueueFull and WouldBlock.  Never blocks, never throws, never allocates.
     PublishResult publish(BulkSource::Lease &&lease, const FrameMetadata &meta) noexcept;
 
-    /// Re-declare geometry.  Opens a new epoch; see IMPLEMENTATION_SPEC.md 4.3
-    /// for the two-phase interlock.  On failure the stream keeps running on the
-    /// old epoch -- a failed re-declaration is never a silent clamp.
-    Status declare_geometry(const FrameMetadata &prototype,
-                            std::uint64_t max_frame_bytes,
-                            std::uint32_t ring_depth);
-
     std::uint32_t generation() const noexcept;
     std::size_t session_count() const noexcept;
     PublisherCounters counters() const noexcept;

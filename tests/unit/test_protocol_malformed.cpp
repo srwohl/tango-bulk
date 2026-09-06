@@ -182,16 +182,6 @@ TEST_CASE("truncation sweep, data plane", "[protocol][malformed]")
                       data_decoder<ProbeMessage>(), "Probe");
     sweep_truncations(to_vector(encode(ProbeAckMessage{1, 2, 3})),
                       data_decoder<ProbeAckMessage>(), "ProbeAck");
-
-    GeometryMessage geom;
-    geom.generation = 3;
-    geom.stream_id = 1;
-    geom.geometry = valid_geometry();
-    sweep_truncations(to_vector(encode(geom)), data_decoder<GeometryMessage>(),
-                      "Geometry");
-
-    sweep_truncations(to_vector(encode(GeometryAckMessage{1, 2, 3})),
-                      data_decoder<GeometryAckMessage>(), "GeometryAck");
 }
 
 TEST_CASE("a null pointer is rejected, not dereferenced", "[protocol][malformed]")
@@ -234,11 +224,6 @@ TEST_CASE("bit-flip sweep, data plane", "[protocol][malformed]")
     sweep_bit_flips(to_vector(encode(CreditMessage{1, 2, 3})),
                     data_decoder<CreditMessage>(), "Credit");
 
-    GeometryMessage geom;
-    geom.generation = 3;
-    geom.stream_id = 1;
-    geom.geometry = valid_geometry();
-    sweep_bit_flips(to_vector(encode(geom)), data_decoder<GeometryMessage>(), "Geometry");
 }
 
 TEST_CASE("a corrupted magic is rejected", "[protocol][malformed]")

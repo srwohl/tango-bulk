@@ -71,7 +71,6 @@ enum class ReconnectPolicy : std::uint32_t
 {
     FailFast = 0,
     BoundedRetry = 1,
-    Manual = 2,
 };
 
 struct SubscriberConfig
