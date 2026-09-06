@@ -260,7 +260,7 @@ TEST_CASE("A client that vanishes releases its slots on the lease, and the strea
 
         // Every view is retained, so 5.5 withholds every credit, so 5.4 retains
         // every producer slot.
-        REQUIRE(eventually([&] { return publisher.source().retained() == k_credit_window; }));
+        REQUIRE(eventually([&] { return publisher.retained() == k_credit_window; }));
 
         // The subscriber is destroyed here with no `Close`: the client crashed.
         // Its views outlive it and its credits will never come back.
@@ -269,7 +269,7 @@ TEST_CASE("A client that vanishes releases its slots on the lease, and the strea
     // Nothing on this side can be asked to release those slots -- there is no
     // peer left to ask.  This is the whole of M3's exit condition: the lease, and
     // only the lease, bounds how long a dead client can hold pinned memory.
-    REQUIRE(eventually([&] { return publisher.source().retained() == 0; }));
+    REQUIRE(eventually([&] { return publisher.retained() == 0; }));
     CHECK(publisher.counters().sessions_expired == 1);
     CHECK(publisher.counters().sessions_closed == 0);
     CHECK(publisher.session_count() == 0);
@@ -325,14 +325,14 @@ TEST_CASE("Two sessions coexist and a slot returns only when both have credited 
 
     // 5.4: retained "until *every* session it was successfully submitted to has
     // credited its sequence".  One release is not enough.
-    CHECK(publisher.source().retained() == 1);
+    CHECK(publisher.retained() == 1);
     a.clear();
     std::this_thread::sleep_for(150ms);
-    CHECK(publisher.source().retained() == 1);
+    CHECK(publisher.retained() == 1);
     CHECK(publisher.counters().frames_credited == 0);
 
     b.clear();
-    REQUIRE(eventually([&] { return publisher.source().retained() == 0; }));
+    REQUIRE(eventually([&] { return publisher.retained() == 0; }));
     CHECK(publisher.counters().frames_credited == 1);
 
     const std::vector<std::byte> close_first = first.make_close_request(11);

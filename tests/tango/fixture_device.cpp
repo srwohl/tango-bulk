@@ -117,7 +117,7 @@ class BulkTestDevice : public TANGO_BASE_CLASS
 
         for(Tango::DevLong i = 0; i < count; ++i)
         {
-            BulkSource::Lease lease = publisher_->source().try_acquire();
+            BulkPublisher::SlotHandle lease = publisher_->try_acquire();
             if(!lease)
             {
                 break;

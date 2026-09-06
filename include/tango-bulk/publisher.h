@@ -62,57 +62,13 @@ struct PublisherConfig
     Status validate() const noexcept;
 };
 
-/// Registered producer ring.
-///
-/// One ucp_mem_map registration covers the whole ring and slots are offsets
-/// into it, so the memory-region count is 1 regardless of depth.
-class BulkSource
+namespace detail
 {
-  public:
-    /// Move-only handle to one producer slot.  Publishing consumes the lease.
-    class Lease
-    {
-      public:
-        Lease() noexcept;
-        Lease(Lease &&) noexcept;
-        Lease &operator=(Lease &&) noexcept;
-        Lease(const Lease &) = delete;
-        Lease &operator=(const Lease &) = delete;
-        ~Lease(); ///< an un-published lease returns the slot
-
-        explicit operator bool() const noexcept;
-        void *data() const noexcept;
-        std::size_t capacity() const noexcept;
-        std::size_t index() const noexcept;
-        MemoryKind memory_kind() const noexcept;
-        void reset() noexcept;
-
-      private:
-        friend class BulkSource;
-        friend class BulkPublisher;
-        struct Impl;
-        std::unique_ptr<Impl> impl_;
-    };
-
-    /// Non-blocking by design: an acquisition thread MUST be able to drop
-    /// rather than wait while slots are retained by a slow or dead consumer.
-    Lease try_acquire() noexcept;
-
-    std::size_t slot_count() const noexcept;
-    std::size_t slot_bytes() const noexcept;  ///< usable payload capacity per slot
-    std::size_t slot_stride() const noexcept; ///< >= slot_bytes; see 6.2
-    std::size_t retained() const noexcept;    ///< slots currently uncredited
-
-    ~BulkSource();
-    BulkSource(const BulkSource &) = delete;
-    BulkSource &operator=(const BulkSource &) = delete;
-
-  private:
-    friend class BulkPublisher;
-    BulkSource();
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
+/// The producer ring, its registration and its free list, defined in
+/// `src/ucx/producer_slots.h`. Forward-declared because that header is internal
+/// and this one is installed: a `shared_ptr` member needs no complete type here.
+class ProducerSlots;
+} // namespace detail
 
 enum class PublishResult : std::uint32_t
 {
@@ -137,11 +93,48 @@ class BulkPublisher
     BulkPublisher(const BulkPublisher &) = delete;
     BulkPublisher &operator=(const BulkPublisher &) = delete;
 
-    BulkSource &source() noexcept;
+    /// An application's exclusive hold on one publisher slot before publication.
+    ///
+    /// It shares ownership of the ring rather than pointing at its publisher, so
+    /// a handle outliving the publisher keeps its storage valid instead of
+    /// dangling (ADR 0003). The share is taken by copying a refcount during
+    /// acquisition, which allocates nothing.
+    class SlotHandle
+    {
+      public:
+        SlotHandle() noexcept;
+        SlotHandle(SlotHandle &&) noexcept;
+        SlotHandle &operator=(SlotHandle &&) noexcept;
+        SlotHandle(const SlotHandle &) = delete;
+        SlotHandle &operator=(const SlotHandle &) = delete;
+        ~SlotHandle(); ///< an unpublished handle returns the slot
 
-    /// Consumes the lease on Accepted; leaves it engaged in the caller's hands
+        explicit operator bool() const noexcept;
+        void *data() const noexcept;
+        std::size_t capacity() const noexcept;
+        std::size_t index() const noexcept;
+        MemoryKind memory_kind() const noexcept;
+        void reset() noexcept;
+
+      private:
+        friend class BulkPublisher;
+
+        std::shared_ptr<detail::ProducerSlots> slots_;
+        std::byte *data_{nullptr};
+        std::size_t capacity_{0};
+        std::uint32_t index_{0};
+    };
+
+    /// Non-blocking by design: an acquisition thread MUST be able to drop rather
+    /// than wait while slots are retained by a slow or dead consumer.
+    SlotHandle try_acquire() noexcept;
+
+    std::size_t slot_bytes() const noexcept; ///< usable payload capacity per slot
+    std::size_t retained() const noexcept;   ///< slots currently held or in flight
+
+    /// Consumes the handle on Accepted; leaves it engaged in the caller's hands
     /// on QueueFull and WouldBlock.  Never blocks, never throws, never allocates.
-    PublishResult publish(BulkSource::Lease &&lease, const FrameMetadata &meta) noexcept;
+    PublishResult publish(SlotHandle &&handle, const FrameMetadata &meta) noexcept;
 
     std::uint32_t generation() const noexcept;
     std::size_t session_count() const noexcept;

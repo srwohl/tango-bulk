@@ -156,7 +156,7 @@ class PreviewDetector : public TANGO_BASE_CLASS
 
         while(acquiring_)
         {
-            BulkSource::Lease lease = publisher_->source().try_acquire();
+            BulkPublisher::SlotHandle lease = publisher_->try_acquire();
             if(!lease)
             {
                 std::this_thread::sleep_for(1ms);

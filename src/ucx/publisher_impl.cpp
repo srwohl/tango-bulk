@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include <ucx/locality.h>
+#include <ucx/producer_slots.h>
 #include <ucx/registered_ring.h>
 #include <ucx/ucx_context.h>
 
 #include <core/bounded_queue.h>
 #include <core/cpu_topology.h>
 #include <core/credit_window.h>
-#include <core/lease_pool.h>
 
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/publisher.h>
@@ -49,26 +49,11 @@ using detail::BoundedQueue;
 using detail::CreditWindow;
 using detail::Locality;
 using detail::observe;
-using detail::LeasePool;
+using detail::ProducerSlots;
 using detail::RegisteredRing;
 using detail::UcxContext;
 using detail::UcxWorker;
 using Protocol::SessionState;
-
-/// Blocks for `Lease::Impl`, so `try_acquire()` does not malloc.
-///
-/// 2.3 fixes `Lease` as a pimpl over `std::unique_ptr<Impl>` and 2.1 forbids the
-/// data path from allocating.  A class-level `operator new` is the language's
-/// answer to exactly that: the declared type stays what the spec says it is, and
-/// the storage comes from somewhere bounded.
-///
-/// Sized for many rings at the maximum depth; the fallback to the global
-/// allocator is a safety net that is counted, not a design assumption.
-LeasePool &lease_impl_pool()
-{
-    static LeasePool pool{4096};
-    return pool;
-}
 
 std::uint64_t now_realtime_ns() noexcept
 {
@@ -112,7 +97,6 @@ struct AtomicPublisherCounters
     std::atomic<std::uint64_t> dropped_credit_stalled{0};
     std::atomic<std::uint64_t> dropped_bad_metadata{0};
     std::atomic<std::uint64_t> acquire_failed{0};
-    std::atomic<std::uint64_t> leases_retained{0};
     std::atomic<std::uint64_t> credits_outstanding{0};
     std::atomic<std::uint64_t> publish_queue_depth{0};
     std::atomic<std::uint64_t> publish_queue_high_water{0};
@@ -148,180 +132,84 @@ void await_request(ucp_worker_h worker, void *request) noexcept
 } // namespace
 
 // ---------------------------------------------------------------------------
-// BulkSource
+// BulkPublisher::SlotHandle
 // ---------------------------------------------------------------------------
 
-struct BulkSource::Lease::Impl
+BulkPublisher::SlotHandle::SlotHandle() noexcept = default;
+
+BulkPublisher::SlotHandle::SlotHandle(SlotHandle &&other) noexcept :
+    slots_(std::move(other.slots_)),
+    data_(other.data_),
+    capacity_(other.capacity_),
+    index_(other.index_)
 {
-    static void *operator new(std::size_t bytes)
-    {
-        if(void *p = lease_impl_pool().allocate(bytes))
-        {
-            return p;
-        }
-        return ::operator new(bytes);
-    }
+    other.data_ = nullptr;
+    other.capacity_ = 0;
+    other.index_ = 0;
+}
 
-    static void operator delete(void *p) noexcept
-    {
-        if(lease_impl_pool().owns(p))
-        {
-            lease_impl_pool().deallocate(p);
-            return;
-        }
-        ::operator delete(p);
-    }
-
-    BulkSource::Impl *owner{nullptr};
-    std::size_t index{0};
-    std::byte *data{nullptr};
-    std::size_t capacity{0};
-};
-
-struct BulkSource::Impl
-{
-    Impl(RegisteredRing &ring_in, AtomicPublisherCounters &counters_in) :
-        ring(&ring_in),
-        counters(&counters_in),
-        free_slots(ring_in.depth())
-    {
-        for(std::size_t i = 0; i < ring_in.depth(); ++i)
-        {
-            auto index = static_cast<std::uint32_t>(i);
-            free_slots.try_push(std::move(index));
-        }
-    }
-
-    /// Return a slot to the free list.
-    ///
-    /// Called from three places, and it matters which: an unpublished lease
-    /// being destroyed, a publish() that dropped the frame, and the engine
-    /// dropping the last session reference to a slot.  All three are the same
-    /// operation, and 5.4 is the rule about *when* each is allowed to happen --
-    /// not about doing anything different once it does.
-    void release(std::size_t index) noexcept
-    {
-        auto value = static_cast<std::uint32_t>(index);
-        const bool pushed = free_slots.try_push(std::move(value));
-        // The free list is exactly ring_depth deep and a slot is in it or in a
-        // lease, never both.  A failure here means a slot was released twice,
-        // which would go on to corrupt a frame in flight.
-        (void) pushed;
-        assert(pushed);
-        retained.fetch_sub(1, std::memory_order_relaxed);
-        counters->leases_retained.store(retained.load(std::memory_order_relaxed),
-                                        std::memory_order_relaxed);
-    }
-
-    RegisteredRing *ring{nullptr};
-    AtomicPublisherCounters *counters{nullptr};
-    BoundedQueue<std::uint32_t> free_slots;
-    std::atomic<std::uint64_t> retained{0};
-};
-
-BulkSource::BulkSource() = default;
-BulkSource::~BulkSource() = default;
-
-BulkSource::Lease::Lease() noexcept = default;
-BulkSource::Lease::Lease(Lease &&) noexcept = default;
-BulkSource::Lease &BulkSource::Lease::operator=(Lease &&other) noexcept
+BulkPublisher::SlotHandle &BulkPublisher::SlotHandle::operator=(SlotHandle &&other) noexcept
 {
     if(this != &other)
     {
         reset();
-        impl_ = std::move(other.impl_);
+        slots_ = std::move(other.slots_);
+        data_ = other.data_;
+        capacity_ = other.capacity_;
+        index_ = other.index_;
+        other.data_ = nullptr;
+        other.capacity_ = 0;
+        other.index_ = 0;
     }
     return *this;
 }
 
-BulkSource::Lease::~Lease()
+BulkPublisher::SlotHandle::~SlotHandle()
 {
     reset();
 }
 
-void BulkSource::Lease::reset() noexcept
+void BulkPublisher::SlotHandle::reset() noexcept
 {
-    // 5.4: "A lease that is destroyed without being published returns its slot
-    // immediately."  Publishing moves the Impl out, so by the time this runs on
-    // a published lease there is nothing left to return.
-    if(impl_ && impl_->owner != nullptr)
+    // 5.4: a handle destroyed without being published returns its slot
+    // immediately. Publishing moves the storage reference out, so by then there
+    // is nothing left to return.
+    if(slots_)
     {
-        impl_->owner->release(impl_->index);
+        slots_->release(index_);
+        slots_.reset();
     }
-    impl_.reset();
+
+    data_ = nullptr;
+    capacity_ = 0;
+    index_ = 0;
 }
 
-BulkSource::Lease::operator bool() const noexcept
+BulkPublisher::SlotHandle::operator bool() const noexcept
 {
-    return impl_ != nullptr;
+    return static_cast<bool>(slots_);
 }
 
-void *BulkSource::Lease::data() const noexcept
+void *BulkPublisher::SlotHandle::data() const noexcept
 {
-    return impl_ ? static_cast<void *>(impl_->data) : nullptr;
+    return data_;
 }
 
-std::size_t BulkSource::Lease::capacity() const noexcept
+std::size_t BulkPublisher::SlotHandle::capacity() const noexcept
 {
-    return impl_ ? impl_->capacity : 0;
+    return capacity_;
 }
 
-std::size_t BulkSource::Lease::index() const noexcept
+std::size_t BulkPublisher::SlotHandle::index() const noexcept
 {
-    return impl_ ? impl_->index : 0;
+    return index_;
 }
 
-MemoryKind BulkSource::Lease::memory_kind() const noexcept
+MemoryKind BulkPublisher::SlotHandle::memory_kind() const noexcept
 {
-    // Host only in the MVP.  Cuda/Rocm are in the protocol so the field does not
+    // Host only in the MVP. Cuda/Rocm are in the protocol so the field does not
     // have to be retrofitted later (spec section 10), not because they work.
     return MemoryKind::Host;
-}
-
-BulkSource::Lease BulkSource::try_acquire() noexcept
-{
-    Lease lease;
-
-    std::uint32_t index = 0;
-    if(!impl_->free_slots.try_pop(index))
-    {
-        // 5.3: never blocks.  An acquisition thread must be able to drop rather
-        // than wait while slots are retained by a slow or dead consumer -- a
-        // detector does not stop producing because a client stopped reading.
-        impl_->counters->acquire_failed.fetch_add(1, std::memory_order_relaxed);
-        return lease;
-    }
-
-    lease.impl_ = std::unique_ptr<Lease::Impl>(new Lease::Impl);
-    lease.impl_->owner = impl_.get();
-    lease.impl_->index = index;
-    lease.impl_->data = impl_->ring->slot(index);
-    lease.impl_->capacity = impl_->ring->slot_bytes();
-
-    const std::uint64_t held = impl_->retained.fetch_add(1, std::memory_order_relaxed) + 1;
-    impl_->counters->leases_retained.store(held, std::memory_order_relaxed);
-
-    return lease;
-}
-
-std::size_t BulkSource::slot_count() const noexcept
-{
-    return impl_->ring->depth();
-}
-
-std::size_t BulkSource::slot_bytes() const noexcept
-{
-    return impl_->ring->slot_bytes();
-}
-
-std::size_t BulkSource::slot_stride() const noexcept
-{
-    return impl_->ring->stride();
-}
-
-std::size_t BulkSource::retained() const noexcept
-{
-    return static_cast<std::size_t>(impl_->retained.load(std::memory_order_relaxed));
 }
 
 // ---------------------------------------------------------------------------
@@ -433,19 +321,17 @@ struct BulkPublisher::Impl
 
     explicit Impl(PublisherConfig cfg) :
         config(std::move(cfg)),
-        context(config.ucx_tls),
-        worker(std::make_unique<UcxWorker>(context)),
-        ring(context,
-             config.max_frame_bytes,
-             config.ring_depth,
-             config.pad_slot_stride,
-             config.pinned_memory_limit_bytes),
+        context(std::make_shared<UcxContext>(config.ucx_tls)),
+        worker(std::make_unique<UcxWorker>(*context)),
+        slots(std::make_shared<ProducerSlots>(context,
+                                              config.max_frame_bytes,
+                                              config.ring_depth,
+                                              config.pad_slot_stride,
+                                              config.pinned_memory_limit_bytes)),
         publish_queue(config.publish_queue_depth),
         slot_refs(config.ring_depth, 0)
     {
-        counters.pinned_bytes.store(ring.mapped_bytes(), std::memory_order_relaxed);
-
-        source.impl_ = std::make_unique<BulkSource::Impl>(ring, counters);
+        counters.pinned_bytes.store(slots->ring().mapped_bytes(), std::memory_order_relaxed);
 
         // 6.1 bounds sessions per publisher, so the table is allocated once here
         // and never grows.  `unique_ptr` because a Session holds atomics and so
@@ -764,7 +650,7 @@ struct BulkPublisher::Impl
         // never assigned a sequence, so an uncreditable hole in the window is
         // impossible rather than merely unlikely.
         const std::uint64_t sequence = session.window.next_sequence();
-        const auto index = static_cast<std::size_t>(sequence % ring.depth());
+        const auto index = static_cast<std::size_t>(sequence % slots->ring().depth());
 
         InFlight &slot = session.inflight[index];
         Protocol::FrameHeader header = item.header;
@@ -796,7 +682,7 @@ struct BulkPublisher::Impl
                                         Protocol::k_am_id_frame,
                                         slot.header.data(),
                                         slot.header.size(),
-                                        ring.slot(item.slot_index),
+                                        slots->ring().slot(item.slot_index),
                                         static_cast<std::size_t>(item.payload_bytes),
                                         &param);
 
@@ -850,7 +736,7 @@ struct BulkPublisher::Impl
         assert(slot_refs[slot_index] > 0);
         if(--slot_refs[slot_index] == 0)
         {
-            source.impl_->release(slot_index);
+            slots->release(slot_index);
         }
     }
 
@@ -949,7 +835,7 @@ struct BulkPublisher::Impl
 
         for(std::uint64_t seq = first; seq < first + outcome.released; ++seq)
         {
-            const InFlight &slot = session->inflight[static_cast<std::size_t>(seq % ring.depth())];
+            const InFlight &slot = session->inflight[static_cast<std::size_t>(seq % slots->ring().depth())];
             const std::size_t slot_index = slot.slot_index;
             const bool last = slot_refs[slot_index] == 1;
             release_slot_ref(slot_index);
@@ -1018,7 +904,7 @@ struct BulkPublisher::Impl
             // Armed is the first moment the endpoint has settled on a transport
             // and device, so it is the earliest this can be asked.  On the engine
             // thread, which is the only thread whose CPU is worth sampling.
-            locality = observe(session->ep, ring.memory().base());
+            locality = observe(session->ep, slots->ring().memory().base());
             detail::report(locality, "publisher");
         }
     }
@@ -1054,7 +940,7 @@ struct BulkPublisher::Impl
                     ? session.processed_ordinal
                     : session
                           .inflight[static_cast<std::size_t>(session.window.credited_end() %
-                                                             ring.depth())]
+                                                             slots->ring().depth())]
                           .ordinal;
             best = std::max(best, retired);
             worst = std::min(worst, retired);
@@ -1197,7 +1083,7 @@ struct BulkPublisher::Impl
         const std::uint64_t to = session.window.next_sequence();
         for(std::uint64_t seq = from; seq < to; ++seq)
         {
-            const InFlight &slot = session.inflight[static_cast<std::size_t>(seq % ring.depth())];
+            const InFlight &slot = session.inflight[static_cast<std::size_t>(seq % slots->ring().depth())];
             release_slot_ref(slot.slot_index);
         }
 
@@ -1332,13 +1218,15 @@ struct BulkPublisher::Impl
     }
 
     PublisherConfig config;
-    UcxContext context;
+    std::shared_ptr<UcxContext> context;
 
     /// By pointer so ~Impl can destroy it before any other member.
     std::unique_ptr<UcxWorker> worker;
-    RegisteredRing ring;
 
-    BulkSource source;
+    /// The registered ring and its free list, shared with every outstanding
+    /// SlotHandle so one can outlive this publisher (ADR 0003).
+    std::shared_ptr<ProducerSlots> slots;
+
     BoundedQueue<PublishItem> publish_queue;
 
     /// How many sessions still owe a credit for each producer slot.  Engine
@@ -1421,14 +1309,43 @@ BulkPublisher::~BulkPublisher() = default;
 BulkPublisher::BulkPublisher(BulkPublisher &&) noexcept = default;
 BulkPublisher &BulkPublisher::operator=(BulkPublisher &&) noexcept = default;
 
-BulkSource &BulkPublisher::source() noexcept
+BulkPublisher::SlotHandle BulkPublisher::try_acquire() noexcept
 {
-    return impl_->source;
+    SlotHandle handle;
+
+    std::uint32_t index = 0;
+    if(!impl_->slots->try_acquire(index))
+    {
+        // 5.3: never blocks. An acquisition thread must be able to drop rather
+        // than wait while slots are retained by a slow or dead consumer -- a
+        // detector does not stop producing because a client stopped reading.
+        impl_->counters.acquire_failed.fetch_add(1, std::memory_order_relaxed);
+        return handle;
+    }
+
+    // A refcount increment, not an allocation: the storage was mapped at
+    // construction and this handle only takes a share of it.
+    handle.slots_ = impl_->slots;
+    handle.index_ = index;
+    handle.data_ = impl_->slots->ring().slot(index);
+    handle.capacity_ = impl_->slots->ring().slot_bytes();
+
+    return handle;
 }
 
-PublishResult BulkPublisher::publish(BulkSource::Lease &&lease, const FrameMetadata &meta) noexcept
+std::size_t BulkPublisher::slot_bytes() const noexcept
 {
-    // Every early return below either consumes the lease deliberately or leaves
+    return impl_->slots->ring().slot_bytes();
+}
+
+std::size_t BulkPublisher::retained() const noexcept
+{
+    return static_cast<std::size_t>(impl_->slots->retained());
+}
+
+PublishResult BulkPublisher::publish(SlotHandle &&lease, const FrameMetadata &meta) noexcept
+{
+    // Every early return below either consumes the handle deliberately or leaves
     // it with the caller; 5.4 spells out which is which, and QueueFull is the
     // only one that gives it back.
     if(!lease)
@@ -1526,10 +1443,10 @@ PublishResult BulkPublisher::publish(BulkSource::Lease &&lease, const FrameMetad
         return PublishResult::QueueFull;
     }
 
-    // Past this point the publisher owns the slot.  Releasing the lease's Impl
-    // without returning the slot is what transfers it.
+    // Past this point the publisher owns the slot. Dropping the handle's share
+    // of the storage *without* releasing the slot is what transfers it.
     impl_->admitted.fetch_add(1, std::memory_order_release);
-    lease.impl_->owner = nullptr;
+    lease.slots_.reset();
     lease.reset();
 
     const std::size_t depth = impl_->publish_queue.size();
@@ -1569,7 +1486,11 @@ PublisherCounters BulkPublisher::counters() const noexcept
     out.dropped_credit_stalled = c.dropped_credit_stalled.load(std::memory_order_relaxed);
     out.dropped_bad_metadata = c.dropped_bad_metadata.load(std::memory_order_relaxed);
     out.acquire_failed = c.acquire_failed.load(std::memory_order_relaxed);
-    out.leases_retained = c.leases_retained.load(std::memory_order_relaxed);
+    // Read from the free list's own accounting rather than mirrored into a
+    // counter on every acquire and release. It was stored three ways at once --
+    // here, in the slot storage, and implicitly in the free list's depth -- and
+    // the mirror is what went stale when the release path stopped updating it.
+    out.leases_retained = impl_->slots->retained();
     out.credits_outstanding = c.credits_outstanding.load(std::memory_order_relaxed);
     out.publish_queue_depth = c.publish_queue_depth.load(std::memory_order_relaxed);
     out.publish_queue_high_water = c.publish_queue_high_water.load(std::memory_order_relaxed);
@@ -1965,7 +1886,7 @@ std::vector<std::byte> BulkPublisher::Impl::handle_query(const std::byte *data,
     add("dropped_credit_stalled", c.dropped_credit_stalled.load(std::memory_order_relaxed));
     add("dropped_bad_metadata", c.dropped_bad_metadata.load(std::memory_order_relaxed));
     add("acquire_failed", c.acquire_failed.load(std::memory_order_relaxed));
-    add("leases_retained", c.leases_retained.load(std::memory_order_relaxed));
+    add("leases_retained", slots->retained());
     add("credits_outstanding", c.credits_outstanding.load(std::memory_order_relaxed));
     add("publish_queue_depth", c.publish_queue_depth.load(std::memory_order_relaxed));
     add("publish_queue_high_water", c.publish_queue_high_water.load(std::memory_order_relaxed));

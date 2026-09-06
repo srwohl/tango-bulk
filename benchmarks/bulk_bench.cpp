@@ -287,10 +287,10 @@ int run_publisher(const Options &options)
         // never touches a payload again. This is both the only way to get a rate
         // with no pattern generation in it, and the closer analogue of a detector
         // whose DMA engine put the frame there.
-        std::vector<BulkSource::Lease> all;
+        std::vector<BulkPublisher::SlotHandle> all;
         for(std::uint32_t i = 0; i < options.ring_depth; ++i)
         {
-            BulkSource::Lease lease = publisher.source().try_acquire();
+            BulkPublisher::SlotHandle lease = publisher.try_acquire();
             if(!lease)
             {
                 fail("could not acquire every slot to pre-fill it");
@@ -325,7 +325,7 @@ int run_publisher(const Options &options)
             std::this_thread::yield();
         }
 
-        BulkSource::Lease lease = publisher.source().try_acquire();
+        BulkPublisher::SlotHandle lease = publisher.try_acquire();
         if(!lease)
         {
             // 5.3: try_acquire never blocks. Every slot is retained by a frame
