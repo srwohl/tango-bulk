@@ -2,17 +2,15 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#ifndef TANGO_BULK_UNSTABLE_SUBSCRIBER_TRANSPORT_H
-#define TANGO_BULK_UNSTABLE_SUBSCRIBER_TRANSPORT_H
+#ifndef TANGO_BULK_SRC_CORE_SUBSCRIBER_TRANSPORT_H
+#define TANGO_BULK_SRC_CORE_SUBSCRIBER_TRANSPORT_H
 
 #include <tango-bulk/counters.h>
 #include <tango-bulk/errors.h>
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/subscriber.h>
 
-#include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -49,4 +47,4 @@ std::unique_ptr<SubscriberTransport> make_subscriber_transport(
 
 } // namespace TangoBulk::detail
 
-#endif // TANGO_BULK_UNSTABLE_SUBSCRIBER_TRANSPORT_H
+#endif // TANGO_BULK_SRC_CORE_SUBSCRIBER_TRANSPORT_H

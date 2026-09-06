@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include <tango-bulk/subscription.h>
+#include <core/subscription_internal.h>
 
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/tango.h>
@@ -172,7 +172,7 @@ std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
 {
     const auto adapter = std::make_shared<CommandChannel>(proxy, names, config.command_timeout_ms);
 
-    return open_subscription(
+    return detail::SubscriptionFactory::open_default(
         std::move(config),
         [adapter](Protocol::CoordType kind, const std::vector<std::byte> &request)
         { return adapter->command(kind, request); },

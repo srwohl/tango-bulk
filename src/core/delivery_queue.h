@@ -38,6 +38,10 @@ class DeliveryQueue
 
     bool push(FrameView frame) noexcept;
 
+    /// Wake an armed consumer after the engine has completed its progress
+    /// callback.  The producer path never writes the descriptor itself.
+    void notify() noexcept;
+
     bool try_take(FrameView &out) noexcept;
 
     bool take(FrameView &out, std::chrono::steady_clock::time_point deadline) noexcept;

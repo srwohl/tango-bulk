@@ -196,17 +196,6 @@ std::size_t BulkPublisher::SlotHandle::capacity() const noexcept
     return capacity_;
 }
 
-std::size_t BulkPublisher::SlotHandle::index() const noexcept
-{
-    return index_;
-}
-
-MemoryKind BulkPublisher::SlotHandle::memory_kind() const noexcept
-{
-    // have to be retrofitted later (spec section 10), not because they work.
-    return MemoryKind::Host;
-}
-
 // ---------------------------------------------------------------------------
 // BulkPublisher
 // ---------------------------------------------------------------------------
@@ -1242,6 +1231,7 @@ struct BulkPublisher::Impl
     std::atomic<std::uint64_t> all_active_admission_limit{
         std::numeric_limits<std::uint64_t>::max()};
     std::atomic<std::uint64_t> dropped_before_all{0};
+    std::atomic_flag publish_reservation = ATOMIC_FLAG_INIT;
 
     /// Sessions a frame could go to.  A gauge rather than a walk of the table,
     /// because publish() reads it once per frame on an application thread.
@@ -1321,16 +1311,6 @@ BulkPublisher::SlotHandle BulkPublisher::try_acquire() noexcept
     return handle;
 }
 
-std::size_t BulkPublisher::slot_bytes() const noexcept
-{
-    return impl_->slots->ring().slot_bytes();
-}
-
-std::size_t BulkPublisher::retained() const noexcept
-{
-    return static_cast<std::size_t>(impl_->slots->retained());
-}
-
 PublishResult BulkPublisher::publish(SlotHandle &&lease, const FrameMetadata &meta) noexcept
 {
     // it with the caller; 5.4 spells out which is which, and QueueFull is the
@@ -1373,6 +1353,25 @@ PublishResult BulkPublisher::publish(SlotHandle &&lease, const FrameMetadata &me
         return PublishResult::NoSession;
     }
 
+    // Queue reservation and ordinal assignment are one linearization point.
+    // A try-lock keeps publish nonblocking while preventing two application
+    // threads from assigning the same ordinal or observing the same admission
+    // headroom.
+    if(impl_->publish_reservation.test_and_set(std::memory_order_acquire))
+    {
+        impl_->counters.dropped_queue_full.fetch_add(1, std::memory_order_relaxed);
+        return PublishResult::QueueFull;
+    }
+
+    struct ReservationGuard
+    {
+        std::atomic_flag &flag;
+        ~ReservationGuard()
+        {
+            flag.clear(std::memory_order_release);
+        }
+    } reservation_guard{impl_->publish_reservation};
+
     const std::uint64_t admitted = impl_->admitted.load(std::memory_order_acquire);
     const std::uint64_t credited = impl_->credited.load(std::memory_order_acquire);
     if(impl_->config.fanout_mode == FanoutMode::AllActive &&
@@ -1393,7 +1392,7 @@ PublishResult BulkPublisher::publish(SlotHandle &&lease, const FrameMetadata &me
     }
 
     Impl::PublishItem item;
-    item.slot_index = lease.index();
+    item.slot_index = lease.index_;
     item.payload_bytes = resolved.payload_bytes;
     item.header.generation = impl_->generation;
     item.header.payload_bytes = resolved.payload_bytes;

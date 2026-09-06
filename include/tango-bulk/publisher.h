@@ -19,9 +19,6 @@
 namespace TangoBulk
 {
 
-// DropPolicy is declared in <tango-bulk/frame.h>, which this header includes.
-// See the note there for why it does not live here.
-
 /// How a publisher treats an armed subscriber that has exhausted its credit.
 enum class FanoutMode : std::uint32_t
 {
@@ -54,7 +51,6 @@ struct PublisherConfig
     /// See docs/EXTRACTION.md.
     std::uint32_t max_renewals_per_ttl{10};
     std::uint64_t pinned_memory_limit_bytes{1ull << 30};
-    DropPolicy drop_policy{DropPolicy::DropNewest};
     std::string ucx_tls;           ///< empty => let UCX choose; tests pin
     int engine_cpu_affinity{-1};   ///< -1 => unpinned
     bool pad_slot_stride{true};    ///< see IMPLEMENTATION_SPEC.md 6.2
@@ -103,8 +99,6 @@ class BulkPublisher
         explicit operator bool() const noexcept;
         void *data() const noexcept;
         std::size_t capacity() const noexcept;
-        std::size_t index() const noexcept;
-        MemoryKind memory_kind() const noexcept;
         void reset() noexcept;
 
       private:
@@ -117,9 +111,6 @@ class BulkPublisher
     };
 
     SlotHandle try_acquire() noexcept;
-
-    std::size_t slot_bytes() const noexcept; ///< usable payload capacity per slot
-    std::size_t retained() const noexcept;   ///< slots currently held or in flight
 
     /// on QueueFull and WouldBlock.  Never blocks, never throws, never allocates.
     PublishResult publish(SlotHandle &&handle, const FrameMetadata &meta) noexcept;

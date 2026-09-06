@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include <core/receive_slot.h>
+#include <core/frame_fields.h>
 
 #include <tango-bulk/frame.h>
 
@@ -17,13 +18,13 @@ namespace
 /// returns one when there is nothing to deliver -- so every accessor has to
 /// answer something.  Zeroes throughout, and `operator bool` is the way to tell
 /// the two cases apart.
-const FrameView::Fields &empty_fields() noexcept
+const detail::FrameFields &empty_fields() noexcept
 {
-    static const FrameView::Fields k_empty{};
+    static const detail::FrameFields k_empty{};
     return k_empty;
 }
 
-/// The credit sink behind FrameView::detached(): it owns the description and
+/// The credit sink behind DetachedFrameFactory: it owns the description and
 /// throws the credit away.
 ///
 /// A detached view could have been given a null lease instead, which would have
@@ -41,7 +42,7 @@ class DetachedSink final : public detail::CreditSink
 {
   public:
     DetachedSink(std::shared_ptr<const void> owner,
-                 const FrameView::Fields &fields) :
+                 const detail::FrameFields &fields) :
         owner_(std::move(owner)),
         fields_(fields)
     {
@@ -52,43 +53,48 @@ class DetachedSink final : public detail::CreditSink
         // There is no slot and no engine. Deliberately empty.
     }
 
-    const FrameView::Fields *fields() const noexcept
+    const detail::FrameFields *fields() const noexcept
     {
         return &fields_;
     }
 
   private:
     std::shared_ptr<const void> owner_;
-    FrameView::Fields fields_;
+    detail::FrameFields fields_;
 };
 
 } // namespace
 
 FrameView::FrameView(std::shared_ptr<detail::ReceiveSlotLease> lease,
                      const std::byte *data,
-                     const Fields *fields) noexcept :
+                     const detail::FrameFields *fields) noexcept :
     lease_(std::move(lease)),
     data_(data),
     fields_(fields)
 {
 }
 
-FrameView FrameView::detached(std::shared_ptr<const void> owner,
-                              const std::byte *data,
-                              const Fields &fields)
+namespace detail
+{
+
+FrameView DetachedFrameFactory::make(std::shared_ptr<const void> owner,
+                                     const std::byte *data,
+                                     const FrameFields &fields)
 {
     auto sink = std::make_shared<DetachedSink>(std::move(owner), fields);
 
     // The Fields pointer must outlive every copy of the view, so it is taken
     // from the sink -- which the lease owns and the view holds -- and never
     // from the caller's argument.
-    const Fields *stored = sink->fields();
+    const detail::FrameFields *stored = sink->fields();
 
     auto lease = std::make_shared<detail::ReceiveSlotLease>(std::move(sink),
                                                             fields.sequence);
 
     return FrameView(std::move(lease), data, stored);
 }
+
+} // namespace detail
 
 FrameView::operator bool() const noexcept
 {
@@ -218,7 +224,7 @@ ReceiveSlotLease::~ReceiveSlotLease()
 
 FrameView ReceiveSlotLease::make_view(std::shared_ptr<ReceiveSlotLease> lease,
                                       const std::byte *data,
-                                      const FrameView::Fields *fields) noexcept
+                                      const FrameFields *fields) noexcept
 {
     return FrameView(std::move(lease), data, fields);
 }

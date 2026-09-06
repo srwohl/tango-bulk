@@ -1423,15 +1423,6 @@ int main(int argc, char *argv[])
                 block.reserve(options.frames_per_block);
             }
         };
-        callbacks.on_state =
-            [](TangoBulk::SubscriberState state, const TangoBulk::BulkError &error) {
-                std::cout << "state: " << TangoBulk::to_string(state);
-                if(error.status != TangoBulk::Status::Ok)
-                    std::cout << " (" << TangoBulk::to_string(error.status) << ": " << error.message
-                              << ")";
-                std::cout << std::endl;
-            };
-
         auto subscription =
             TangoBulk::subscribe(proxy, config, std::move(callbacks));
         const auto acquisition_started = std::chrono::steady_clock::now();
@@ -1439,7 +1430,7 @@ int main(int argc, char *argv[])
         std::uint64_t progress_bytes = 0;
         while(running.load() && received < options.frames)
         {
-            subscription->poll(std::chrono::milliseconds{50});
+            subscription->poll(std::chrono::milliseconds{50}, 8);
             const auto now = std::chrono::steady_clock::now();
             const double interval_seconds =
                 std::chrono::duration<double>(now - progress_at).count();

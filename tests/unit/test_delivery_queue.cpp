@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include <core/delivery_queue.h>
+#include <core/frame_fields.h>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -23,7 +24,7 @@ using namespace std::chrono_literals;
 FrameView frame_over(const std::shared_ptr<std::vector<std::uint16_t>> &payload,
                      std::uint64_t sequence)
 {
-    FrameView::Fields fields;
+    detail::FrameFields fields;
     fields.element_type = ElementType::UInt16;
     fields.element_size = 2;
     fields.rank = 1;
@@ -32,7 +33,7 @@ FrameView frame_over(const std::shared_ptr<std::vector<std::uint16_t>> &payload,
     fields.payload_bytes = payload->size() * sizeof(std::uint16_t);
     fields.sequence = sequence;
 
-    return FrameView::detached(
+    return detail::DetachedFrameFactory::make(
         payload, reinterpret_cast<const std::byte *>(payload->data()), fields);
 }
 
@@ -215,6 +216,7 @@ TEST_CASE("take() returns as soon as a producer pushes and notifies",
     std::thread producer([&queue] {
         std::this_thread::sleep_for(20ms);
         queue.push(frame_over(storage(7), 7));
+        queue.notify();
     });
 
     const auto started = std::chrono::steady_clock::now();
@@ -295,6 +297,7 @@ TEST_CASE("an empty try_take() arms, so the next notify() is seen",
     CHECK_FALSE(readable(queue.fd()));
 
     CHECK(queue.push(frame_over(storage(5), 5)));
+    queue.notify();
 
     CHECK(readable(queue.fd()));
     REQUIRE(queue.try_take(frame));

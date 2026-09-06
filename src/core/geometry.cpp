@@ -5,6 +5,7 @@
 #include <tango-bulk/frame.h>
 #include <tango-bulk/limits.h>
 #include <tango-bulk/protocol.h>
+#include <tango-bulk/geometry.h>
 
 #include "core/byte_order.h"
 #include "core/geometry_rules.h"
@@ -116,6 +117,82 @@ Status validate_element_size(ElementType type, std::uint32_t element_size) noexc
 
 } // namespace detail
 
+Status Geometry::validate() const noexcept
+{
+    Protocol::GeometryBlock wire;
+    wire.generation = generation;
+    wire.element_type = element_type;
+    wire.element_size = element_size;
+    wire.rank = rank;
+    wire.max_frame_bytes = max_frame_bytes;
+    wire.ring_depth = ring_depth;
+    wire.credit_window = credit_window;
+    wire.shape = shape;
+    wire.strides = strides;
+    return wire.validate();
+}
+
+std::uint64_t Geometry::reachable_span() const noexcept
+{
+    if(validate() != Status::Ok)
+    {
+        return 0;
+    }
+
+    bool empty = false;
+    for(std::uint32_t i = 0; i < rank; ++i)
+    {
+        if(shape[i] == 0)
+        {
+            empty = true;
+            break;
+        }
+    }
+
+    if(empty)
+    {
+        return 0;
+    }
+
+    std::uint64_t span = element_size;
+    for(std::uint32_t i = 0; i < rank; ++i)
+    {
+        const std::uint64_t reach = (shape[i] - 1) * strides[i];
+        if(span > UINT64_MAX - reach)
+        {
+            return 0;
+        }
+        span += reach;
+    }
+    return span;
+}
+
+bool Geometry::describes_same_array(const Geometry &other) const noexcept
+{
+    return element_type == other.element_type && element_size == other.element_size &&
+           rank == other.rank && shape == other.shape && strides == other.strides;
+}
+
+namespace detail
+{
+
+Geometry to_geometry(const Protocol::GeometryBlock &wire) noexcept
+{
+    Geometry out;
+    out.generation = wire.generation;
+    out.element_type = wire.element_type;
+    out.element_size = wire.element_size;
+    out.rank = wire.rank;
+    out.max_frame_bytes = wire.max_frame_bytes;
+    out.ring_depth = wire.ring_depth;
+    out.credit_window = wire.credit_window;
+    out.shape = wire.shape;
+    out.strides = wire.strides;
+    return out;
+}
+
+} // namespace detail
+
 namespace
 {
 
@@ -157,7 +234,7 @@ Status Protocol::GeometryBlock::validate() const noexcept
         return status;
     }
 
-    if(max_frame_bytes == 0 || max_frame_bytes > k_max_frame_bytes_hard_cap)
+    if(max_frame_bytes < k_min_frame_bytes || max_frame_bytes > k_max_frame_bytes_hard_cap)
     {
         return Status::FrameTooLarge;
     }
