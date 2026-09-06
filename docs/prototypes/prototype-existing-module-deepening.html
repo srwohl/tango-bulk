@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prototype — deepen the existing modules</title>
+  <style>
+    :root {
+      --ink: #1f2933;
+      --muted: #64748b;
+      --line: #d9e2ec;
+      --paper: #f7f9fb;
+      --panel: #ffffff;
+      --accent: #0f766e;
+      --accent-soft: #dff5f1;
+      --warn: #a16207;
+      --warn-soft: #fff7d6;
+      --bad: #b42318;
+      --bad-soft: #fff0ed;
+      --good: #166534;
+      --good-soft: #e9f8ed;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font: 15px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { max-width: 1180px; margin: 0 auto; padding: 34px 22px 70px; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { letter-spacing: -0.03em; font-size: clamp(28px, 4vw, 44px); line-height: 1.05; }
+    h2 { font-size: 20px; margin-bottom: 10px; }
+    h3 { font-size: 16px; margin-bottom: 8px; }
+    .intro { max-width: 850px; color: #405261; font-size: 17px; }
+    .question { border-left: 4px solid var(--accent); padding: 12px 16px; background: var(--accent-soft); max-width: 920px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(300px, .75fr); gap: 18px; margin-top: 24px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; box-shadow: 0 3px 14px rgba(31, 41, 51, .04); }
+    .panel + .panel { margin-top: 18px; }
+    .state-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .state-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: #fbfcfd; }
+    .state-card strong { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 4px; }
+    .state-card span { font-size: 18px; font-weight: 650; }
+    .state-card small { display: block; color: var(--muted); margin-top: 3px; }
+    .event { padding: 9px 10px; border-bottom: 1px solid #edf1f4; }
+    .event:last-child { border-bottom: 0; }
+    .event time { color: var(--muted); font-size: 12px; margin-right: 8px; }
+    .event.good { background: var(--good-soft); }
+    .event.warn { background: var(--warn-soft); }
+    .event.bad { background: var(--bad-soft); color: var(--bad); }
+    .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+    button { border: 1px solid #a8bbb9; border-radius: 8px; padding: 8px 11px; background: white; color: var(--ink); cursor: pointer; font: inherit; }
+    button:hover { border-color: var(--accent); color: var(--accent); }
+    button.primary { border-color: var(--accent); background: var(--accent); color: white; }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+    .group { margin-top: 16px; }
+    .group:first-child { margin-top: 0; }
+    .group-label { color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; margin-bottom: 7px; }
+    .tabs { display: flex; flex-wrap: wrap; gap: 7px; border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 14px; }
+    .tab.active { background: var(--accent-soft); border-color: var(--accent); color: #075e58; }
+    .walkthrough { display: none; }
+    .walkthrough.active { display: block; }
+    .walkthrough p { color: #405261; }
+    .step { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid #edf1f4; }
+    .step:last-child { border-bottom: 0; }
+    .step button { flex: 1; text-align: left; }
+    .step.done button { color: var(--good); border-color: #a8d7b4; background: var(--good-soft); }
+    .step.current button { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+    .step-number { min-width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; background: #e8eef2; color: var(--muted); font-size: 12px; font-weight: 700; }
+    .step.done .step-number { background: var(--good); color: white; }
+    .owner-list { display: grid; gap: 8px; }
+    .owner { padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; }
+    .owner strong { display: block; color: var(--accent); }
+    .owner span { color: #405261; font-size: 13px; }
+    .trace { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; color: #405261; background: #f2f5f7; border-radius: 8px; padding: 10px; min-height: 70px; }
+    .verdict { margin-top: 18px; padding: 13px 15px; border-radius: 10px; background: var(--good-soft); border: 1px solid #b9e2c2; color: var(--good); }
+    .muted { color: var(--muted); }
+    @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } .state-grid { grid-template-columns: 1fr 1fr; } }
+    @media (max-width: 510px) { .state-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Can the five changes deepen what is already here?</h1>
+  <p class="intro">This throwaway logic prototype answers one design question: can the five proposed issues be expressed by deepening the existing <em>Subscription</em>, <em>ReceivePlan</em>, <em>PinnedBudget</em>, <em>DeliveryQueue</em>, <em>BulkPublisher</em>, and Tango adapter, without creating a new top-level “Establishment” module?</p>
+  <p class="question"><strong>Watch for this:</strong> the public journey should be one Subscription owning the order of discovery, planning, Open, delivery, reconnect, and close. Typed values and adapters may appear at the seams; a second orchestration object should not.</p>
+
+  <div class="layout">
+    <section>
+      <div class="panel">
+        <h2>Current state</h2>
+        <div id="state"></div>
+        <div class="verdict" id="verdict"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Free play</h2>
+        <p class="muted">Try actions in any order. Invalid order is part of the question: the deep owner should make the result visible and keep the wire representation out of the rest of the design.</p>
+        <div id="free-play"></div>
+      </div>
+    </section>
+
+    <aside>
+      <div class="panel">
+        <h2>Guided walkthroughs</h2>
+        <div class="tabs" id="tabs"></div>
+        <div id="walkthroughs"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Ownership after deepening</h2>
+        <div class="owner-list">
+          <div class="owner"><strong>Subscription</strong><span>Owns establishment order, immutable delivery mode, session generation, reconnect, and terminal outcome.</span></div>
+          <div class="owner"><strong>ReceivePlan + PinnedBudget</strong><span>Turn a StreamOffer and a budget into one reserved, validated receive plan.</span></div>
+          <div class="owner"><strong>DeliveryQueue</strong><span>Owns the one authoritative queue, wakeup, acceptance ordering, and consumer-facing drain.</span></div>
+          <div class="owner"><strong>BulkPublisher</strong><span>Owns typed coordination behavior and the authoritative stream snapshot.</span></div>
+          <div class="owner"><strong>Tango adapter</strong><span>Translates attributes and encoded commands; it does not own stream state or policy.</span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Wire / adapter trace</h2>
+        <div class="trace" id="trace"></div>
+      </div>
+    </aside>
+  </div>
+</main>
+
+<script>
+/*
+  Portable logic module.
+  Question: can the five issues deepen the existing modules rather than add an
+  Establishment module? The reducer models only the decisions needed to answer
+  that question; the HTML below is a throwaway shell around it.
+*/
+const DeepenedModules = (() => {
+  const offer = Object.freeze({ stream: "frames", geometry: "2048 × 2048 × uint16", maxFrameMiB: 8, leaseMs: 5000 });
+
+  function initialState() {
+    return {
+      phase: "Idle",
+      mode: null,
+      generation: 0,
+      offer: null,
+      budgetMiB: 64,
+      plan: null,
+      reservationMiB: 0,
+      queue: [],
+      queueCapacity: 3,
+      accepted: 0,
+      delivered: 0,
+      dropped: 0,
+      callbacks: 0,
+      terminal: null,
+      publisherSessions: 0,
+      publisherPublished: 0,
+      publisherDropped: 0,
+      observations: 0,
+      coordinationCalls: [],
+      adapterTrace: [],
+      events: [{ text: "Ready: no second orchestration module exists.", tone: "good" }]
+    };
+  }
+
+  function event(state, text, tone = "good") {
+    return { ...state, events: [...state.events, { text, tone }].slice(-9) };
+  }
+
+  function planFor(currentOffer, budgetMiB) {
+    if (!currentOffer) return null;
+    const ringDepth = Math.max(1, Math.min(8, Math.floor(budgetMiB / currentOffer.maxFrameMiB)));
+    return { maxFrameMiB: currentOffer.maxFrameMiB, ringDepth, creditWindow: Math.max(1, ringDepth - 1), pinnedMiB: ringDepth * currentOffer.maxFrameMiB };
+  }
+
+  function wire(state, text) {
+    return { ...state, adapterTrace: [...state.adapterTrace, text].slice(-8) };
+  }
+
+  function reduce(previous, action) {
+    let state = { ...previous };
+    switch (action.type) {
+      case "readOffer":
+        state = { ...state, offer, observations: state.observations + 1 };
+        state = wire(state, "Tango attributes → StreamOffer → Subscription");
+        return event(state, "Subscription received the stream offer from the observation adapter.");
+      case "refreshAttributes":
+        state = { ...state, observations: state.observations + 1 };
+        state = wire(state, "Tango read-only attributes → Publisher snapshot");
+        return event(state, "Publisher snapshot refreshed; no BulkQuery state was created.");
+      case "setBudget":
+        state = { ...state, budgetMiB: action.mib };
+        return event(state, `Pinned budget set to ${action.mib} MiB.`);
+      case "choosePull":
+        if (state.phase !== "Idle") return event(state, "Delivery mode is immutable after establishment.", "warn");
+        return event({ ...state, mode: "Pull" }, "Subscription selected Pull delivery before Open.");
+      case "choosePush":
+        if (state.phase !== "Idle") return event(state, "Delivery mode is immutable after establishment.", "warn");
+        return event({ ...state, mode: "Push" }, "Subscription selected Push delivery before Open.");
+      case "derivePlan": {
+        if (!state.offer) return event(state, "ReceivePlan cannot derive from an absent offer.", "bad");
+        const plan = planFor(state.offer, state.budgetMiB);
+        if (plan.pinnedMiB > state.budgetMiB) return event(state, "PinnedBudget rejected the plan before Open.", "bad");
+        return event({ ...state, plan, reservationMiB: plan.pinnedMiB }, `ReceivePlan reserved ${plan.pinnedMiB} MiB before Open.`);
+      }
+      case "open":
+        if (!state.plan) return event(state, "Subscription refused Open: no prepared ReceivePlan.", "bad");
+        if (state.phase !== "Idle") return event(state, "Subscription already left the establishment phase.", "warn");
+        state = { ...state, phase: "Opening", mode: state.mode || "Pull", coordinationCalls: [...state.coordinationCalls, "Open"] };
+        state = wire(state, "Tango command adapter: typed OpenRequest → bytes");
+        return event(state, "Subscription sent Open through the existing coordination path.");
+      case "openReply":
+        if (state.phase !== "Opening") return event(state, "OpenReply is only meaningful after Open.", "warn");
+        state = { ...state, phase: "Active", generation: state.generation + 1, publisherSessions: state.publisherSessions + 1 };
+        state = wire(state, "bytes → typed OpenReply → Subscription");
+        return event(state, "Subscription accepted OpenReply and became Active.");
+      case "publish":
+        if (state.phase !== "Active") return event(state, "Publisher cannot deliver into an inactive Subscription.", "warn");
+        if (state.queue.length >= state.queueCapacity) {
+          return event({ ...state, dropped: state.dropped + 1, publisherDropped: state.publisherDropped + 1 }, "DeliveryQueue was full; the frame was dropped at admission.", "warn");
+        }
+        return event({ ...state, queue: [...state.queue, `frame-${state.accepted + 1}@g${state.generation}`], accepted: state.accepted + 1, publisherPublished: state.publisherPublished + 1 }, "DeliveryQueue accepted a frame; Publisher did not know consumer policy.");
+      case "pull":
+        if (state.mode !== "Pull") return event(state, "Pull is unavailable: this Subscription was established as Push.", "bad");
+        if (!state.queue.length) return event(state, "Pull found no frame; the Subscription remains Active.", "warn");
+        return event({ ...state, queue: state.queue.slice(1), delivered: state.delivered + 1 }, "Pull consumed one frame from the authoritative queue.");
+      case "dispatch":
+        if (state.mode !== "Push") return event(state, "Dispatch is unavailable: this Subscription was established as Pull.", "bad");
+        if (!state.queue.length) return event(state, "Push has nothing to dispatch.", "warn");
+        return event({ ...state, queue: state.queue.slice(1), delivered: state.delivered + 1, callbacks: state.callbacks + 1 }, "The existing delivery owner invoked the callback once.");
+      case "interrupt":
+        if (state.phase === "Closed") return event(state, "Interrupt is sticky; no second action was needed.", "warn");
+        return event({ ...state, phase: "Closed", terminal: "Interrupted", queue: [], reservationMiB: 0 }, "Local interrupt discarded queued frames and sent no Close coordination.", "warn");
+      case "close":
+        if (state.phase === "Closed") return event(state, "Close is idempotent.", "warn");
+        state = { ...state, phase: "Closed", terminal: "Closed", queue: [], reservationMiB: 0, publisherSessions: Math.max(0, state.publisherSessions - 1), coordinationCalls: [...state.coordinationCalls, "Close"] };
+        state = wire(state, "Tango command adapter: typed CloseRequest → bytes");
+        return event(state, "Subscription closed and released its reservation through the existing owner.");
+      case "transportFail":
+        if (state.phase !== "Active") return event(state, "There is no active Session to fail.", "warn");
+        return event({ ...state, phase: "Reconnecting", terminal: null }, "Subscription recorded a transient Session failure; delivery remains owned by Subscription.", "warn");
+      case "reconnect":
+        if (state.phase !== "Reconnecting") return event(state, "Reconnect is only internal after a transient failure.", "warn");
+        return event({ ...state, phase: "Active", generation: state.generation + 1, terminal: null }, "Subscription re-established a new generation; stale frames cannot join it.");
+      case "exchangeOpen":
+        state = { ...state, coordinationCalls: [...state.coordinationCalls, "Open"] };
+        state = wire(state, "Tango adapter decodes bytes → BulkPublisher handles typed OpenRequest → encodes reply");
+        return event(state, "Coordination stayed typed inside the Publisher; the adapter owned bytes.");
+      case "exchangeWrong":
+        state = wire(state, "Tango adapter rejected wrong command kind before Publisher dispatch");
+        return event(state, "Wrong command kind became a typed MalformedMessage, not a Publisher wire branch.", "bad");
+      case "reset":
+        return initialState();
+      default:
+        return event(state, "Unknown action.", "bad");
+    }
+  }
+
+  const scenarios = [
+    { id: "establishment", title: "Subscription owns establishment", description: "There is no second Establishment object. Subscription consumes an offer, prepares a plan, opens, and accepts the reply.", steps: [
+      ["Read the stream offer", "readOffer"], ["Prepare the receive plan", "derivePlan"], ["Open from Subscription", "open"], ["Accept OpenReply", "openReply"]
+    ]},
+    { id: "coordination", title: "Publisher stays typed", description: "Bytes stop at the Tango adapter. BulkPublisher sees a typed request and owns the behavior and error decision.", steps: [
+      ["Send a typed Open request through Tango", "exchangeOpen"], ["Try a wrong command kind", "exchangeWrong"]
+    ]},
+    { id: "planning", title: "Plan and budget stay together", description: "A budget creates one complete plan before Open. No caller performs frame-size × depth arithmetic by hand.", steps: [
+      ["Read the stream offer", "readOffer"], ["Set the pinned budget to 64 MiB", { type: "setBudget", mib: 64 }], ["Prepare and reserve one plan", "derivePlan"], ["Open", "open"], ["Accept the publisher's reply", "openReply"]
+    ]},
+    { id: "delivery", title: "One queue, one delivery contract", description: "Pull and Push are immutable choices over the same authoritative DeliveryQueue. Interrupt is local and terminal.", steps: [
+      ["Select Pull delivery", "choosePull"], ["Read the offer", "readOffer"], ["Prepare the plan", "derivePlan"], ["Open", "open"], ["Accept OpenReply", "openReply"], ["Publish a frame", "publish"], ["Pull the frame", "pull"], ["Interrupt locally", "interrupt"], ["Try to pull after interrupt", "pull"]
+    ]},
+    { id: "observation", title: "Observation replaces BulkQuery", description: "The Publisher snapshot is exposed through the Tango observation adapter and reused as the Subscription's StreamOffer.", steps: [
+      ["Read discovery attributes", "readOffer"], ["Refresh publisher health attributes", "refreshAttributes"], ["Prepare from the same offer", "derivePlan"], ["Open", "open"], ["Accept OpenReply", "openReply"], ["Refresh health without making a query state", "refreshAttributes"]
+    ]},
+    { id: "reconnect", title: "Reconnect remains Subscription policy", description: "A transient Session failure changes generation inside Subscription. No new public coordinator owns the retry.", steps: [
+      ["Read the offer", "readOffer"], ["Prepare the plan", "derivePlan"], ["Open", "open"], ["Accept OpenReply", "openReply"], ["Publish a frame", "publish"], ["Record a transient failure", "transportFail"], ["Reconnect as a new generation", "reconnect"], ["Publish after reconnect", "publish"]
+    ]}
+  ];
+
+  return { initialState, reduce, scenarios };
+})();
+
+let state = DeepenedModules.initialState();
+let activeScenario = DeepenedModules.scenarios[0].id;
+let progress = 0;
+
+function esc(value) {
+  return String(value).replace(/[&<>"']/g, character => ({"&":"&amp;", "<":"&lt;", ">":"&gt;", "\"":"&quot;", "'":"&#39;"}[character]));
+}
+
+function act(action) {
+  state = DeepenedModules.reduce(state, action);
+  render();
+}
+
+function startScenario(id) {
+  activeScenario = id;
+  progress = 0;
+  state = DeepenedModules.initialState();
+  render();
+}
+
+function runStep(index) {
+  const scenario = DeepenedModules.scenarios.find(item => item.id === activeScenario);
+  if (index !== progress) return;
+  const action = typeof scenario.steps[index][1] === "string" ? { type: scenario.steps[index][1] } : scenario.steps[index][1];
+  act(action);
+  progress += 1;
+  render();
+}
+
+function stateCard(label, value, detail = "") {
+  return `<div class="state-card"><strong>${esc(label)}</strong><span>${esc(value)}</span>${detail ? `<small>${esc(detail)}</small>` : ""}</div>`;
+}
+
+function render() {
+  const plan = state.plan ? `${state.plan.pinnedMiB} MiB / ${state.plan.ringDepth} slots` : "Not prepared";
+  const terminal = state.terminal || "None";
+  document.getElementById("state").innerHTML = `
+    <div class="state-grid">
+      ${stateCard("Subscription", state.phase, `generation ${state.generation}; terminal: ${terminal}`)}
+      ${stateCard("Delivery", state.mode || "Not chosen", `${state.queue.length}/${state.queueCapacity} frames queued`)}
+      ${stateCard("Stream offer", state.offer ? state.offer.geometry : "Not read", state.offer ? `maximum frame ${state.offer.maxFrameMiB} MiB` : "Read observation attributes first")}
+      ${stateCard("Receive plan", plan, `budget ${state.budgetMiB} MiB; reservation ${state.reservationMiB} MiB`)}
+      ${stateCard("Frames", `${state.delivered} delivered`, `${state.accepted} accepted; ${state.dropped} dropped`)}
+      ${stateCard("Publisher", `${state.publisherPublished} published`, `${state.publisherSessions} active session(s); ${state.publisherDropped} queue drop(s)`)}
+      ${stateCard("Callback", `${state.callbacks} invoked`, "zero is correct for Pull")}
+      ${stateCard("Observations", state.observations, `${state.coordinationCalls.length} coordination call(s)`)}
+    </div>
+    <h3 style="margin-top:16px">What just happened</h3>
+    <div>${state.events.slice().reverse().map(item => `<div class="event ${esc(item.tone)}"><time>now</time>${esc(item.text)}</div>`).join("")}</div>`;
+
+  document.getElementById("verdict").textContent = state.phase === "Active"
+    ? "The existing-module shape holds: Subscription is the only orchestration owner, and every other seam is a typed value or adapter."
+    : "Use the walkthroughs to test whether ownership stays local as the state changes.";
+
+  document.getElementById("trace").textContent = state.adapterTrace.length ? state.adapterTrace.join("\n") : "No adapter activity yet.";
+
+  document.getElementById("free-play").innerHTML = `
+    <div class="group"><div class="group-label">Observation</div><div class="buttons">
+      <button onclick="act({type:'readOffer'})">Read stream offer</button><button onclick="act({type:'refreshAttributes'})">Refresh publisher snapshot</button>
+    </div></div>
+    <div class="group"><div class="group-label">Subscription</div><div class="buttons">
+      <button onclick="act({type:'choosePull'})">Choose Pull</button><button onclick="act({type:'choosePush'})">Choose Push</button><button onclick="act({type:'setBudget',mib:16})">Budget 16 MiB</button><button onclick="act({type:'setBudget',mib:64})">Budget 64 MiB</button><button onclick="act({type:'derivePlan'})">Prepare plan</button><button class="primary" onclick="act({type:'open'})">Open</button><button onclick="act({type:'openReply'})">Accept OpenReply</button><button onclick="act({type:'transportFail'})">Transient failure</button><button onclick="act({type:'reconnect'})">Reconnect</button><button onclick="act({type:'interrupt'})">Interrupt</button><button onclick="act({type:'close'})">Close</button>
+    </div></div>
+    <div class="group"><div class="group-label">DeliveryQueue</div><div class="buttons">
+      <button onclick="act({type:'publish'})">Publish frame</button><button onclick="act({type:'pull'})">Pull frame</button><button onclick="act({type:'dispatch'})">Dispatch callback</button>
+    </div></div>
+    <div class="group"><div class="group-label">Coordination adapter</div><div class="buttons">
+      <button onclick="act({type:'exchangeOpen'})">Typed Open exchange</button><button onclick="act({type:'exchangeWrong'})">Wrong command kind</button><button onclick="act({type:'reset'})">Reset</button>
+    </div></div>`;
+
+  document.querySelectorAll(".tab").forEach(tab => tab.classList.toggle("active", tab.dataset.id === activeScenario));
+  document.querySelectorAll(".walkthrough").forEach(panel => panel.classList.toggle("active", panel.dataset.id === activeScenario));
+  const scenario = DeepenedModules.scenarios.find(item => item.id === activeScenario);
+  document.querySelector(`[data-walkthrough="${activeScenario}"]`).innerHTML = `
+    <p>${esc(scenario.description)}</p>
+    <button class="primary" onclick="startScenario('${activeScenario}')">Start / restart walkthrough</button>
+    <div style="margin-top:12px">${scenario.steps.map((step, index) => `<div class="step ${index < progress ? "done" : ""} ${index === progress ? "current" : ""}"><span class="step-number">${index < progress ? "✓" : index + 1}</span><button ${index !== progress ? "disabled" : ""} onclick="runStep(${index})">${esc(step[0])}</button></div>`).join("")}</div>`;
+}
+
+document.getElementById("tabs").innerHTML = DeepenedModules.scenarios.map(scenario => `<button class="tab" data-id="${scenario.id}" onclick="startScenario('${scenario.id}')">${esc(scenario.title)}</button>`).join("");
+document.getElementById("walkthroughs").innerHTML = DeepenedModules.scenarios.map(scenario => `<div class="walkthrough" data-id="${scenario.id}" data-walkthrough="${scenario.id}"></div>`).join("");
+render();
+</script>
+</body>
+</html>
