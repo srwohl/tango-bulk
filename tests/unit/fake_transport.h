@@ -7,10 +7,13 @@
 
 #include <tango-bulk/unstable/session_supervisor.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
-#include <array>
+#include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -32,6 +35,24 @@ namespace TangoBulkTests
 
 using namespace TangoBulk;
 using namespace std::chrono_literals;
+
+/// One frame the fake has been told to receive, and the storage behind it.
+///
+/// The payload is a real allocation held by `shared_ptr` because
+/// `FrameView::detached()` keeps that owner alive for as long as any copy of
+/// the view does. That is what lets this fake be asked ADR 0003's question --
+/// does a frame the application kept outlive the session that delivered it --
+/// and not only the delivery question.
+struct ScriptedFrame
+{
+    std::shared_ptr<std::vector<std::uint16_t>> payload;
+    FrameView::Fields fields;
+
+    const std::byte *bytes() const noexcept
+    {
+        return reinterpret_cast<const std::byte *>(payload->data());
+    }
+};
 
 struct Script
 {
@@ -110,6 +131,78 @@ struct Script
     }
 
     int grants_made{0};
+
+    // -- the data path -------------------------------------------------------
+
+    /// Frames the transport has received and not yet handed over.
+    ///
+    /// Here rather than in the transport for the same reason everything else
+    /// scripted is: a test arranges arrivals before a supervisor exists, and a
+    /// reconnect builds a *new* transport that has to keep delivering them.
+    std::deque<ScriptedFrame> arrivals;
+
+    /// Which threads the frame callback ran on. Delivery is not allowed to
+    /// happen on a coordination thread (ADR 0008), so where it happened is a
+    /// thing to assert rather than to assume.
+    std::set<std::thread::id> frame_threads;
+    std::atomic<int> frames_delivered{0};
+
+    /// Hand the transport one more frame to deliver, shaped like the grant.
+    ///
+    /// 8x8 UInt16, matching the geometry `adopt_open_reply` grants when it has
+    /// not been told to reshape, with `sequence` written into every element --
+    /// so a test can tell delivered frames apart by their contents and not
+    /// merely count them.
+    void receive(std::uint64_t sequence)
+    {
+        ScriptedFrame frame;
+        frame.payload = std::make_shared<std::vector<std::uint16_t>>(
+            8 * 8, static_cast<std::uint16_t>(sequence));
+
+        frame.fields.element_type = ElementType::UInt16;
+        frame.fields.element_size = 2;
+        frame.fields.rank = 2;
+        frame.fields.shape = {8, 8, 0, 0};
+        frame.fields.strides = {16, 2, 0, 0};
+        frame.fields.payload_bytes = 8 * 8 * sizeof(std::uint16_t);
+        frame.fields.sequence = sequence;
+        frame.fields.event_counter = sequence;
+        frame.fields.generation = 1;
+
+        std::lock_guard<std::mutex> lock(mutex);
+        arrivals.push_back(std::move(frame));
+    }
+
+    bool take_frame(ScriptedFrame &out)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if(arrivals.empty())
+        {
+            return false;
+        }
+
+        out = std::move(arrivals.front());
+        arrivals.pop_front();
+        return true;
+    }
+
+    void note_frame_thread()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        frame_threads.insert(std::this_thread::get_id());
+    }
+
+    std::size_t frame_thread_count()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return frame_threads.size();
+    }
+
+    bool delivered_on(std::thread::id id)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return frame_threads.count(id) != 0;
+    }
 };
 
 class FakeTransport final : public detail::SubscriberTransport
@@ -190,12 +283,52 @@ class FakeTransport final : public detail::SubscriberTransport
     void arm_wakeup() noexcept override {}
     void drain_wakeup() noexcept override {}
 
+    /// The real engine's `poll()` contract over a scripted arrival queue:
+    /// invoke `cb` on the CALLING thread, dispatch at most `max_frames` (0
+    /// meaning everything queued), block up to `timeout` if nothing has
+    /// arrived, and return how many it dispatched.
+    ///
+    /// It has to be the contract rather than a stub. This is the only place
+    /// frame delivery is reachable without a device, and while this returned a
+    /// constant 0 the supervisor's delivery path had no test at all -- which is
+    /// the single largest hole in the suite that a Python binding would sit on
+    /// top of.
     std::size_t poll(std::chrono::milliseconds timeout,
-                     const FrameCallback &,
-                     std::size_t = 0) override
+                     const FrameCallback &cb,
+                     std::size_t max_frames = 0) override
     {
-        std::this_thread::sleep_for(std::min(timeout, std::chrono::milliseconds{2}));
-        return 0;
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        std::size_t dispatched = 0;
+
+        for(;;)
+        {
+            ScriptedFrame frame;
+
+            // The budget is tested before the take, not after: a frame this
+            // call has no room for would be dispatched nowhere and destroyed,
+            // which loses it. The engine gets this right and so must the fake,
+            // or the fake stops standing in for it.
+            while((max_frames == 0 || dispatched < max_frames) && script_.take_frame(frame))
+            {
+                ++dispatched;
+                script_.frames_delivered.fetch_add(1, std::memory_order_relaxed);
+                script_.note_frame_thread();
+
+                if(cb)
+                {
+                    cb(FrameView::detached(frame.payload, frame.bytes(), frame.fields));
+                }
+            }
+
+            if(dispatched != 0 || std::chrono::steady_clock::now() >= deadline)
+            {
+                break;
+            }
+
+            std::this_thread::sleep_for(std::min(timeout, std::chrono::milliseconds{2}));
+        }
+
+        return dispatched;
     }
 
     BulkError last_error() const noexcept override

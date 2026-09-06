@@ -467,4 +467,223 @@ TEST_CASE("poll() is refused when a dispatch thread is already delivering",
     CHECK_THROWS_AS(supervisor->poll(std::chrono::milliseconds{1}), BulkException);
 }
 
+// -- delivery ----------------------------------------------------------------
+//
+// Everything below reaches the frame path, which had no device-free test at
+// all: the fake's poll() used to sleep and return 0, so no unit test had ever
+// seen a frame cross SessionSupervisor. That is the surface a Python binding
+// consists almost entirely of, and it is the reason the transport seam moves
+// first (docs/ARCHITECTURE_SIMPLIFICATION.md section 4.1).
+
+/// Collects what the frame callback was handed, so a test can assert contents
+/// and not only counts.
+struct Delivered
+{
+    std::mutex mutex;
+    std::vector<std::uint64_t> sequences;
+    std::vector<std::uint16_t> first_elements;
+    std::vector<std::size_t> sizes;
+
+    void record(const FrameView &frame)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        sequences.push_back(frame.sequence());
+        sizes.push_back(frame.size());
+        first_elements.push_back(
+            frame.data() != nullptr ? *reinterpret_cast<const std::uint16_t *>(frame.data()) : 0);
+    }
+
+    std::size_t count()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return sequences.size();
+    }
+};
+
+TEST_CASE("a frame the transport received reaches the application", "[core][supervisor]")
+{
+    Script script;
+    Delivered seen;
+
+    script.receive(1);
+    script.receive(2);
+    script.receive(3);
+
+    detail::SessionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    CHECK(supervisor->poll(std::chrono::milliseconds{200}) == 3);
+
+    REQUIRE(seen.count() == 3);
+    CHECK(seen.sequences == std::vector<std::uint64_t>{1, 2, 3});
+
+    // The payload, not just the count: a delivery path that hands over the
+    // right number of empty views would pass every count-only assertion.
+    CHECK(seen.first_elements == std::vector<std::uint16_t>{1, 2, 3});
+    CHECK(seen.sizes == std::vector<std::size_t>(3, std::size_t{128}));
+}
+
+TEST_CASE("frames arriving after the open are delivered too", "[core][supervisor]")
+{
+    // The ordering that matters operationally: the application is already
+    // polling when the frame turns up, rather than the queue being primed
+    // before anything opened.
+    Script script;
+    Delivered seen;
+
+    detail::SessionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    CHECK(supervisor->poll(std::chrono::milliseconds{5}) == 0);
+
+    script.receive(7);
+    CHECK(supervisor->poll(std::chrono::milliseconds{500}) == 1);
+    REQUIRE(seen.count() == 1);
+    CHECK(seen.sequences.front() == 7);
+}
+
+TEST_CASE("a dispatch thread delivers without the application asking",
+          "[core][supervisor]")
+{
+    Script script;
+    Delivered seen;
+
+    SubscriberConfig config = supervisor_config();
+    config.delivery_mode = DeliveryMode::DispatchThread;
+
+    detail::SessionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
+
+    auto supervisor = detail::SessionSupervisor::open(
+        config, fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    for(std::uint64_t sequence = 1; sequence <= 4; ++sequence)
+    {
+        script.receive(sequence);
+    }
+
+    REQUIRE(eventually([&seen] { return seen.count() == 4; }));
+
+    // In order, and on one thread. The dispatch thread is the only consumer,
+    // which is what makes a sequential callback contract (ADR 0008) true here
+    // rather than merely intended.
+    CHECK(seen.sequences == std::vector<std::uint64_t>{1, 2, 3, 4});
+    CHECK(script.frame_thread_count() == 1);
+    CHECK_FALSE(script.delivered_on(std::this_thread::get_id()));
+}
+
+TEST_CASE("poll() delivers no more frames than it was asked for", "[core][supervisor]")
+{
+    Script script;
+    Delivered seen;
+
+    for(std::uint64_t sequence = 1; sequence <= 5; ++sequence)
+    {
+        script.receive(sequence);
+    }
+
+    detail::SessionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    // Two, then the rest. A bounded take is what lets one frame be consumed at
+    // a time -- a read(), an iterator step -- without a second delivery path,
+    // and the frames it did not take must still be there.
+    CHECK(supervisor->poll(std::chrono::milliseconds{200}, 2) == 2);
+    CHECK(seen.count() == 2);
+
+    CHECK(supervisor->poll(std::chrono::milliseconds{200}) == 3);
+    REQUIRE(seen.count() == 5);
+    CHECK(seen.sequences == std::vector<std::uint64_t>{1, 2, 3, 4, 5});
+}
+
+TEST_CASE("frames are delivered on the polling thread, never on a coordination thread",
+          "[core][supervisor]")
+{
+    Script script;
+    script.receive(1);
+    script.receive(2);
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+
+    CHECK(supervisor->poll(std::chrono::milliseconds{200}) == 2);
+
+    // Manual delivery: the caller's thread, and no other. The control thread
+    // renews on its own schedule throughout, and it must not be a place user
+    // code runs.
+    CHECK(script.frame_thread_count() == 1);
+    CHECK(script.delivered_on(std::this_thread::get_id()));
+}
+
+TEST_CASE("a frame the application kept outlives the session that delivered it",
+          "[core][supervisor]")
+{
+    // ADR 0003: closing ends participation, not the validity of memory an
+    // application still holds. Retention is the whole reason FrameView is
+    // reference-counted, so it is the property most worth pinning down before
+    // the ownership of the delivery path moves.
+    Script script;
+    script.receive(42);
+
+    FrameView retained;
+
+    detail::SessionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [&retained](FrameView frame) { retained = std::move(frame); };
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    CHECK(supervisor->poll(std::chrono::milliseconds{200}) == 1);
+    REQUIRE(static_cast<bool>(retained));
+
+    // The session, its transport and both its threads go away here.
+    supervisor.reset();
+
+    REQUIRE(static_cast<bool>(retained));
+    CHECK(retained.sequence() == 42);
+    CHECK(retained.size() == 128);
+    CHECK(retained.rank() == 2);
+    CHECK(*reinterpret_cast<const std::uint16_t *>(retained.data()) == 42);
+}
+
+TEST_CASE("a frame delivered before a reconnect survives the session that replaced it",
+          "[core][supervisor]")
+{
+    Script script;
+    script.receive(11);
+
+    FrameView retained;
+
+    detail::SessionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [&retained](FrameView frame) { retained = std::move(frame); };
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    CHECK(supervisor->poll(std::chrono::milliseconds{200}) == 1);
+    REQUIRE(static_cast<bool>(retained));
+
+    // Lose the session. The control thread retires that transport and builds a
+    // new one, which is the moment a view pointing into the old receive ring
+    // would be invalidated if the credit interlock did not own its storage.
+    script.renew_results.push_back(Status::SessionExpired);
+    REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
+
+    CHECK(retained.sequence() == 11);
+    CHECK(*reinterpret_cast<const std::uint16_t *>(retained.data()) == 11);
+
+    // And the replacement session delivers, so the reconnect really happened.
+    script.receive(12);
+    CHECK(eventually([&] { return supervisor->poll(std::chrono::milliseconds{50}) == 1; }));
+}
+
 } // namespace
