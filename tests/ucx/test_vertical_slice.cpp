@@ -112,7 +112,7 @@ TEST_CASE("Slots recycle: sequence s lands in slot s % ring_depth", "[m2][slice]
     // Every producer slot came back.  A wraparound bug that leaked one slot per
     // lap shows up here and nowhere else.
     CHECK(eventually([&] { return slice.publisher.counters().frames_credited == total; }));
-    CHECK(eventually([&] { return slice.publisher.source().retained() == 0; }));
+    CHECK(eventually([&] { return slice.publisher.retained() == 0; }));
 }
 
 TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring",
@@ -172,7 +172,7 @@ TEST_CASE("A retained view withholds exactly one credit", "[m2][slice]")
 
     // The window is full and every view is retained, so the publisher stalls.
     {
-        BulkSource::Lease lease = slice.publisher.source().try_acquire();
+        BulkPublisher::SlotHandle lease = slice.publisher.try_acquire();
         REQUIRE(lease);
         CHECK(slice.publisher.publish(std::move(lease), meta_for(bytes, 99)) ==
               PublishResult::CreditStalled);
@@ -241,7 +241,7 @@ TEST_CASE("With every view retained, publish reports CreditStalled and never blo
 
     for(std::uint32_t n = 0; n < k_ring_depth; ++n)
     {
-        BulkSource::Lease lease = slice.publisher.source().try_acquire();
+        BulkPublisher::SlotHandle lease = slice.publisher.try_acquire();
         REQUIRE(lease);
         fill(lease, bytes, n);
 
@@ -268,7 +268,44 @@ TEST_CASE("With every view retained, publish reports CreditStalled and never blo
     // No slot was reused: every accepted frame still holds its own, and every
     // stalled frame gave its slot straight back.
     CHECK(counters.leases_retained == accepted);
-    CHECK(slice.publisher.source().retained() == accepted);
+    CHECK(slice.publisher.retained() == accepted);
+}
+
+TEST_CASE("A slot handle outlives the publisher that issued it", "[m2][slice]")
+{
+    // ADR 0003: closing ends participation, not the validity of memory an
+    // application still holds. This was a use-after-free until the ring moved
+    // into shared storage -- the handle carried a raw pointer into a ring the
+    // publisher owned by value, and a Python binding's non-deterministic
+    // destruction order makes that the default outcome rather than an edge case.
+    BulkPublisher::SlotHandle handle;
+
+    {
+        BulkPublisher publisher(publisher_config());
+        handle = publisher.try_acquire();
+        REQUIRE(handle);
+
+        fill(handle, k_frame_bytes, 5);
+        CHECK(publisher.retained() == 1);
+    }
+
+    // The publisher is gone. The registration, the ring and the free list the
+    // slot goes back to are not, because this handle still holds a share.
+    REQUIRE(handle);
+    CHECK(handle.capacity() >= k_frame_bytes);
+
+    const auto *bytes = static_cast<const unsigned char *>(handle.data());
+    bool intact = true;
+    for(std::uint64_t i = 0; i < k_frame_bytes && intact; ++i)
+    {
+        intact = bytes[i] == static_cast<unsigned char>((5u * 31u + static_cast<unsigned>(i)) & 0xFFu);
+    }
+    CHECK(intact);
+
+    // And releasing it is safe with nothing else referencing the storage: the
+    // slot goes back to a free list that is destroyed immediately afterwards.
+    handle.reset();
+    CHECK_FALSE(handle);
 }
 
 TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", "[m2][slice]")
@@ -289,10 +326,10 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
     Slice slice(pub, sub);
 
     // Fill the leases first, so the publish burst is nothing but publish calls.
-    std::vector<BulkSource::Lease> leases;
+    std::vector<BulkPublisher::SlotHandle> leases;
     for(std::uint32_t n = 0; n < 64; ++n)
     {
-        BulkSource::Lease lease = slice.publisher.source().try_acquire();
+        BulkPublisher::SlotHandle lease = slice.publisher.try_acquire();
         REQUIRE(lease);
         fill(lease, k_frame_bytes, n);
         leases.push_back(std::move(lease));
@@ -366,7 +403,7 @@ TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
 
     std::thread producer([&] {
         std::this_thread::sleep_for(60ms);
-        auto lease = publisher.source().try_acquire();
+        auto lease = publisher.try_acquire();
         REQUIRE(lease);
         fill(lease, k_frame_bytes, 9);
         REQUIRE(publisher.publish(std::move(lease), meta_for(k_frame_bytes, 9)) ==
@@ -410,7 +447,7 @@ TEST_CASE("An unarmed descriptor is never signalled, which is what makes it free
 
     for(int i = 0; i < 4; ++i)
     {
-        auto lease = publisher.source().try_acquire();
+        auto lease = publisher.try_acquire();
         REQUIRE(lease);
         fill(lease, k_frame_bytes, static_cast<unsigned>(i));
         REQUIRE(publisher.publish(std::move(lease),
@@ -449,7 +486,7 @@ TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
     constexpr int k_published = 4;
     for(int i = 0; i < k_published; ++i)
     {
-        auto lease = publisher.source().try_acquire();
+        auto lease = publisher.try_acquire();
         REQUIRE(lease);
         fill(lease, k_frame_bytes, static_cast<unsigned>(i));
         REQUIRE(publisher.publish(std::move(lease),
@@ -481,7 +518,7 @@ TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
     // caller relies on.
     for(int i = 0; i < k_published; ++i)
     {
-        auto lease = publisher.source().try_acquire();
+        auto lease = publisher.try_acquire();
         REQUIRE(lease);
         fill(lease, k_frame_bytes, static_cast<unsigned>(i));
         REQUIRE(publisher.publish(std::move(lease),
@@ -518,7 +555,7 @@ TEST_CASE("A publisher refuses to send an array it did not declare", "[m2][slice
 
     // What it declared, accepted.
     {
-        auto lease = publisher.source().try_acquire();
+        auto lease = publisher.try_acquire();
         REQUIRE(lease);
         fill(lease, k_frame_bytes, 1);
         CHECK(publisher.publish(std::move(lease), meta_for(k_frame_bytes, 1)) ==
@@ -528,7 +565,7 @@ TEST_CASE("A publisher refuses to send an array it did not declare", "[m2][slice
     // The same bytes described as a different array: refused, and the lease is
     // consumed rather than left engaged, exactly as any other BadMetadata.
     {
-        auto lease = publisher.source().try_acquire();
+        auto lease = publisher.try_acquire();
         REQUIRE(lease);
         fill(lease, k_frame_bytes, 2);
 
@@ -596,7 +633,7 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
     // The publisher sends what it actually declared, which now contradicts what
     // this subscriber believes it was granted.
     {
-        auto lease = publisher.source().try_acquire();
+        auto lease = publisher.try_acquire();
         REQUIRE(lease);
         fill(lease, k_frame_bytes, 3);
         REQUIRE(publisher.publish(std::move(lease), meta_for(k_frame_bytes, 3)) ==

@@ -205,7 +205,7 @@ inline FrameMetadata meta_for(std::uint64_t payload_bytes, std::uint64_t counter
 
 /// A pattern that depends on both the seed and the offset, so a frame delivered
 /// from the wrong slot or truncated mid-payload does not accidentally match.
-inline void fill(const BulkSource::Lease &lease, std::uint64_t bytes, unsigned seed)
+inline void fill(const BulkPublisher::SlotHandle &lease, std::uint64_t bytes, unsigned seed)
 {
     auto *p = static_cast<unsigned char *>(lease.data());
     for(std::uint64_t i = 0; i < bytes; ++i)
@@ -229,7 +229,7 @@ inline bool payload_matches(const FrameView &view, unsigned seed)
 
 inline PublishResult publish_one(BulkPublisher &publisher, std::uint64_t bytes, unsigned seed)
 {
-    BulkSource::Lease lease = publisher.source().try_acquire();
+    BulkPublisher::SlotHandle lease = publisher.try_acquire();
     REQUIRE(lease);
     fill(lease, bytes, seed);
     return publisher.publish(std::move(lease), meta_for(bytes, seed));

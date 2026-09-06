@@ -252,7 +252,7 @@ class ExampleDetector : public TANGO_BASE_CLASS
 
         while(acquiring_)
         {
-            BulkSource::Lease lease = publisher_->source().try_acquire();
+            BulkPublisher::SlotHandle lease = publisher_->try_acquire();
             if(!lease)
             {
                 // 5.3: acquisition drops, it never waits.  A consumer holding
