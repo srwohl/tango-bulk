@@ -4,9 +4,6 @@
 
 #include <ucx/subscriber_engine.h>
 
-#include <poll.h>
-#include <sys/eventfd.h>
-#include <unistd.h>
 
 #include <ucx/locality.h>
 
@@ -151,7 +148,7 @@ struct SubscriberEngine::Pending
 SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
     config_(std::move(config)),
     tracker_(config_.ring_depth),
-    delivery_(config_.delivery_queue_depth),
+    delivery_(config_.delivery_queue_depth, config_.drop_policy),
     pending_(config_.ring_depth)
 {
     const Status status = config_.validate();
@@ -189,12 +186,6 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
         pending_[i].slot_index = i;
     }
 
-    // A subscriber without a wakeup descriptor still works -- await_frame()
-    // falls back to a short sleep -- so a failure here is reported by the
-    // descriptor staying -1 rather than by refusing to open. Losing the wakeup
-    // path costs latency and interruptibility, not correctness.
-    wakeup_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-
     register_am_handlers();
 
     // The engine thread starts in adopt_open_reply(), not here.
@@ -213,15 +204,10 @@ SubscriberEngine::~SubscriberEngine()
 {
     running_.store(false, std::memory_order_release);
 
-    // Wake a consumer blocked in await_frame() before joining, so teardown does
-    // not have to wait out somebody else's timeout.
-    consumer_waiting_.store(false, std::memory_order_release);
-    if(wakeup_fd_ >= 0)
-    {
-        const std::uint64_t one = 1;
-        const ssize_t written = ::write(wakeup_fd_, &one, sizeof(one));
-        static_cast<void>(written);
-    }
+    // Stop the delivery queue before joining, so teardown does not have to wait
+    // out somebody else's timeout. Sticky rather than a nudge: a consumer that
+    // is merely woken finds nothing and blocks again.
+    delivery_.stop();
 
     if(engine_.joinable())
     {
@@ -330,7 +316,7 @@ std::vector<std::byte> SubscriberEngine::make_renew_request(std::uint64_t correl
     renewals_sent_.fetch_add(1, std::memory_order_relaxed);
     return session_.make_renew_request(
         correlation_id,
-        frames_delivered_.load(std::memory_order_relaxed),
+        delivery_.taken(),
         arena_ ? arena_->credits_returned() : 0,
         static_cast<std::uint32_t>(state_.load(std::memory_order_acquire)));
 }
@@ -388,7 +374,7 @@ void SubscriberEngine::engine_loop()
         // Out of the callback and into the loop, the same way credit and
         // probe-acks are routed: a write() belongs nowhere near the inside of
         // ucp_worker_progress.
-        signal_consumer();
+        delivery_.notify();
 
         if(worked)
         {
@@ -963,90 +949,6 @@ void SubscriberEngine::on_rndv_complete(void *request,
     }
 }
 
-void SubscriberEngine::signal_consumer() noexcept
-{
-    if(wakeup_fd_ < 0 || delivery_.empty())
-    {
-        return;
-    }
-
-    // Only on the true-to-false transition. A consumer that is keeping up never
-    // sets the flag, so the case that matters -- consumer behind, queue never
-    // empty -- makes no syscall at all.
-    if(!consumer_waiting_.exchange(false, std::memory_order_acq_rel))
-    {
-        return;
-    }
-
-    const std::uint64_t one = 1;
-    const ssize_t written = ::write(wakeup_fd_, &one, sizeof(one));
-    static_cast<void>(written); // EAGAIN means it is already signalled
-}
-
-void SubscriberEngine::drain_wakeup() noexcept
-{
-    if(wakeup_fd_ < 0)
-    {
-        return;
-    }
-
-    // The descriptor is a notification, not a count -- the queue is the truth
-    // about how many frames there are, so one read clears however many writes.
-    std::uint64_t drained = 0;
-    const ssize_t got = ::read(wakeup_fd_, &drained, sizeof(drained));
-    static_cast<void>(got); // EAGAIN: nothing pending, which is fine
-}
-
-bool SubscriberEngine::await_frame(std::chrono::steady_clock::time_point deadline) noexcept
-{
-    const auto now = std::chrono::steady_clock::now();
-    if(now >= deadline)
-    {
-        return false;
-    }
-
-    const auto remaining =
-        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-
-    if(wakeup_fd_ < 0)
-    {
-        // No descriptor: the short sleep this replaced, and the same behaviour.
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-        return true;
-    }
-
-    // Declare the intent to block BEFORE looking at the queue again. The other
-    // order loses wakeups: the engine could push and find the flag still clear
-    // between the check and the block, and nothing would write the descriptor.
-    arm_wakeup();
-
-    if(!delivery_.empty())
-    {
-        consumer_waiting_.store(false, std::memory_order_release);
-        return true;
-    }
-
-    pollfd descriptor{};
-    descriptor.fd = wakeup_fd_;
-    descriptor.events = POLLIN;
-
-    const int ready = ::poll(&descriptor, 1, remaining > 0 ? static_cast<int>(remaining) : 1);
-
-    // Whoever gets here first clears it; the engine may already have.
-    consumer_waiting_.store(false, std::memory_order_release);
-
-    if(ready > 0)
-    {
-        drain_wakeup();
-    }
-
-    // ready == 0 is the timeout and ready < 0 is EINTR -- a signal arriving,
-    // which is the whole reason a blocking read is now interruptible instead of
-    // swallowing Ctrl-C for a full poll timeout. Both mean "look again", and
-    // the caller's deadline decides whether to keep waiting.
-    return true;
-}
-
 void SubscriberEngine::fail(Status status, const char *reason) noexcept
 {
     // First reason wins. A failing transport tends to fail again on the way
@@ -1086,38 +988,11 @@ void SubscriberEngine::commit(std::size_t slot_index) noexcept
     arena_->note_view_issued();
     FrameView view = ReceiveSlotLease::make_view(std::move(lease), slot.data, &slot.fields);
 
-    if(delivery_.try_push(std::move(view)))
-    {
-        const std::uint64_t depth = delivery_.size();
-        if(depth > delivery_high_water_.load(std::memory_order_relaxed))
-        {
-            delivery_high_water_.store(depth, std::memory_order_relaxed);
-        }
-        return;
-    }
-
-    // 5.3: apply drop_policy, and never stall UCX progress to do it.
-    if(config_.drop_policy == DropPolicy::DropOldest)
-    {
-        FrameView oldest;
-        if(delivery_.try_pop(oldest))
-        {
-            // Destroying the oldest view releases its slot and returns its
-            // credit, which is what makes room.
-            oldest.reset();
-            if(delivery_.try_push(std::move(view)))
-            {
-                dropped_queue_full_.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-        }
-    }
-
-    // DropNewest, or DropOldest that lost a race for the space it just made:
-    // let `view` go out of scope.  Its destructor releases the slot and returns
-    // the credit immediately, which is exactly what the spec asks for and is
-    // why there is nothing else to do here.
-    dropped_queue_full_.fetch_add(1, std::memory_order_relaxed);
+    // 5.3's drop policy, the high-water gauge and the credit a dropped frame
+    // returns are all the queue's now. Waking a consumer is deliberately not
+    // done here: this runs inside `ucp_worker_progress`, and the loop calls
+    // `notify()` for the same reason it sends credit and probe acks.
+    delivery_.push(std::move(view));
 }
 
 // -- application thread -----------------------------------------------------
@@ -1129,38 +1004,34 @@ std::size_t SubscriberEngine::poll(std::chrono::milliseconds timeout,
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::size_t dispatched = 0;
 
-    for(;;)
+    while(max_frames == 0 || dispatched < max_frames)
     {
         FrameView view;
 
-        // The budget is tested before try_pop, not after: popping a frame this
-        // call has no room for would deliver it nowhere and destroy it, which
-        // returns its credit and loses the frame.
-        while((max_frames == 0 || dispatched < max_frames) && delivery_.try_pop(view))
-        {
-            frames_delivered_.fetch_add(1, std::memory_order_relaxed);
-            ++dispatched;
+        // Only the first frame of an idle poll waits. After that, whatever
+        // arrived alongside it is taken without blocking again, which is what
+        // makes one call drain a burst rather than one frame per timeout.
+        //
+        // Both forms leave the consumer armed when they come up empty, so a
+        // caller watching fd() never performs the arm/re-check protocol itself.
+        const bool got =
+            dispatched == 0 ? delivery_.take(view, deadline) : delivery_.try_take(view);
 
-            // On the CALLING thread, per 2.4.  Whether the credit returns when
-            // this returns is entirely up to the callback: keeping a copy
-            // withholds it, which is the documented backpressure semantic and
-            // not a leak.
-            if(cb)
-            {
-                cb(std::move(view));
-            }
-            view.reset();
-        }
-
-        if(dispatched != 0 || std::chrono::steady_clock::now() >= deadline)
+        if(!got)
         {
             break;
         }
 
-        if(!await_frame(deadline))
+        ++dispatched;
+
+        // On the CALLING thread, per 2.4.  Whether the credit returns when this
+        // returns is entirely up to the callback: keeping a copy withholds it,
+        // which is the documented backpressure semantic and not a leak.
+        if(cb)
         {
-            break;
+            cb(std::move(view));
         }
+        view.reset();
     }
 
     return dispatched;
@@ -1180,8 +1051,8 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
 {
     SubscriberCounters out;
     out.frames_received = frames_received_.load(std::memory_order_relaxed);
-    out.frames_delivered = frames_delivered_.load(std::memory_order_relaxed);
-    out.frames_dropped_queue_full = dropped_queue_full_.load(std::memory_order_relaxed);
+    out.frames_delivered = delivery_.taken();
+    out.frames_dropped_queue_full = delivery_.dropped();
     out.frames_dropped_stale_epoch = dropped_stale_epoch_.load(std::memory_order_relaxed);
     out.frames_dropped_bad_header = dropped_bad_header_.load(std::memory_order_relaxed);
     out.frames_dropped_oversize = dropped_oversize_.load(std::memory_order_relaxed);
@@ -1192,7 +1063,7 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
     out.credit_messages_sent = credit_messages_sent_.load(std::memory_order_relaxed);
     out.views_outstanding = arena_->views_outstanding();
     out.delivery_queue_depth = delivery_.size();
-    out.delivery_queue_high_water = delivery_high_water_.load(std::memory_order_relaxed);
+    out.delivery_queue_high_water = delivery_.high_water();
     out.sessions_opened = session_.stream_id() != 0 ? 1u : 0u;
     out.renewals_sent = renewals_sent_.load(std::memory_order_relaxed);
     out.renewals_failed = renewals_failed_.load(std::memory_order_relaxed);

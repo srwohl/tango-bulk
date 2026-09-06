@@ -115,6 +115,18 @@ struct Script
         return status;
     }
 
+    /// Queue one renewal outcome on a supervisor that is already running.
+    ///
+    /// The plain `renew_results = {...}` the other cases use is safe only
+    /// because they all write it before `open()`, when no control thread
+    /// exists. Making a *live* session fail is a write the control thread races
+    /// with, and ThreadSanitizer says so.
+    void refuse_next_renew(Status status)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        renew_results.push_back(status);
+    }
+
     bool probes()
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -279,9 +291,6 @@ class FakeTransport final : public detail::SubscriberTransport
     {
         return -1; // no data path, so nothing to wait on
     }
-
-    void arm_wakeup() noexcept override {}
-    void drain_wakeup() noexcept override {}
 
     /// The real engine's `poll()` contract over a scripted arrival queue:
     /// invoke `cb` on the CALLING thread, dispatch at most `max_frames` (0

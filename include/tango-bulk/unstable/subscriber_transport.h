@@ -69,10 +69,6 @@ class SubscriberTransport
     virtual std::uint32_t lease_ttl_ms() const noexcept = 0;
     virtual std::uint32_t renew_interval_ms() const noexcept = 0;
 
-    /// Invoke `cb` on the CALLING thread for each frame available within
-    /// `timeout`; returns how many it dispatched.  Never the engine thread --
-    /// that is 5.2's guarantee, and it is structural: the engine holds no
-    /// `std::function` at all.
     /// A descriptor that becomes readable when a frame arrives, or -1 if this
     /// transport has none.
     ///
@@ -82,32 +78,29 @@ class SubscriberTransport
     /// is keeping up cost zero syscalls. Adding an unarmed descriptor to an
     /// event loop produces something that never fires.
     ///
-    /// The protocol, and all three steps are load-bearing:
+    /// The protocol, and both steps are load-bearing:
     ///
-    ///     transport.arm_wakeup();               // 1. declare the intent
-    ///     if (transport.poll(0ms, cb, 1) == 0)  // 2. re-check: a frame may
-    ///     {                                     //    have landed before (1)
-    ///         ::poll(&pfd, 1, timeout);         // 3. now it is safe to block
-    ///         transport.drain_wakeup();
+    ///     if (transport.poll(0ms, cb, 1) == 0)  // 1. look, and arm if empty
+    ///     {
+    ///         ::poll(&pfd, 1, timeout);         // 2. now it is safe to block
     ///     }
     ///
-    /// Step 2 is what closes the lost-wakeup race. Without it the engine can
-    /// push a frame between the arm and the block, find nobody armed yet, write
-    /// nothing, and leave the consumer asleep with work waiting.
+    /// Step 1 is what closes the lost-wakeup race, and it is one step rather
+    /// than three because the arm and the re-check belong to the delivery
+    /// queue, not to its caller: any poll that comes up empty leaves this
+    /// consumer armed. A caller that armed by hand could get the order wrong;
+    /// one that cannot reach the flag cannot (ADR 0005).
     ///
-    /// `poll()` does all of this internally; this is for a caller that owns its
-    /// own event loop -- `epoll`, `select`, `loop.add_reader()` -- and needs the
-    /// waiting to happen somewhere else.
+    /// `poll()` with a timeout does the waiting too; this is for a caller that
+    /// owns its own event loop -- `epoll`, `select`, `loop.add_reader()` -- and
+    /// needs the waiting to happen somewhere else.
     virtual int fd() const noexcept = 0;
 
-    /// Declare that this consumer is about to wait on `fd()`. Idempotent.
-    /// See `fd()` for why a re-check must follow it.
-    virtual void arm_wakeup() noexcept = 0;
-
-    /// Consume a signal after `fd()` becomes readable, so it does not persist.
-    /// A no-op when there is no descriptor or nothing pending.
-    virtual void drain_wakeup() noexcept = 0;
-
+    /// Invoke `cb` on the CALLING thread for each frame available within
+    /// `timeout`; returns how many it dispatched.  Never the engine thread --
+    /// that is 5.2's guarantee, and it is structural: the engine holds no
+    /// `std::function` at all.
+    ///
     /// `max_frames` of 0 means "everything queued", which is what this did
     /// before the parameter existed and remains the default.
     ///

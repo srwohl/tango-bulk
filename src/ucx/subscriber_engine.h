@@ -11,6 +11,7 @@
 
 #include <core/bounded_queue.h>
 #include <core/credit_window.h>
+#include <core/delivery_queue.h>
 #include <core/lease_pool.h>
 #include <core/receive_slot.h>
 #include <core/session_client.h>
@@ -177,15 +178,8 @@ class SubscriberEngine final : public SubscriberTransport
     /// thread.  Either way it is never the engine thread (5.2).
     int fd() const noexcept override
     {
-        return wakeup_fd_;
+        return delivery_.fd();
     }
-
-    void arm_wakeup() noexcept override
-    {
-        consumer_waiting_.store(true, std::memory_order_release);
-    }
-
-    void drain_wakeup() noexcept override;
 
     std::size_t poll(std::chrono::milliseconds timeout,
                      const FrameCallback &cb,
@@ -294,20 +288,6 @@ class SubscriberEngine final : public SubscriberTransport
 
     void commit(std::size_t slot_index) noexcept;
 
-    /// Signal a consumer that has declared itself about to block.
-    ///
-    /// Engine thread, from the loop rather than from an AM callback -- the same
-    /// routing credit and probe-acks already use, because a callback runs inside
-    /// `ucp_worker_progress` and this writes a descriptor.
-    ///
-    /// Writes only if `consumer_waiting_` was true, so a consumer that is keeping
-    /// up never causes a syscall.
-    void signal_consumer() noexcept;
-
-    /// Block until `deadline`, a frame arrives, or the wait is interrupted.
-    /// Consumer thread. Returns whether it is worth looking at the queue again.
-    bool await_frame(std::chrono::steady_clock::time_point deadline) noexcept;
-
     /// Retire the session, and say why.
     ///
     /// `reason` MUST be a string literal or otherwise outlive the engine: this
@@ -324,7 +304,15 @@ class SubscriberEngine final : public SubscriberTransport
     std::shared_ptr<CreditSink> sink_; ///< arena_, as the leases see it
 
     ReleaseTracker tracker_;
-    BoundedQueue<FrameView> delivery_;
+
+    /// The frames this transport has received and not yet handed over, its
+    /// queue policy, and the descriptor a waiting consumer is woken on.
+    ///
+    /// A member for now, which CONTEXT.md says is the wrong owner: the local
+    /// delivery queue belongs to a Subscription, and a reconnect throws this
+    /// transport away. Extracting it is what makes that move possible; section
+    /// 4.2 is what makes it.
+    DeliveryQueue delivery_;
 
     std::vector<Pending> pending_; ///< engine thread only; indexed by slot
 
@@ -359,19 +347,6 @@ class SubscriberEngine final : public SubscriberTransport
     /// Set by `fail()`, read by `last_error()` on the control thread. A raw
     /// pointer to a literal rather than a string, so the AM callback can set it
     /// without allocating.
-    /// eventfd, or -1 if it could not be created.
-    ///
-    /// A transport without one still works: `await_frame` falls back to the
-    /// short sleep this replaced. Losing the wakeup path is a performance and
-    /// interruptibility regression, not a correctness one, so it must not stop
-    /// a subscriber from opening.
-    int wakeup_fd_{-1};
-
-    /// Set by a consumer immediately before it blocks, cleared by whichever of
-    /// the two gets there first. The engine writes the descriptor only on the
-    /// true-to-false transition, which is what makes the common case free.
-    std::atomic<bool> consumer_waiting_{false};
-
     std::atomic<const char *> failure_reason_{nullptr};
     std::atomic<Status> failure_status_{Status::Ok};
 
@@ -391,15 +366,12 @@ class SubscriberEngine final : public SubscriberTransport
     std::atomic<std::uint64_t> renewals_failed_{0};
 
     std::atomic<std::uint64_t> frames_received_{0};
-    std::atomic<std::uint64_t> frames_delivered_{0};
-    std::atomic<std::uint64_t> dropped_queue_full_{0};
     std::atomic<std::uint64_t> dropped_bad_header_{0};
     std::atomic<std::uint64_t> dropped_oversize_{0};
     std::atomic<std::uint64_t> dropped_stale_epoch_{0};
     std::atomic<std::uint64_t> dropped_duplicate_seq_{0};
     std::atomic<std::uint64_t> dropped_geometry_mismatch_{0};
     std::atomic<std::uint64_t> credit_messages_sent_{0};
-    std::atomic<std::uint64_t> delivery_high_water_{0};
     std::atomic<std::uint64_t> transport_errors_{0};
     std::atomic<std::uint64_t> bytes_copied_{0};
 };
