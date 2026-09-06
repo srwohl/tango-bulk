@@ -470,7 +470,7 @@ TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
 
         CHECK(dispatched == 1);
         CHECK(seen == 1);
-        CHECK(subscriber.delivery->taken() ==
+        CHECK(subscriber.delivery->stats().taken ==
               static_cast<std::uint64_t>(i) + 1);
     }
 
@@ -612,7 +612,7 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
     // problem is that it disagreed.
     CHECK(subscriber.engine.counters().frames_dropped_geometry_mismatch == 1);
     CHECK(subscriber.engine.counters().frames_dropped_bad_header == 0);
-    CHECK(subscriber.delivery->taken() == 0);
+    CHECK(subscriber.delivery->stats().taken == 0);
 
     const BulkError why = subscriber.engine.last_error();
     CHECK(why.status == Status::GeometryMismatch);

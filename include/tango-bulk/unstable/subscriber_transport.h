@@ -33,24 +33,13 @@
 /// It lives in `src/core/` because that is the one layer both sides may include.
 /// No UCX type appears on it, so the Tango layer links the transport without
 /// ever compiling against a `ucp/*` header.
-///
-/// Five operations: say where you are, adopt a validated grant, and report
-/// state, failure and counts. It carried sixteen once, mixing the protocol
-/// codec, the lease terms, the wakeup primitives, delivery and observation --
-/// five unrelated concerns, of which the codec varied between implementations
-/// not at all. What is left is what actually differs between a UCX transport
-/// and a fake.
 namespace TangoBulk::detail
 {
 
-/// The subscription's delivery queue, defined in `src/core/delivery_queue.h`.
-///
-/// Forward-declared rather than included, because that header is internal and
-/// this one is installed. A `shared_ptr` parameter needs no complete type, and
-/// a transport implementation -- which does, since it pushes -- is compiled
-/// inside this project. An out-of-tree transport therefore cannot be written
-/// against the installed headers alone; section 4.10 rank 8 is where that seam
-/// stops being installed at all.
+/// Defined in `src/core/delivery_queue.h`. Forward-declared because that header
+/// is internal and this one is installed: a `shared_ptr` parameter needs no
+/// complete type. A transport implementation does need it, so one cannot be
+/// written against the installed headers alone.
 class DeliveryQueue;
 
 class SubscriberTransport
@@ -62,29 +51,19 @@ class SubscriberTransport
     SubscriberTransport &operator=(const SubscriberTransport &) = delete;
 
     /// This subscriber's own address, for the peer to create an endpoint from.
-    ///
-    /// Valid from construction: the receive ring is allocated, registered and
-    /// armed before `Open` goes out, because the publisher may send the first
-    /// frame the instant it replies.
+    /// Valid from construction, because the ring must be armed before `Open`
+    /// goes out: the publisher may send the first frame the instant it replies.
     virtual const std::vector<std::byte> &local_address() const noexcept = 0;
 
-    /// Adopt a grant that has already been validated, and start receiving.
+    /// Adopt a validated grant and start receiving.
     ///
-    /// Everything above the line -- what to ask for, whether the answer is
-    /// acceptable, what the lease now says -- belongs to the subscription and
-    /// happens before this is called. What arrives here is the settled contract:
-    /// the data-plane handle, the array this session will carry, and where to
-    /// reach the publisher.
-    ///
-    /// The ordering is the point. A transport that has not been activated has
-    /// no endpoint and no progress thread, so it cannot put a frame into the
-    /// subscription's delivery queue -- which is what lets a refused grant be
-    /// refused with nothing to clean up. Creating the endpoint precedes
-    /// starting worker progress, for the same reason: one thread owns the
-    /// worker, and `ucp_ep_create` must not race `ucp_worker_progress`.
+    /// Until this is called there is no endpoint and no progress thread, so a
+    /// refused grant needs no cleanup. Endpoint creation precedes worker
+    /// progress: one thread owns the worker, and `ucp_ep_create` must not race
+    /// `ucp_worker_progress`.
     ///
     /// Leaves the state in `Probing`; the publisher's `Probe` moves it to
-    /// `Active`. Returns the reason it could not, having called nothing.
+    /// `Active`.
     virtual Status activate(Protocol::StreamId stream_id,
                             const Protocol::GeometryBlock &granted,
                             const std::vector<std::byte> &server_address) = 0;

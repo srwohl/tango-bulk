@@ -25,13 +25,10 @@
 /// same word, and a failed push or pop is a load and a compare rather than a
 /// lock.
 ///
-/// MPMC is not surplus to requirements, which this comment used to claim it was.
-/// The delivery queue is not SPSC: `DeliveryQueue::push`'s `DropOldest` branch
-/// pops from the producer's thread to make room, so the producer is a second
-/// consumer whenever the queue is full -- and ADR 0008 goes further and permits
-/// competing SPMC readers on the pull side. One reviewed implementation is worth
-/// more than three specialised ones in any case, and the extra cost is a single
-/// CAS on an uncontended word.
+/// MPMC is not surplus to requirements. `DeliveryQueue::push`'s `DropOldest`
+/// branch pops from the producer's thread, so the producer is a second consumer
+/// whenever the queue is full, and ADR 0008 permits competing SPMC readers on
+/// the pull side.
 namespace TangoBulk::detail
 {
 

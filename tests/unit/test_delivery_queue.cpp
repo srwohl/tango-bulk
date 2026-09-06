@@ -76,8 +76,8 @@ TEST_CASE("a pushed frame comes back out in order", "[core][delivery]")
         CHECK(queue.push(frame_over(storage(static_cast<std::uint16_t>(sequence)), sequence)));
     }
 
-    CHECK(queue.size() == 3);
-    CHECK(queue.high_water() == 3);
+    CHECK(queue.stats().depth == 3);
+    CHECK(queue.stats().high_water == 3);
 
     for(std::uint64_t sequence = 1; sequence <= 3; ++sequence)
     {
@@ -89,14 +89,14 @@ TEST_CASE("a pushed frame comes back out in order", "[core][delivery]")
 
     FrameView none;
     CHECK_FALSE(queue.try_take(none));
-    CHECK(queue.taken() == 3);
-    CHECK(queue.dropped() == 0);
+    CHECK(queue.stats().taken == 3);
+    CHECK(queue.stats().dropped == 0);
 }
 
 TEST_CASE("capacity is rounded up to a power of two, and reported", "[core][delivery]")
 {
     detail::DeliveryQueue queue(5, DropPolicy::DropNewest);
-    CHECK(queue.capacity() == 8);
+    CHECK(queue.stats().capacity == 8);
 }
 
 // -- the queue policy --------------------------------------------------------
@@ -115,7 +115,7 @@ TEST_CASE("DropNewest refuses the arriving frame and keeps the queued ones",
     // Refused, and released on the spot. Holding a rejected frame would be a
     // withheld credit that nothing is ever going to return.
     CHECK(rejected.use_count() == 1);
-    CHECK(queue.dropped() == 1);
+    CHECK(queue.stats().dropped == 1);
 
     FrameView frame;
     REQUIRE(queue.try_take(frame));
@@ -134,7 +134,7 @@ TEST_CASE("DropOldest evicts the head to make room for the arriving frame",
 
     // The evicted frame's credit went back when it was dropped, not later.
     CHECK(evicted.use_count() == 1);
-    CHECK(queue.dropped() == 1);
+    CHECK(queue.stats().dropped == 1);
 
     FrameView frame;
     REQUIRE(queue.try_take(frame));
@@ -190,15 +190,15 @@ TEST_CASE("discard() empties the queue and returns every credit", "[core][delive
     CHECK(queue.push(frame_over(second, 2)));
 
     CHECK(queue.discard() == 2);
-    CHECK(queue.size() == 0);
+    CHECK(queue.stats().depth == 0);
     CHECK(first.use_count() == 1);
     CHECK(second.use_count() == 1);
 
     // Counted as its own thing. A frame let go because its session ended is not
     // a frame the queue had no room for, and one counter cannot mean both.
-    CHECK(queue.discarded() == 2);
-    CHECK(queue.dropped() == 0);
-    CHECK(queue.taken() == 0);
+    CHECK(queue.stats().discarded == 2);
+    CHECK(queue.stats().dropped == 0);
+    CHECK(queue.stats().taken == 0);
 
     FrameView none;
     CHECK_FALSE(queue.try_take(none));
@@ -243,7 +243,6 @@ TEST_CASE("take() returns as soon as a producer pushes and notifies",
     std::thread producer([&queue] {
         std::this_thread::sleep_for(20ms);
         queue.push(frame_over(storage(7), 7));
-        queue.notify();
     });
 
     const auto started = std::chrono::steady_clock::now();
@@ -294,7 +293,6 @@ TEST_CASE("a stopped queue hands over what it already holds, then stops waiting"
     CHECK(queue.push(frame_over(storage(1), 1)));
     CHECK(queue.push(frame_over(storage(2), 2)));
     queue.stop();
-    CHECK(queue.stopped());
 
     const auto started = std::chrono::steady_clock::now();
 
@@ -323,8 +321,6 @@ TEST_CASE("notify() with nobody armed makes no signal at all", "[core][delivery]
     REQUIRE(queue.fd() >= 0);
 
     CHECK(queue.push(frame_over(storage(1), 1)));
-    queue.notify();
-    queue.notify();
 
     CHECK_FALSE(readable(queue.fd()));
 }
@@ -343,7 +339,6 @@ TEST_CASE("an empty try_take() arms, so the next notify() is seen",
     CHECK_FALSE(readable(queue.fd()));
 
     CHECK(queue.push(frame_over(storage(5), 5)));
-    queue.notify();
 
     CHECK(readable(queue.fd()));
     REQUIRE(queue.try_take(frame));
@@ -363,7 +358,6 @@ TEST_CASE("a frame that arrives between the look and the wait is not lost",
     CHECK_FALSE(queue.try_take(frame));
 
     queue.push(frame_over(storage(6), 6));
-    queue.notify();
 
     const auto started = std::chrono::steady_clock::now();
     REQUIRE(queue.take(frame, started + 5s));
@@ -386,7 +380,7 @@ TEST_CASE("many frames survive a producer and a consumer running at once",
     std::thread producer([&queue, &refused] {
         for(std::uint64_t sequence = 1; sequence <= k_frames; ++sequence)
         {
-            while(queue.size() >= queue.capacity())
+            while(queue.stats().depth >= queue.stats().capacity)
             {
                 std::this_thread::yield();
             }
@@ -395,7 +389,6 @@ TEST_CASE("many frames survive a producer and a consumer running at once",
             {
                 refused.store(true);
             }
-            queue.notify();
         }
     });
 
@@ -418,8 +411,8 @@ TEST_CASE("many frames survive a producer and a consumer running at once",
     // producer waits for room rather than overrunning it.
     CHECK_FALSE(refused.load());
     CHECK(expected == k_frames + 1);
-    CHECK(queue.taken() == k_frames);
-    CHECK(queue.dropped() == 0);
+    CHECK(queue.stats().taken == k_frames);
+    CHECK(queue.stats().dropped == 0);
 }
 
 } // namespace
