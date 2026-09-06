@@ -7,6 +7,7 @@
 
 #include <ucx/subscriber_engine.h>
 
+#include <core/delivery_queue.h>
 #include <core/cpu_topology.h>
 
 #include <tango-bulk/publisher.h>
@@ -154,11 +155,59 @@ inline PublishResult publish_one(BulkPublisher &publisher, std::uint64_t bytes, 
     return publisher.publish(std::move(lease), meta_for(bytes, seed));
 }
 
+/// The delivery queue a subscription would have created for this engine.
+///
+/// A transport no longer owns its queue: the subscription does, so that it
+/// survives a reconnect and so that taking a frame never reaches through the
+/// transport. A test driving an engine directly is therefore standing in for
+/// the subscription, and it says so by holding the queue itself -- one named
+/// variable per engine, rather than a helper that would hide the very ownership
+/// these tests exist to exercise.
+inline std::shared_ptr<detail::DeliveryQueue> queue_for(const SubscriberConfig &config)
+{
+    return std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
+                                                   config.drop_policy);
+}
+
+/// Take up to `max_frames` within `timeout`, invoking `cb` on this thread.
+///
+/// What `SubscriberEngine::poll()` used to be, as a free function over the
+/// queue -- which is where the frames are now.
+inline std::size_t drain(detail::DeliveryQueue &delivery,
+                         std::chrono::milliseconds timeout,
+                         const FrameCallback &cb,
+                         std::size_t max_frames = 0)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::size_t dispatched = 0;
+
+    while(max_frames == 0 || dispatched < max_frames)
+    {
+        FrameView view;
+        const bool got =
+            dispatched == 0 ? delivery.take(view, deadline) : delivery.try_take(view);
+
+        if(!got)
+        {
+            break;
+        }
+
+        ++dispatched;
+        if(cb)
+        {
+            cb(std::move(view));
+        }
+        view.reset();
+    }
+
+    return dispatched;
+}
+
 /// Poll until `want` frames have been delivered, or the budget runs out.
 ///
 /// The returned views are *retained*, which means their credits are withheld.
 /// That is the point in most cases; where it is not, the caller clears them.
-inline std::vector<FrameView> collect(detail::SubscriberEngine &subscriber,
+inline std::vector<FrameView> collect(detail::DeliveryQueue &delivery,
                                       std::size_t want,
                                       std::chrono::milliseconds budget = 5s)
 {
@@ -167,7 +216,7 @@ inline std::vector<FrameView> collect(detail::SubscriberEngine &subscriber,
 
     while(views.size() < want && std::chrono::steady_clock::now() < deadline)
     {
-        subscriber.poll(10ms, [&views](FrameView view) { views.push_back(std::move(view)); });
+        drain(delivery, 10ms, [&views](FrameView view) { views.push_back(std::move(view)); });
     }
 
     return views;
@@ -177,12 +226,18 @@ inline std::vector<FrameView> collect(detail::SubscriberEngine &subscriber,
 struct Slice
 {
     BulkPublisher publisher;
+
+    /// Declared before `subscriber` so it outlives it, which is the ownership
+    /// this change is about: the queue is the subscription's, and the transport
+    /// only borrows somewhere to push.
+    std::shared_ptr<detail::DeliveryQueue> delivery;
     detail::SubscriberEngine subscriber;
 
     explicit Slice(PublisherConfig pub = publisher_config(),
                    SubscriberConfig sub = subscriber_config()) :
         publisher(std::move(pub)),
-        subscriber(std::move(sub))
+        delivery(queue_for(sub)),
+        subscriber(std::move(sub), delivery)
     {
         open_session(publisher, subscriber);
     }

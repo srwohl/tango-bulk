@@ -5,6 +5,8 @@
 #ifndef TANGO_BULK_TESTS_UNIT_FAKE_TRANSPORT_H
 #define TANGO_BULK_TESTS_UNIT_FAKE_TRANSPORT_H
 
+#include <core/delivery_queue.h>
+
 #include <tango-bulk/unstable/session_supervisor.h>
 
 #include <algorithm>
@@ -146,18 +148,30 @@ struct Script
 
     // -- the data path -------------------------------------------------------
 
-    /// Frames the transport has received and not yet handed over.
-    ///
-    /// Here rather than in the transport for the same reason everything else
-    /// scripted is: a test arranges arrivals before a supervisor exists, and a
-    /// reconnect builds a *new* transport that has to keep delivering them.
-    std::deque<ScriptedFrame> arrivals;
+    /// The subscription's delivery queue, once a transport has been built over
+    /// it. The same queue for every session, which is the ownership under test.
+    std::shared_ptr<detail::DeliveryQueue> delivery;
 
-    /// Which threads the frame callback ran on. Delivery is not allowed to
-    /// happen on a coordination thread (ADR 0008), so where it happened is a
-    /// thing to assert rather than to assume.
-    std::set<std::thread::id> frame_threads;
-    std::atomic<int> frames_delivered{0};
+    /// Frames sent before any transport existed.
+    ///
+    /// A test arranges arrivals before it opens a supervisor, and until then
+    /// there is nowhere to put them -- the queue is created by the subscription,
+    /// which does not exist yet. They go in on the first attach, which is what a
+    /// publisher that had frames waiting would produce anyway.
+    std::deque<ScriptedFrame> staged;
+
+    /// Called by the factory for every transport it builds.
+    void attach(std::shared_ptr<detail::DeliveryQueue> queue)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        delivery = std::move(queue);
+
+        for(ScriptedFrame &frame : staged)
+        {
+            deliver_locked(frame);
+        }
+        staged.clear();
+    }
 
     /// Hand the transport one more frame to deliver, shaped like the grant.
     ///
@@ -182,47 +196,41 @@ struct Script
         frame.fields.generation = 1;
 
         std::lock_guard<std::mutex> lock(mutex);
-        arrivals.push_back(std::move(frame));
-    }
-
-    bool take_frame(ScriptedFrame &out)
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        if(arrivals.empty())
+        if(delivery)
         {
-            return false;
+            deliver_locked(frame);
         }
-
-        out = std::move(arrivals.front());
-        arrivals.pop_front();
-        return true;
+        else
+        {
+            staged.push_back(std::move(frame));
+        }
     }
 
-    void note_frame_thread()
+  private:
+    /// Push straight into the subscription's queue, exactly as the engine's AM
+    /// callback does, and then wake anyone waiting -- which the engine does from
+    /// its loop rather than from the callback.
+    void deliver_locked(ScriptedFrame &frame)
     {
-        std::lock_guard<std::mutex> lock(mutex);
-        frame_threads.insert(std::this_thread::get_id());
-    }
-
-    std::size_t frame_thread_count()
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        return frame_threads.size();
-    }
-
-    bool delivered_on(std::thread::id id)
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        return frame_threads.count(id) != 0;
+        delivery->push(FrameView::detached(frame.payload, frame.bytes(), frame.fields));
+        delivery->notify();
     }
 };
 
 class FakeTransport final : public detail::SubscriberTransport
 {
   public:
-    explicit FakeTransport(Script &script) : script_(script)
+    /// Takes the subscription's queue and hands it to the script, which is what
+    /// gives a test somewhere to send frames from.
+    ///
+    /// There is no `poll()` here any more, and that is the point: a transport
+    /// is given somewhere to put frames rather than asked for them, so nothing
+    /// above has to hold it alive across an application callback.
+    FakeTransport(Script &script, std::shared_ptr<detail::DeliveryQueue> delivery) :
+        script_(script)
     {
         script_.transports_built.fetch_add(1, std::memory_order_relaxed);
+        script_.attach(std::move(delivery));
     }
 
     std::vector<std::byte> make_open_request(std::uint64_t) const override
@@ -287,59 +295,6 @@ class FakeTransport final : public detail::SubscriberTransport
         return 20;
     }
 
-    int fd() const noexcept override
-    {
-        return -1; // no data path, so nothing to wait on
-    }
-
-    /// The real engine's `poll()` contract over a scripted arrival queue:
-    /// invoke `cb` on the CALLING thread, dispatch at most `max_frames` (0
-    /// meaning everything queued), block up to `timeout` if nothing has
-    /// arrived, and return how many it dispatched.
-    ///
-    /// It has to be the contract rather than a stub. This is the only place
-    /// frame delivery is reachable without a device, and while this returned a
-    /// constant 0 the supervisor's delivery path had no test at all -- which is
-    /// the single largest hole in the suite that a Python binding would sit on
-    /// top of.
-    std::size_t poll(std::chrono::milliseconds timeout,
-                     const FrameCallback &cb,
-                     std::size_t max_frames = 0) override
-    {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        std::size_t dispatched = 0;
-
-        for(;;)
-        {
-            ScriptedFrame frame;
-
-            // The budget is tested before the take, not after: a frame this
-            // call has no room for would be dispatched nowhere and destroyed,
-            // which loses it. The engine gets this right and so must the fake,
-            // or the fake stops standing in for it.
-            while((max_frames == 0 || dispatched < max_frames) && script_.take_frame(frame))
-            {
-                ++dispatched;
-                script_.frames_delivered.fetch_add(1, std::memory_order_relaxed);
-                script_.note_frame_thread();
-
-                if(cb)
-                {
-                    cb(FrameView::detached(frame.payload, frame.bytes(), frame.fields));
-                }
-            }
-
-            if(dispatched != 0 || std::chrono::steady_clock::now() >= deadline)
-            {
-                break;
-            }
-
-            std::this_thread::sleep_for(std::min(timeout, std::chrono::milliseconds{2}));
-        }
-
-        return dispatched;
-    }
-
     BulkError last_error() const noexcept override
     {
         return failed_ ? BulkError{Status::TransportFailure, "the fake was told to fail", "transport"}
@@ -387,9 +342,11 @@ class FakeTransport final : public detail::SubscriberTransport
 inline detail::TransportFactory fake_factory(Script &script,
                                              std::shared_ptr<FakeTransport *> latest = nullptr)
 {
-    return [&script, latest](const SubscriberConfig &) -> std::unique_ptr<detail::SubscriberTransport>
+    return [&script, latest](const SubscriberConfig &,
+                             std::shared_ptr<detail::DeliveryQueue> delivery)
+        -> std::unique_ptr<detail::SubscriberTransport>
     {
-        auto transport = std::make_unique<FakeTransport>(script);
+        auto transport = std::make_unique<FakeTransport>(script, std::move(delivery));
         if(latest)
         {
             *latest = transport.get();

@@ -4,6 +4,7 @@
 
 #include <tango-bulk/unstable/session_supervisor.h>
 
+#include <memory>
 #include <utility>
 
 /// The one translation unit that knows both halves.
@@ -22,7 +23,8 @@ std::unique_ptr<SessionSupervisor> open_session(SubscriberConfig config,
     return SessionSupervisor::open(
         std::move(config),
         std::move(channel),
-        [](const SubscriberConfig &for_session) { return make_subscriber_transport(for_session); },
+        [](const SubscriberConfig &for_session, std::shared_ptr<DeliveryQueue> delivery)
+        { return make_subscriber_transport(for_session, std::move(delivery)); },
         std::move(callbacks));
 }
 

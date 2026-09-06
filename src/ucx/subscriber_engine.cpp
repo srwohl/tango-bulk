@@ -145,10 +145,11 @@ struct SubscriberEngine::Pending
     void *request{nullptr};
 };
 
-SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
+SubscriberEngine::SubscriberEngine(SubscriberConfig config,
+                                   std::shared_ptr<DeliveryQueue> delivery) :
     config_(std::move(config)),
     tracker_(config_.ring_depth),
-    delivery_(config_.delivery_queue_depth, config_.drop_policy),
+    delivery_(std::move(delivery)),
     pending_(config_.ring_depth)
 {
     const Status status = config_.validate();
@@ -158,12 +159,21 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
             status, std::string("invalid SubscriberConfig: ") + to_string(status), "subscriber"});
     }
 
-    // `delivery_mode` is deliberately not inspected here.  This class delivers
-    // by `poll()` and nothing else; whether a library-owned thread calls it or
-    // the application does is `BulkSubscriber`'s business, one layer up, which
-    // is also the layer that owns the `std::function` 5.2 keeps away from the
-    // engine.  A check here would only be able to refuse a mode this class has
-    // no opinion about.
+    // Checked here rather than at the first push, because the first push is
+    // inside `ucp_worker_progress` on the engine thread, where there is nothing
+    // useful to do about it.
+    if(!delivery_)
+    {
+        throw BulkException(BulkError{
+            Status::Internal, "a subscriber transport needs a delivery queue", "subscriber"});
+    }
+
+    // `delivery_mode` is deliberately not inspected here.  This class receives
+    // into the queue it was given and nothing else; whether a library-owned
+    // thread or the application takes frames out of it is the subscription's
+    // business, one layer up, which is also the layer that owns the
+    // `std::function` 5.2 keeps away from the engine.  A check here could only
+    // refuse a mode this class has no opinion about.
 
     context_ = std::make_shared<UcxContext>(config_.ucx_tls);
     worker_ = std::make_unique<UcxWorker>(*context_);
@@ -204,10 +214,11 @@ SubscriberEngine::~SubscriberEngine()
 {
     running_.store(false, std::memory_order_release);
 
-    // Stop the delivery queue before joining, so teardown does not have to wait
-    // out somebody else's timeout. Sticky rather than a nudge: a consumer that
-    // is merely woken finds nothing and blocks again.
-    delivery_.stop();
+    // The delivery queue is deliberately NOT stopped here. It belongs to the
+    // subscription, and a reconnect destroys this engine to build another over
+    // the same queue -- stopping it would end delivery for the subscription on
+    // the first lost session. Whoever owns the queue stops it when the
+    // subscription itself ends.
 
     if(engine_.joinable())
     {
@@ -288,6 +299,11 @@ Status SubscriberEngine::adopt_open_reply(const std::byte *data, std::size_t siz
 
     tracker_.reset(0);
 
+    // Where this session's delivery count starts. The queue spans every session
+    // the subscription has had; `Renew` reports the progress of this one.
+    // Written before the engine thread exists, which is what publishes it.
+    delivered_at_open_ = delivery_->taken();
+
     // Still the only thread touching this worker: the engine has not started.
     try
     {
@@ -316,7 +332,7 @@ std::vector<std::byte> SubscriberEngine::make_renew_request(std::uint64_t correl
     renewals_sent_.fetch_add(1, std::memory_order_relaxed);
     return session_.make_renew_request(
         correlation_id,
-        delivery_.taken(),
+        delivery_->taken() - delivered_at_open_,
         arena_ ? arena_->credits_returned() : 0,
         static_cast<std::uint32_t>(state_.load(std::memory_order_acquire)));
 }
@@ -374,7 +390,7 @@ void SubscriberEngine::engine_loop()
         // Out of the callback and into the loop, the same way credit and
         // probe-acks are routed: a write() belongs nowhere near the inside of
         // ucp_worker_progress.
-        delivery_.notify();
+        delivery_->notify();
 
         if(worked)
         {
@@ -992,50 +1008,10 @@ void SubscriberEngine::commit(std::size_t slot_index) noexcept
     // returns are all the queue's now. Waking a consumer is deliberately not
     // done here: this runs inside `ucp_worker_progress`, and the loop calls
     // `notify()` for the same reason it sends credit and probe acks.
-    delivery_.push(std::move(view));
+    delivery_->push(std::move(view));
 }
 
 // -- application thread -----------------------------------------------------
-
-std::size_t SubscriberEngine::poll(std::chrono::milliseconds timeout,
-                                   const FrameCallback &cb,
-                                   std::size_t max_frames)
-{
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    std::size_t dispatched = 0;
-
-    while(max_frames == 0 || dispatched < max_frames)
-    {
-        FrameView view;
-
-        // Only the first frame of an idle poll waits. After that, whatever
-        // arrived alongside it is taken without blocking again, which is what
-        // makes one call drain a burst rather than one frame per timeout.
-        //
-        // Both forms leave the consumer armed when they come up empty, so a
-        // caller watching fd() never performs the arm/re-check protocol itself.
-        const bool got =
-            dispatched == 0 ? delivery_.take(view, deadline) : delivery_.try_take(view);
-
-        if(!got)
-        {
-            break;
-        }
-
-        ++dispatched;
-
-        // On the CALLING thread, per 2.4.  Whether the credit returns when this
-        // returns is entirely up to the callback: keeping a copy withholds it,
-        // which is the documented backpressure semantic and not a leak.
-        if(cb)
-        {
-            cb(std::move(view));
-        }
-        view.reset();
-    }
-
-    return dispatched;
-}
 
 bool SubscriberEngine::ring_contains(const void *p) const noexcept
 {
@@ -1049,10 +1025,13 @@ const std::byte *SubscriberEngine::slot_address(std::size_t index) const noexcep
 
 SubscriberCounters SubscriberEngine::counters() const noexcept
 {
+    // `frames_delivered`, `frames_dropped_queue_full` and the two queue gauges
+    // are absent, and stay absent: they describe the subscription's delivery
+    // queue, which outlives this transport. Reporting the shared totals from
+    // here would have them counted once per session by whoever accumulates
+    // retiring transports.
     SubscriberCounters out;
     out.frames_received = frames_received_.load(std::memory_order_relaxed);
-    out.frames_delivered = delivery_.taken();
-    out.frames_dropped_queue_full = delivery_.dropped();
     out.frames_dropped_stale_epoch = dropped_stale_epoch_.load(std::memory_order_relaxed);
     out.frames_dropped_bad_header = dropped_bad_header_.load(std::memory_order_relaxed);
     out.frames_dropped_oversize = dropped_oversize_.load(std::memory_order_relaxed);
@@ -1062,8 +1041,6 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
     out.credits_returned = arena_->credits_returned();
     out.credit_messages_sent = credit_messages_sent_.load(std::memory_order_relaxed);
     out.views_outstanding = arena_->views_outstanding();
-    out.delivery_queue_depth = delivery_.size();
-    out.delivery_queue_high_water = delivery_.high_water();
     out.sessions_opened = session_.stream_id() != 0 ? 1u : 0u;
     out.renewals_sent = renewals_sent_.load(std::memory_order_relaxed);
     out.renewals_failed = renewals_failed_.load(std::memory_order_relaxed);
@@ -1072,12 +1049,13 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
     return out;
 }
 
-std::unique_ptr<SubscriberTransport> make_subscriber_transport(SubscriberConfig config)
+std::unique_ptr<SubscriberTransport> make_subscriber_transport(
+    SubscriberConfig config, std::shared_ptr<DeliveryQueue> delivery)
 {
     // Declared in `tango-bulk/unstable/subscriber_transport.h` and defined here, which is the
     // point of the seam: `BulkSubscriber` constructs a transport without naming
     // the concrete type, and therefore without compiling against `ucp/*`.
-    return std::make_unique<SubscriberEngine>(std::move(config));
+    return std::make_unique<SubscriberEngine>(std::move(config), std::move(delivery));
 }
 
 } // namespace TangoBulk::detail

@@ -6,6 +6,8 @@
 
 #include <ucx/subscriber_engine.h>
 
+#include <core/delivery_queue.h>
+
 #include <tango-bulk/publisher.h>
 
 #include <algorithm>
@@ -14,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -436,6 +439,38 @@ int run_publisher(const Options &options)
 
 // -- subscriber --------------------------------------------------------------
 
+/// Take up to `max_frames` within `timeout`, invoking `cb` on this thread.
+///
+/// The engine used to offer this. It no longer does: the delivery queue belongs
+/// to the subscription, and here the benchmark *is* the subscription, so the
+/// loop lives with the consumer rather than with the transport.
+std::size_t take_frames(detail::DeliveryQueue &delivery,
+                        std::chrono::milliseconds timeout,
+                        const FrameCallback &cb,
+                        std::size_t max_frames = 0)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::size_t dispatched = 0;
+
+    while(max_frames == 0 || dispatched < max_frames)
+    {
+        FrameView view;
+        const bool got =
+            dispatched == 0 ? delivery.take(view, deadline) : delivery.try_take(view);
+
+        if(!got)
+        {
+            break;
+        }
+
+        ++dispatched;
+        cb(std::move(view));
+        view.reset();
+    }
+
+    return dispatched;
+}
+
 int run_subscriber(const Options &options)
 {
     SubscriberConfig config;
@@ -447,7 +482,12 @@ int run_subscriber(const Options &options)
     config.delivery_mode = DeliveryMode::Manual;
     config.ucx_tls = options.tls;
 
-    detail::SubscriberEngine engine(config);
+    // The queue belongs to the subscription, and here the benchmark is the
+    // subscription: it supplies somewhere for the engine to push frames, and
+    // takes them out of that rather than out of the engine.
+    const auto delivery = std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
+                                                                  config.drop_policy);
+    detail::SubscriberEngine engine(config, delivery);
 
     const OobChannel oob = OobChannel::connect_to(options.host, options.port);
 
@@ -485,7 +525,8 @@ int run_subscriber(const Options &options)
     const auto deadline = Clock::now() + std::chrono::seconds(120);
     while(received < total && Clock::now() < deadline)
     {
-        engine.poll(std::chrono::milliseconds(10),
+        take_frames(*delivery,
+                    std::chrono::milliseconds(10),
                     [&](FrameView view)
                     {
                         if(view.size() != options.size)
@@ -511,11 +552,16 @@ int run_subscriber(const Options &options)
     const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
 
     const SubscriberCounters counters = engine.counters();
+
+    // `frames_dropped_queue_full` is the queue's, not the engine's: the queue
+    // outlives any one session, so it is the thing that knows.
+    const std::uint64_t dropped_queue_full = delivery->dropped();
+
     report_rate("subscriber", received > options.warmup ? received - options.warmup : 0,
                 options.size, seconds);
     std::printf("            dropped: queue-full %" PRIu64 "  bad-header %" PRIu64
                 "  oversize %" PRIu64 "  duplicate-seq %" PRIu64 "  stale-epoch %" PRIu64 "\n",
-                counters.frames_dropped_queue_full,
+                dropped_queue_full,
                 counters.frames_dropped_bad_header,
                 counters.frames_dropped_oversize,
                 counters.frames_dropped_duplicate_seq,
