@@ -354,6 +354,15 @@ TEST_CASE("a reopened session that describes a different array is refused",
 
     // The new grant was never adopted, so nothing describes the new shape.
     CHECK(supervisor->granted_geometry().generation == 0);
+
+    // And the transport carrying it was never started. That is what makes this
+    // safe rather than merely tidy: a transport is built, its grant is checked,
+    // and only then is it activated -- so a refused reopen has no endpoint, no
+    // progress thread and nothing queued behind it. The seam enforces the
+    // order, because adopting a grant and starting on it is one call and the
+    // subscription decides whether to make it.
+    CHECK(script.transports_built.load() >= 2);
+    CHECK(script.activations.load() == 1);
 }
 
 TEST_CASE("a reopened session with the same array is adopted normally",

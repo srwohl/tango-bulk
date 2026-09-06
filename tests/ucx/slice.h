@@ -8,6 +8,7 @@
 #include <ucx/subscriber_engine.h>
 
 #include <core/delivery_queue.h>
+#include <core/session_client.h>
 #include <core/cpu_topology.h>
 
 #include <tango-bulk/publisher.h>
@@ -76,13 +77,92 @@ bool eventually(Predicate predicate, std::chrono::milliseconds budget = 5s)
     return predicate();
 }
 
+/// The delivery queue a subscription would have created for this engine.
+///
+/// A transport no longer owns its queue: the subscription does, so that it
+/// survives a reconnect and so that taking a frame never reaches through the
+/// transport. A test driving an engine directly is therefore standing in for
+/// the subscription, and it says so by holding the queue itself -- one named
+/// variable per engine, rather than a helper that would hide the very ownership
+/// these tests exist to exercise.
+inline std::shared_ptr<detail::DeliveryQueue> queue_for(const SubscriberConfig &config)
+{
+    return std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
+                                                   config.drop_policy);
+}
+
+/// One subscriber, assembled the way a subscription assembles one.
+///
+/// A transport owns neither of these any more. The delivery queue belongs to
+/// the subscription so that it survives a reconnect, and the session contract
+/// -- the grant, the lease terms, the identifiers `Renew` and `Close` quote --
+/// belongs to it too, so that a grant is settled and checked *before* a
+/// transport is started on it. A test driving an engine directly is standing in
+/// for the subscription, and this is what that costs: two members and the open
+/// handshake spelled out.
+struct Subscriber
+{
+    SubscriberConfig config;
+    std::shared_ptr<detail::DeliveryQueue> delivery;
+    detail::SessionClient session;
+    detail::SubscriberEngine engine;
+
+    explicit Subscriber(SubscriberConfig cfg = subscriber_config()) :
+        config(std::move(cfg)),
+        delivery(queue_for(config)),
+        engine(config, delivery)
+    {
+    }
+
+    std::vector<std::byte> make_open_request(std::uint64_t correlation_id)
+    {
+        return session.make_open_request(config, engine.local_address(), correlation_id);
+    }
+
+    /// Adopt the grant, then start the transport on it -- in that order, which
+    /// is the ordering the seam now enforces rather than merely documents.
+    Status adopt_open_reply(const std::byte *data, std::size_t size)
+    {
+        const Status status = session.adopt_open_reply(data, size, config);
+        if(status != Status::Ok)
+        {
+            return status;
+        }
+
+        return engine.activate(
+            session.stream_id(), session.granted_geometry(), session.server_address());
+    }
+
+    std::vector<std::byte> make_renew_request(std::uint64_t correlation_id)
+    {
+        return session.make_renew_request(correlation_id,
+                                          delivery->taken(),
+                                          engine.counters().credits_returned,
+                                          static_cast<std::uint32_t>(engine.state()));
+    }
+
+    Status adopt_renew_reply(const std::byte *data, std::size_t size)
+    {
+        return session.adopt_renew_reply(data, size).status;
+    }
+
+    std::vector<std::byte> make_close_request(std::uint64_t correlation_id) const
+    {
+        return session.make_close_request(correlation_id);
+    }
+};
+
+/// Take up to `max_frames` within `timeout`, invoking `cb` on this thread.
+///
+/// What `SubscriberEngine::poll()` used to be, as a free function over the
+/// queue -- which is where the frames are now.
 /// Run the `Open` exchange, straight through `handle_coordination`.
 ///
 /// No Tango process, no DeviceProxy, no commands -- the bytes are the real
 /// protocol bytes and only the transport carrying them is short-circuited.
 /// Returns the reply so a caller can inspect the grant.
 inline std::vector<std::byte> exchange_open(BulkPublisher &publisher,
-                                            detail::SubscriberEngine &subscriber,
+                                            Subscriber &subscriber,
                                             std::uint64_t correlation_id = 1)
 {
     const std::vector<std::byte> request = subscriber.make_open_request(correlation_id);
@@ -95,16 +175,16 @@ inline std::vector<std::byte> exchange_open(BulkPublisher &publisher,
 /// moment before it is eligible for a frame.  `armed_target` is how many armed
 /// sessions the publisher should end up with.
 inline bool await_armed(BulkPublisher &publisher,
-                        detail::SubscriberEngine &subscriber,
+                        Subscriber &subscriber,
                         std::size_t armed_target = 1)
 {
     return eventually([&] { return publisher.session_count() == armed_target; }) &&
-           eventually([&] { return subscriber.state() == SubscriberState::Active; });
+           eventually([&] { return subscriber.engine.state() == SubscriberState::Active; });
 }
 
 /// Open a session and wait until frames may flow.
 inline void open_session(BulkPublisher &publisher,
-                         detail::SubscriberEngine &subscriber,
+                         Subscriber &subscriber,
                          std::size_t armed_target = 1)
 {
     const std::vector<std::byte> reply = exchange_open(publisher, subscriber);
@@ -155,24 +235,6 @@ inline PublishResult publish_one(BulkPublisher &publisher, std::uint64_t bytes, 
     return publisher.publish(std::move(lease), meta_for(bytes, seed));
 }
 
-/// The delivery queue a subscription would have created for this engine.
-///
-/// A transport no longer owns its queue: the subscription does, so that it
-/// survives a reconnect and so that taking a frame never reaches through the
-/// transport. A test driving an engine directly is therefore standing in for
-/// the subscription, and it says so by holding the queue itself -- one named
-/// variable per engine, rather than a helper that would hide the very ownership
-/// these tests exist to exercise.
-inline std::shared_ptr<detail::DeliveryQueue> queue_for(const SubscriberConfig &config)
-{
-    return std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
-                                                   config.drop_policy);
-}
-
-/// Take up to `max_frames` within `timeout`, invoking `cb` on this thread.
-///
-/// What `SubscriberEngine::poll()` used to be, as a free function over the
-/// queue -- which is where the frames are now.
 inline std::size_t drain(detail::DeliveryQueue &delivery,
                          std::chrono::milliseconds timeout,
                          const FrameCallback &cb,
@@ -226,18 +288,12 @@ inline std::vector<FrameView> collect(detail::DeliveryQueue &delivery,
 struct Slice
 {
     BulkPublisher publisher;
-
-    /// Declared before `subscriber` so it outlives it, which is the ownership
-    /// this change is about: the queue is the subscription's, and the transport
-    /// only borrows somewhere to push.
-    std::shared_ptr<detail::DeliveryQueue> delivery;
-    detail::SubscriberEngine subscriber;
+    Subscriber subscriber;
 
     explicit Slice(PublisherConfig pub = publisher_config(),
                    SubscriberConfig sub = subscriber_config()) :
         publisher(std::move(pub)),
-        delivery(queue_for(sub)),
-        subscriber(std::move(sub), delivery)
+        subscriber(std::move(sub))
     {
         open_session(publisher, subscriber);
     }

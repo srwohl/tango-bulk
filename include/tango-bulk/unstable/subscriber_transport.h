@@ -31,9 +31,15 @@
 /// coordination bytes over Tango commands, and this header is the seam.
 ///
 /// It lives in `src/core/` because that is the one layer both sides may include.
-/// Every method deals in encoded bytes, plain enums and `FrameView` -- no UCX
-/// type appears, so the Tango layer links the transport without ever compiling
-/// against a `ucp/*` header.
+/// No UCX type appears on it, so the Tango layer links the transport without
+/// ever compiling against a `ucp/*` header.
+///
+/// Five operations: say where you are, adopt a validated grant, and report
+/// state, failure and counts. It carried sixteen once, mixing the protocol
+/// codec, the lease terms, the wakeup primitives, delivery and observation --
+/// five unrelated concerns, of which the codec varied between implementations
+/// not at all. What is left is what actually differs between a UCX transport
+/// and a fake.
 namespace TangoBulk::detail
 {
 
@@ -55,40 +61,33 @@ class SubscriberTransport
     SubscriberTransport(const SubscriberTransport &) = delete;
     SubscriberTransport &operator=(const SubscriberTransport &) = delete;
 
-    /// Encoded `Open`.  By the time this returns the receive ring is allocated,
-    /// registered and armed (4.1's `Opening` entry action), because the
-    /// publisher may send the first frame the instant it replies.
-    virtual std::vector<std::byte> make_open_request(std::uint64_t correlation_id) const = 0;
-
-    /// Adopt an `OpenReply`: stream id, granted geometry, endpoint to the
-    /// server.  Leaves the state in `Probing`; the publisher's `Probe` moves it
-    /// to `Active`.
-    virtual Status adopt_open_reply(const std::byte *data, std::size_t size) = 0;
-
-    virtual std::vector<std::byte> make_renew_request(std::uint64_t correlation_id) = 0;
-
-    /// Adopt a `RenewReply`.  `SessionExpired` and `UnknownSession` are terminal
-    /// for this session (3.7: "There is no resurrection").
-    virtual Status adopt_renew_reply(const std::byte *data, std::size_t size) = 0;
-
-    virtual std::vector<std::byte> make_close_request(std::uint64_t correlation_id) const = 0;
-
-    /// The lease terms as they stand after the last reply.  3.7 lets the server
-    /// change them at any renewal and requires the client to adopt the new
-    /// values, so the renew timer reads these rather than the configuration.
-    virtual std::uint32_t lease_ttl_ms() const noexcept = 0;
-    virtual std::uint32_t renew_interval_ms() const noexcept = 0;
-
-    /// The geometry this session was granted: element type, rank, shape,
-    /// strides, maximum frame size, ring depth and credit window.
+    /// This subscriber's own address, for the peer to create an endpoint from.
     ///
-    /// All-zero before a grant is adopted; `generation` is the field to test,
-    /// since 0 is never a legal epoch on the wire.
+    /// Valid from construction: the receive ring is allocated, registered and
+    /// armed before `Open` goes out, because the publisher may send the first
+    /// frame the instant it replies.
+    virtual const std::vector<std::byte> &local_address() const noexcept = 0;
+
+    /// Adopt a grant that has already been validated, and start receiving.
     ///
-    /// By value rather than by reference: a reconnect replaces the whole
-    /// transport, so a reference handed to an application thread would outlive
-    /// what it points at. The block is 96 bytes of POD.
-    virtual Protocol::GeometryBlock granted_geometry() const noexcept = 0;
+    /// Everything above the line -- what to ask for, whether the answer is
+    /// acceptable, what the lease now says -- belongs to the subscription and
+    /// happens before this is called. What arrives here is the settled contract:
+    /// the data-plane handle, the array this session will carry, and where to
+    /// reach the publisher.
+    ///
+    /// The ordering is the point. A transport that has not been activated has
+    /// no endpoint and no progress thread, so it cannot put a frame into the
+    /// subscription's delivery queue -- which is what lets a refused grant be
+    /// refused with nothing to clean up. Creating the endpoint precedes
+    /// starting worker progress, for the same reason: one thread owns the
+    /// worker, and `ucp_ep_create` must not race `ucp_worker_progress`.
+    ///
+    /// Leaves the state in `Probing`; the publisher's `Probe` moves it to
+    /// `Active`. Returns the reason it could not, having called nothing.
+    virtual Status activate(Protocol::StreamId stream_id,
+                            const Protocol::GeometryBlock &granted,
+                            const std::vector<std::byte> &server_address) = 0;
 
     /// Why the transport reached `Failed`, valid once it has.
     ///
@@ -103,7 +102,6 @@ class SubscriberTransport
     virtual BulkError last_error() const noexcept = 0;
 
     virtual SubscriberState state() const noexcept = 0;
-    virtual std::uint32_t generation() const noexcept = 0;
     virtual SubscriberCounters counters() const noexcept = 0;
 
   protected:

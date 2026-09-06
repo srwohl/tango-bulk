@@ -121,10 +121,8 @@ TEST_CASE("Open grants unpredictable identifiers and the negotiated lease terms"
     config.renew_interval_ms = 1'000;
 
     BulkPublisher publisher(config);
-    const auto first_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine first(subscriber_config(), first_delivery);
-    const auto second_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine second(subscriber_config(), second_delivery);
+    Subscriber first(subscriber_config());
+    Subscriber second(subscriber_config());
 
     const Protocol::OpenReply a = decode_open_reply(exchange_open(publisher, first, 1));
     const Protocol::OpenReply b = decode_open_reply(exchange_open(publisher, second, 2));
@@ -155,8 +153,7 @@ TEST_CASE("Open grants unpredictable identifiers and the negotiated lease terms"
 TEST_CASE("A granted session carries no frame until ProbeAck arms it", "[m3][session]")
 {
     BulkPublisher publisher(publisher_config());
-    const auto subscriber_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine subscriber(subscriber_config(), subscriber_delivery);
+    Subscriber subscriber(subscriber_config());
 
     const std::vector<std::byte> reply = exchange_open(publisher, subscriber);
 
@@ -174,7 +171,7 @@ TEST_CASE("A granted session carries no frame until ProbeAck arms it", "[m3][ses
     REQUIRE(await_armed(publisher, subscriber));
 
     CHECK(publish_one(publisher, 4096, 2) == PublishResult::Accepted);
-    REQUIRE(collect(*subscriber_delivery, 1).size() == 1);
+    REQUIRE(collect(*subscriber.delivery, 1).size() == 1);
 
     const std::vector<std::byte> request = subscriber.make_close_request(2);
     publisher.handle_coordination(request.data(), request.size());
@@ -200,14 +197,13 @@ TEST_CASE("Renewal keeps a session alive past its lease", "[m3][session]")
     CHECK(slice.publisher.session_count() == 1);
     CHECK(slice.publisher.counters().sessions_expired == 0);
     CHECK(slice.publisher.counters().renewals_accepted >= 6);
-    CHECK(slice.subscriber.state() == SubscriberState::Active);
+    CHECK(slice.subscriber.engine.state() == SubscriberState::Active);
 }
 
 TEST_CASE("An unrenewed session expires on schedule with no frames in flight", "[m3][session]")
 {
     BulkPublisher publisher(short_lease_config());
-    const auto subscriber_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine subscriber(subscriber_config(), subscriber_delivery);
+    Subscriber subscriber(subscriber_config());
 
     const std::vector<std::byte> raw = exchange_open(publisher, subscriber);
     const Protocol::OpenReply granted = decode_open_reply(raw);
@@ -230,11 +226,17 @@ TEST_CASE("An unrenewed session expires on schedule with no frames in flight", "
     CHECK(late.server_state == SessionState::Closed);
 
     // The client learns from the reply that this session is over for good.
+    //
+    // Asserted on the subscription's session contract rather than on the
+    // transport's state. The transport does not see renew replies any more --
+    // the lease is not its to keep -- so "no resurrection" is a fact about the
+    // session, and `session_lost` is where it is said.
     const std::vector<std::byte> encoded = Protocol::encode(late, 7);
-    CHECK(subscriber.adopt_renew_reply(encoded.data(), encoded.size()) ==
-          Status::SessionExpired);
-    CHECK(subscriber.state() == SubscriberState::Failed);
-    CHECK(subscriber.counters().renewals_failed == 1);
+    const detail::SessionClient::RenewOutcome outcome =
+        subscriber.session.adopt_renew_reply(encoded.data(), encoded.size());
+
+    CHECK(outcome.status == Status::SessionExpired);
+    CHECK(outcome.session_lost);
 }
 
 TEST_CASE("A client that vanishes releases its slots on the lease, and the stream recovers",
@@ -245,8 +247,7 @@ TEST_CASE("A client that vanishes releases its slots on the lease, and the strea
     std::vector<FrameView> stranded;
 
     {
-        const auto subscriber_delivery = queue_for(subscriber_config());
-        detail::SubscriberEngine subscriber(subscriber_config(), subscriber_delivery);
+        Subscriber subscriber(subscriber_config());
         open_session(publisher, subscriber);
 
         for(std::uint32_t n = 0; n < k_credit_window; ++n)
@@ -254,7 +255,7 @@ TEST_CASE("A client that vanishes releases its slots on the lease, and the strea
             REQUIRE(publish_one(publisher, 4096, n) == PublishResult::Accepted);
         }
 
-        stranded = collect(*subscriber_delivery, k_credit_window);
+        stranded = collect(*subscriber.delivery, k_credit_window);
         REQUIRE(stranded.size() == k_credit_window);
 
         // Every view is retained, so 5.5 withholds every credit, so 5.4 retains
@@ -275,12 +276,11 @@ TEST_CASE("A client that vanishes releases its slots on the lease, and the strea
 
     // ...and the device server is still serving.  A restarted client opens a new
     // session on the same publisher and the stream resumes.
-    const auto restarted_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine restarted(subscriber_config(), restarted_delivery);
+    Subscriber restarted(subscriber_config());
     open_session(publisher, restarted);
 
     REQUIRE(publish_one(publisher, 4096, 42) == PublishResult::Accepted);
-    const std::vector<FrameView> delivered = collect(*restarted_delivery, 1);
+    const std::vector<FrameView> delivered = collect(*restarted.delivery, 1);
     REQUIRE(delivered.size() == 1);
     CHECK(payload_matches(delivered.front(), 42));
 
@@ -301,10 +301,8 @@ TEST_CASE("Two sessions coexist and a slot returns only when both have credited 
           "[m3][session]")
 {
     BulkPublisher publisher(publisher_config());
-    const auto first_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine first(subscriber_config(), first_delivery);
-    const auto second_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine second(subscriber_config(), second_delivery);
+    Subscriber first(subscriber_config());
+    Subscriber second(subscriber_config());
 
     open_session(publisher, first, 1);
     open_session(publisher, second, 2);
@@ -312,8 +310,8 @@ TEST_CASE("Two sessions coexist and a slot returns only when both have credited 
 
     REQUIRE(publish_one(publisher, 4096, 0x77) == PublishResult::Accepted);
 
-    std::vector<FrameView> a = collect(*first_delivery, 1);
-    std::vector<FrameView> b = collect(*second_delivery, 1);
+    std::vector<FrameView> a = collect(*first.delivery, 1);
+    std::vector<FrameView> b = collect(*second.delivery, 1);
     REQUIRE(a.size() == 1);
     REQUIRE(b.size() == 1);
 
@@ -347,8 +345,7 @@ TEST_CASE("Close is idempotent and Renew tells a closed session from an unknown 
           "[m3][session]")
 {
     BulkPublisher publisher(publisher_config());
-    const auto subscriber_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine subscriber(subscriber_config(), subscriber_delivery);
+    Subscriber subscriber(subscriber_config());
 
     const std::vector<std::byte> raw = exchange_open(publisher, subscriber);
     const Protocol::OpenReply granted = decode_open_reply(raw);
@@ -390,8 +387,7 @@ TEST_CASE("Renewing faster than the rate limit is refused without shortening the
     config.max_renewals_per_ttl = 3;
 
     BulkPublisher publisher(config);
-    const auto subscriber_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine subscriber(subscriber_config(), subscriber_delivery);
+    Subscriber subscriber(subscriber_config());
 
     const std::vector<std::byte> raw = exchange_open(publisher, subscriber);
     const Protocol::OpenReply granted = decode_open_reply(raw);
@@ -412,7 +408,7 @@ TEST_CASE("Renewing faster than the rate limit is refused without shortening the
     // refused is still armed and still carries frames.
     CHECK(publisher.session_count() == 1);
     CHECK(publish_one(publisher, 4096, 5) == PublishResult::Accepted);
-    CHECK(collect(*subscriber_delivery, 1).size() == 1);
+    CHECK(collect(*subscriber.delivery, 1).size() == 1);
 
     close(publisher, granted.session_id);
 }
@@ -423,12 +419,9 @@ TEST_CASE("A publisher admits no more sessions than it was configured for", "[m3
     config.max_sessions = 2;
 
     BulkPublisher publisher(config);
-    const auto first_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine first(subscriber_config(), first_delivery);
-    const auto second_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine second(subscriber_config(), second_delivery);
-    const auto third_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine third(subscriber_config(), third_delivery);
+    Subscriber first(subscriber_config());
+    Subscriber second(subscriber_config());
+    Subscriber third(subscriber_config());
 
     const Protocol::OpenReply a = decode_open_reply(exchange_open(publisher, first, 1));
     const Protocol::OpenReply b = decode_open_reply(exchange_open(publisher, second, 2));
@@ -474,11 +467,10 @@ TEST_CASE("engine_cpu_affinity pins the engine, and the placement report proves 
     sub.engine_cpu_affinity = 1;
 
     BulkPublisher publisher(publisher_config());
-    const auto subscriber_delivery = queue_for(sub);
-    detail::SubscriberEngine subscriber(sub, subscriber_delivery);
+    Subscriber subscriber(sub);
     open_session(publisher, subscriber);
 
-    const detail::Locality &where = subscriber.locality();
+    const detail::Locality &where = subscriber.engine.locality();
 
     CHECK(where.engine_cpu == 1);
 
@@ -504,8 +496,7 @@ TEST_CASE("Query answers server-wide and per session", "[m4][session]")
     // Query naming one session -- is reachable only from a caller that decoded
     // the `OpenReply` itself, which is exactly what this file does.
     BulkPublisher publisher(short_lease_config());
-    const auto subscriber_delivery = queue_for(subscriber_config());
-    detail::SubscriberEngine subscriber(subscriber_config(), subscriber_delivery);
+    Subscriber subscriber(subscriber_config());
 
     const std::vector<std::byte> raw = exchange_open(publisher, subscriber);
     const Protocol::OpenReply granted = decode_open_reply(raw);

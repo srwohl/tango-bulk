@@ -5,6 +5,7 @@
 #include <tango-bulk/unstable/session_supervisor.h>
 
 #include <core/delivery_queue.h>
+#include <core/session_client.h>
 
 #include <algorithm>
 #include <atomic>
@@ -69,6 +70,10 @@ constexpr auto k_dispatch_quantum = 20ms;
 /// queue, which spans every session rather than one -- so they are read from it
 /// once in `counters()`, and summing a transport's copy would count the same
 /// frame again for every session the subscription outlived.
+///
+/// So are the renewal counts, for the same reason and a sharper one: a
+/// transport does not renew. The lease is the subscription's to keep, so it is
+/// the subscription that counts the attempts and the refusals.
 void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexcept
 {
     total.frames_received += part.frames_received;
@@ -80,8 +85,6 @@ void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexc
     total.credits_returned += part.credits_returned;
     total.credit_messages_sent += part.credit_messages_sent;
     total.sessions_opened += part.sessions_opened;
-    total.renewals_sent += part.renewals_sent;
-    total.renewals_failed += part.renewals_failed;
     total.geometry_changes += part.geometry_changes;
     total.transport_errors += part.transport_errors;
 
@@ -243,14 +246,22 @@ struct SessionSupervisor::Impl
             return false;
         }
 
+        // Adopted into a candidate, not into the live session. A grant this
+        // subscription is about to refuse must not be the answer
+        // `granted_geometry()` gives in the meantime, and the transport must
+        // not be started on it -- which is why the check below sits between the
+        // two.
+        SessionClient candidate;
+
         try
         {
-            const std::vector<std::byte> request =
-                fresh->make_open_request(next_correlation_id());
+            const std::vector<std::byte> request = candidate.make_open_request(
+                config, fresh->local_address(), next_correlation_id());
             const std::vector<std::byte> reply =
                 channel(Protocol::CoordType::Open, request);
 
-            const Status status = fresh->adopt_open_reply(reply.data(), reply.size());
+            const Status status =
+                candidate.adopt_open_reply(reply.data(), reply.size(), config);
             if(status != Status::Ok)
             {
                 error = BulkError{status,
@@ -279,7 +290,7 @@ struct SessionSupervisor::Impl
         // client ends up interpreting 1024x1024 frames as 2048x2048; the epoch
         // and the sizing terms are allowed to move, the description is not.
         if(retired_geometry.generation != 0 &&
-           !describes_same_array(retired_geometry, fresh->granted_geometry()))
+           !describes_same_array(retired_geometry, candidate.granted_geometry()))
         {
             geometry_changes.fetch_add(1, std::memory_order_relaxed);
             error = BulkError{Status::GeometryMismatch,
@@ -288,17 +299,36 @@ struct SessionSupervisor::Impl
                               "with the new contract in hand",
                               "subscriber"};
 
-            // Not adopted: this transport is closed rather than published, so
-            // no frame from it can reach a callback expecting the old shape.
-            //
-            // Destroyed *first*, then the queue is emptied. `adopt_open_reply`
-            // starts the engine before this check runs, so a frame of the new
-            // shape may already be queued; discarding before the producer has
-            // stopped would leave the next one behind it. Section 4.2 wants the
-            // check to precede the start, which is a change to the seam rather
-            // than to this ordering.
+            // Nothing to clean up, and that is structural rather than lucky: an
+            // unactivated transport has no endpoint and no progress thread, so
+            // it cannot have put a frame into the delivery queue. Refusing here
+            // costs a destructor.
             fresh.reset();
-            delivery->discard();
+            return false;
+        }
+
+        {
+            // The grant is settled. Under the lock because granted_geometry()
+            // reads it from an application thread.
+            std::lock_guard<std::mutex> lock(mutex);
+            session = candidate;
+        }
+
+        // This session's share of a queue that spans every session: `Renew`
+        // reports the progress of this one.
+        delivered_at_open = delivery->taken();
+
+        if(const Status status = fresh->activate(session.stream_id(),
+                                                 session.granted_geometry(),
+                                                 session.server_address());
+           status != Status::Ok)
+        {
+            const BulkError reported = fresh->last_error();
+            error = reported.status != Status::Ok
+                        ? reported
+                        : BulkError{status, "the transport could not adopt the grant",
+                                    "subscriber"};
+            fresh.reset();
             return false;
         }
 
@@ -370,7 +400,7 @@ struct SessionSupervisor::Impl
                 try
                 {
                     const std::vector<std::byte> request =
-                        live->make_close_request(next_correlation_id());
+                        session.make_close_request(next_correlation_id());
                     channel(Protocol::CoordType::Close, request);
                 }
                 catch(const std::exception &)
@@ -471,21 +501,39 @@ struct SessionSupervisor::Impl
 
     Status renew_once(BulkError &error) noexcept
     {
-        const Ref live = borrow();
-        if(!live)
+        std::uint64_t credits_returned = 0;
+        std::uint32_t client_state = static_cast<std::uint32_t>(SubscriberState::Failed);
+
         {
-            error = BulkError{Status::Internal, "the transport disappeared", "subscriber"};
-            return Status::Internal;
+            const Ref live = borrow();
+            if(!live)
+            {
+                error = BulkError{Status::Internal, "the transport disappeared", "subscriber"};
+                return Status::Internal;
+            }
+
+            // The client's own progress report, and the only thing the renewal
+            // needs from the transport. Everything else it says -- who this
+            // session is, how many frames reached the application -- the
+            // subscription knows without asking.
+            credits_returned = live->counters().credits_returned;
+            client_state = static_cast<std::uint32_t>(live->state());
         }
 
         Status status = Status::Ok;
 
         try
         {
-            const std::vector<std::byte> request = live->make_renew_request(next_correlation_id());
+            const std::vector<std::byte> request =
+                session.make_renew_request(next_correlation_id(),
+                                           delivery->taken() - delivered_at_open,
+                                           credits_returned,
+                                           client_state);
+
+            renewals_sent.fetch_add(1, std::memory_order_relaxed);
             const std::vector<std::byte> reply =
                 channel(Protocol::CoordType::Renew, request);
-            status = live->adopt_renew_reply(reply.data(), reply.size());
+            status = session.adopt_renew_reply(reply.data(), reply.size()).status;
 
             if(status != Status::Ok)
             {
@@ -505,16 +553,25 @@ struct SessionSupervisor::Impl
             status = Status::TransportFailure;
         }
 
+        // Anything that is not a granted renewal, including a channel that
+        // threw before the request arrived anywhere. The old counter lived on
+        // the transport and only ever saw refusals that decoded, so an
+        // unreachable device renewed silently.
+        if(status != Status::Ok)
+        {
+            renewals_failed.fetch_add(1, std::memory_order_relaxed);
+        }
+
         return status;
     }
 
     std::uint32_t current_renew_interval() noexcept
     {
         // 3.7 lets the server change the interval at any renewal and requires
-        // the client to adopt the new value, so it is read from the transport
-        // rather than from the configuration.
-        const Ref live = borrow();
-        const std::uint32_t granted = live ? live->renew_interval_ms() : 0;
+        // the client to adopt the new value, so it is read from the adopted
+        // lease rather than from the configuration. Control thread, which is
+        // also the only writer -- no borrow, and nothing to borrow it from.
+        const std::uint32_t granted = session.renew_interval_ms();
         return granted == 0 ? 1'000u : granted;
     }
 
@@ -679,15 +736,18 @@ struct SessionSupervisor::Impl
                 // Fold the retiring transport's totals in, so a reconnect does
                 // not reset the counters an operator is watching.
                 accumulate(retired, transport->counters());
-                last_lease_ttl_ms = std::max(last_lease_ttl_ms, transport->lease_ttl_ms());
+                last_lease_ttl_ms = std::max(last_lease_ttl_ms, session.lease_ttl_ms());
 
-                // And keep what it was describing, so the next grant can be
-                // compared against it rather than silently replacing it.
-                const Protocol::GeometryBlock going = transport->granted_geometry();
-                if(going.generation != 0)
+                // And keep what this session was describing, so the next grant
+                // can be compared against it rather than silently replacing it.
+                if(session.granted_geometry().generation != 0)
                 {
-                    retired_geometry = going;
+                    retired_geometry = session.granted_geometry();
                 }
+
+                // The session ends with its transport. What it was granted is
+                // remembered above; what it *is* stops being the answer.
+                session = SessionClient{};
             }
 
             previous = std::move(transport);
@@ -884,6 +944,22 @@ struct SessionSupervisor::Impl
     FrameCallback frame_callback;
     StateCallback state_callback;
 
+    /// The session contract: who this session is, what it was granted, and
+    /// what its lease now says.
+    ///
+    /// The subscription's, not the transport's. It used to live inside the
+    /// engine, which put the grant, the epoch and the two lease terms behind
+    /// three declarations apiece -- on the engine, on the seam, and here --
+    /// for one storage location. Written by the control thread under `mutex`,
+    /// because `granted_geometry()` reads it from an application thread.
+    SessionClient session;
+
+    /// `delivery->taken()` when the live session was granted.
+    ///
+    /// The queue counts every session the subscription has had; `Renew` reports
+    /// the progress of the current one. Control thread only.
+    std::uint64_t delivered_at_open{0};
+
     /// Where frames go, for the life of the subscription rather than the life
     /// of a session.
     ///
@@ -919,6 +995,8 @@ struct SessionSupervisor::Impl
     std::atomic<std::uint64_t> correlation{0};
     std::atomic<std::uint64_t> reconnects{0};
     std::atomic<std::uint64_t> geometry_changes{0};
+    std::atomic<std::uint64_t> renewals_sent{0};
+    std::atomic<std::uint64_t> renewals_failed{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -1032,14 +1110,14 @@ int SessionSupervisor::fd() const noexcept
 
 Protocol::GeometryBlock SessionSupervisor::granted_geometry() const noexcept
 {
-    const Impl::Ref live = impl_->borrow();
-    return live ? live->granted_geometry() : Protocol::GeometryBlock{};
+    const std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->session.granted_geometry();
 }
 
 std::uint32_t SessionSupervisor::generation() const noexcept
 {
-    const Impl::Ref live = impl_->borrow();
-    return live ? live->generation() : 0;
+    const std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->session.generation();
 }
 
 SubscriberCounters SessionSupervisor::counters() const noexcept
@@ -1060,6 +1138,9 @@ SubscriberCounters SessionSupervisor::counters() const noexcept
     // Read once from the owner rather than accumulated per session. These four
     // describe the subscription's queue, which spans every session it has had,
     // so there is nothing to fold in and nothing that resets on a reconnect.
+    total.renewals_sent = impl_->renewals_sent.load(std::memory_order_relaxed);
+    total.renewals_failed = impl_->renewals_failed.load(std::memory_order_relaxed);
+
     total.frames_delivered = impl_->delivery->taken();
     total.frames_dropped_queue_full = impl_->delivery->dropped();
     total.delivery_queue_depth = impl_->delivery->size();
