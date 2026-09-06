@@ -143,7 +143,7 @@ int main(int argc, char *argv[])
         config.receive_buffer_bytes = ring_bytes;
         config.receive_memory_kind = TangoBulk::MemoryKind::Cuda;
 
-        TangoBulk::BulkSubscriber subscriber(proxy, config);
+        TangoBulk::SubscriptionCallbacks callbacks;
 
         std::atomic<std::uint64_t> frames{0};
         std::atomic<std::uint64_t> bytes{0};
@@ -151,7 +151,7 @@ int main(int argc, char *argv[])
         const auto buffer_begin = reinterpret_cast<std::uintptr_t>(device_memory);
         const auto buffer_end = buffer_begin + ring_bytes;
 
-        subscriber.set_frame_callback(
+        callbacks.on_frame =
             [&frames, &bytes, gpu, buffer_begin, buffer_end](TangoBulk::FrameView view)
             {
                 // DeliveryMode::DispatchThread runs this on a library thread,
@@ -202,7 +202,7 @@ int main(int argc, char *argv[])
                 bytes.fetch_add(view.size(), std::memory_order_relaxed);
             });
 
-        subscriber.set_state_callback(
+        callbacks.on_state =
             [](TangoBulk::SubscriberState state, const TangoBulk::BulkError &error)
             {
                 std::cout << "state: " << TangoBulk::to_string(state);
@@ -214,7 +214,8 @@ int main(int argc, char *argv[])
                 std::cout << std::endl;
             });
 
-        subscriber.start();
+        auto subscription =
+            TangoBulk::subscribe(proxy, config, std::move(callbacks));
 
         auto last = std::chrono::steady_clock::now();
         std::uint64_t last_frames = 0;
@@ -238,8 +239,8 @@ int main(int argc, char *argv[])
             last_bytes = total_bytes;
         }
 
-        subscriber.stop();
-        const TangoBulk::SubscriberCounters counters = subscriber.counters();
+        subscription.reset();
+        const TangoBulk::SubscriberCounters counters = subscription->counters();
         std::cout << "received=" << counters.frames_received
                   << " delivered=" << counters.frames_delivered
                   << " credits_returned=" << counters.credits_returned

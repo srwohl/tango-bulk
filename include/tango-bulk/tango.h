@@ -7,6 +7,7 @@
 
 #include <tango-bulk/publisher.h>
 #include <tango-bulk/subscriber.h>
+#include <tango-bulk/subscription.h>
 
 #include <array>
 #include <cstdint>
@@ -16,6 +17,8 @@
 // layering check has an explicit exception for it.  Note what is *not* here:
 // no ucp/*, and no UCX type in any signature.  A device server that links the
 // adapter never inherits UCX headers.
+#include <memory>
+
 namespace Tango
 {
 class DeviceClass;
@@ -60,17 +63,24 @@ void install_bulk_commands(Tango::DeviceClass &device_class,
 void attach_publisher(Tango::DeviceImpl &device, BulkPublisher &publisher);
 void detach_publisher(Tango::DeviceImpl &device) noexcept;
 
-/// Point a subscriber at a device whose commands carry a prefix.
+/// Open a Subscription that carries its coordination over Tango commands.
 ///
-/// MUST be called before start(); it throws BulkException{Internal} afterwards,
-/// because changing the name of the command that opened a session would leave no
-/// way to renew or close it.
+/// `proxy` is BORROWED and MUST outlive the returned Subscription. It is called
+/// only from the control thread, never from the engine or dispatch thread, and
+/// never concurrently.
 ///
-/// This is a free function rather than a SubscriberConfig field because
-/// SubscriberConfig is declared in <tango-bulk/subscriber.h>, which the UCX
-/// layer compiles against and which therefore cannot name a Tango-only concept.
-/// See docs/EXTRACTION.md.
-void set_command_names(BulkSubscriber &subscriber, const CommandNames &names);
+/// `names` is here rather than in SubscriberConfig because SubscriberConfig is
+/// declared in <tango-bulk/subscriber.h>, which the UCX layer compiles against
+/// and which therefore cannot name a Tango-only concept. Passing it at open is
+/// also what removes the setter-before-start ordering it used to have: the
+/// names that opened a session are the names that renew and close it.
+///
+/// Throws BulkException if the configuration is invalid, or if the first open
+/// fails under a policy that reports rather than retries.
+std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
+                                        SubscriberConfig config,
+                                        SubscriptionCallbacks callbacks,
+                                        const CommandNames &names = {});
 
 /// What BulkQuery reports about a publisher.
 struct BulkQueryResult

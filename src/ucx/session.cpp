@@ -2,30 +2,30 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include <tango-bulk/unstable/session_supervisor.h>
+#include <tango-bulk/subscription.h>
 
 #include <memory>
 #include <utility>
 
 /// The one translation unit that knows both halves.
 ///
-/// `SessionSupervisor` lives in core and must not name a UCX symbol;
+/// `Subscription` lives in core and must not name a UCX symbol;
 /// `make_subscriber_transport()` is defined in this library. Joining them is a
 /// three-line function, and it belongs here because here is the only place
 /// where naming both is legal.
-namespace TangoBulk::detail
+namespace TangoBulk
 {
 
-std::unique_ptr<SessionSupervisor> open_session(SubscriberConfig config,
-                                                CoordinationChannel channel,
-                                                SessionCallbacks callbacks)
+std::unique_ptr<Subscription> open_subscription(SubscriberConfig config,
+                                                detail::CoordinationChannel channel,
+                                                SubscriptionCallbacks callbacks)
 {
-    return SessionSupervisor::open(
+    return Subscription::open(
         std::move(config),
         std::move(channel),
-        [](const SubscriberConfig &for_session, std::shared_ptr<DeliveryQueue> delivery)
-        { return make_subscriber_transport(for_session, std::move(delivery)); },
+        [](const SubscriberConfig &for_session, std::shared_ptr<detail::DeliveryQueue> delivery)
+        { return detail::make_subscriber_transport(for_session, std::move(delivery)); },
         std::move(callbacks));
 }
 
-} // namespace TangoBulk::detail
+} // namespace TangoBulk

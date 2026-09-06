@@ -1403,14 +1403,14 @@ int main(int argc, char *argv[])
 
         ParallelShardWriter writer(options, geometry, receive_ring.fd(), receive_ring.data(),
                                    receive_ring.bytes());
-        TangoBulk::BulkSubscriber subscriber(proxy, config);
+        TangoBulk::SubscriptionCallbacks callbacks;
         std::uint64_t received = 0;
         std::uint64_t submitted_blocks = 0;
         std::optional<Endian> stream_endian;
         std::vector<FrameView> block;
         block.reserve(options.frames_per_block);
 
-        subscriber.set_frame_callback([&](FrameView frame) {
+        callbacks.on_frame = [&](FrameView frame) {
             if(received >= options.frames)
                 return;
             validate_frame(frame, publisher, geometry, stream_endian);
@@ -1422,23 +1422,24 @@ int main(int argc, char *argv[])
                 block.clear();
                 block.reserve(options.frames_per_block);
             }
-        });
-        subscriber.set_state_callback(
+        };
+        callbacks.on_state =
             [](TangoBulk::SubscriberState state, const TangoBulk::BulkError &error) {
                 std::cout << "state: " << TangoBulk::to_string(state);
                 if(error.status != TangoBulk::Status::Ok)
                     std::cout << " (" << TangoBulk::to_string(error.status) << ": " << error.message
                               << ")";
                 std::cout << std::endl;
-            });
+            };
 
-        subscriber.start();
+        auto subscription =
+            TangoBulk::subscribe(proxy, config, std::move(callbacks));
         const auto acquisition_started = std::chrono::steady_clock::now();
         auto progress_at = acquisition_started;
         std::uint64_t progress_bytes = 0;
         while(running.load() && received < options.frames)
         {
-            subscriber.poll(std::chrono::milliseconds{50});
+            subscription->poll(std::chrono::milliseconds{50});
             const auto now = std::chrono::steady_clock::now();
             const double interval_seconds =
                 std::chrono::duration<double>(now - progress_at).count();
@@ -1463,7 +1464,7 @@ int main(int argc, char *argv[])
                 progress_bytes = completed_bytes;
             }
         }
-        subscriber.stop();
+        subscription.reset();
         writer.close();
 
         if(received != options.frames)
