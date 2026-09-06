@@ -343,16 +343,16 @@ TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
 {
     // The ergonomic claim: an event loop that already owns the waiting -- epoll,
     // select, asyncio's add_reader -- needs nothing from this layer but a
-    // descriptor and the arm/re-check protocol. If this works, `async for` is a
-    // pure-Python addition with no further C++.
+    // descriptor and one empty poll. If this works, `async for` is a pure-Python
+    // addition with no further C++.
     BulkPublisher publisher(publisher_config());
     detail::SubscriberEngine subscriber(subscriber_config());
     open_session(publisher, subscriber);
 
     REQUIRE(subscriber.fd() >= 0);
 
-    // Nothing queued, so an armed wait must time out rather than fire.
-    subscriber.arm_wakeup();
+    // Nothing queued, so an armed wait must time out rather than fire. The
+    // empty poll is what arms; there is no separate step to forget.
     REQUIRE(subscriber.poll(0ms, [](FrameView) {}, 1) == 0);
     {
         pollfd pfd{};
@@ -361,8 +361,7 @@ TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
         CHECK(::poll(&pfd, 1, 40) == 0);
     }
 
-    // Arm, re-check, then block -- exactly the three steps fd() documents.
-    subscriber.arm_wakeup();
+    // Look, then block -- exactly the two steps fd() documents.
     REQUIRE(subscriber.poll(0ms, [](FrameView) {}, 1) == 0);
 
     std::thread producer([&] {
@@ -387,7 +386,6 @@ TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
     REQUIRE(ready == 1);
     CHECK((pfd.revents & POLLIN) != 0);
     CHECK(waited < 3s);
-    subscriber.drain_wakeup();
 
     FrameView got;
     REQUIRE(eventually([&] {
@@ -401,9 +399,9 @@ TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
 TEST_CASE("An unarmed descriptor is never signalled, which is what makes it free",
           "[m2][slice]")
 {
-    // The other half of the contract, and the reason arming is in the interface
-    // rather than hidden: a consumer that is keeping up never arms, so the
-    // engine never writes, so the fast path costs no syscall at all. A test
+    // The other half of the contract: a consumer that is keeping up never arms,
+    // so the engine never writes, so the fast path costs no syscall at all. A
+    // test
     // that only checked "the fd fires" would pass just as well against an
     // engine that wrote on every frame.
     BulkPublisher publisher(publisher_config());

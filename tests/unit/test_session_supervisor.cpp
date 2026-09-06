@@ -675,7 +675,7 @@ TEST_CASE("a frame delivered before a reconnect survives the session that replac
     // Lose the session. The control thread retires that transport and builds a
     // new one, which is the moment a view pointing into the old receive ring
     // would be invalidated if the credit interlock did not own its storage.
-    script.renew_results.push_back(Status::SessionExpired);
+    script.refuse_next_renew(Status::SessionExpired);
     REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
 
     CHECK(retained.sequence() == 11);

@@ -14,6 +14,7 @@ add_library(
     config.cpp
     cpu_topology.cpp
     credit_window.cpp
+    delivery_queue.cpp
     enums.cpp
     errors.cpp
     frame_view.cpp

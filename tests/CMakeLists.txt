@@ -17,6 +17,7 @@ add_executable(
     tango-bulk-unit-tests
     unit/test_cpu_topology.cpp
     unit/test_credit_window.cpp
+    unit/test_delivery_queue.cpp
     unit/test_enums.cpp
     unit/test_errors.cpp
     unit/test_frame_view.cpp
