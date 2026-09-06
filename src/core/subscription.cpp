@@ -2,15 +2,14 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include <tango-bulk/subscription.h>
+#include <core/subscription_internal.h>
 
-#include <core/delivery_queue.h>
 #include <core/session_client.h>
+#include <core/geometry_conversion.h>
 
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -47,9 +46,9 @@ void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexc
 } // namespace
 
 
-std::chrono::milliseconds backoff_delay(std::uint32_t attempt,
-                                        std::uint32_t backoff_ms,
-                                        std::uint32_t lease_ttl_ms) noexcept
+std::chrono::milliseconds detail::backoff_delay(std::uint32_t attempt,
+                                                std::uint32_t backoff_ms,
+                                                std::uint32_t lease_ttl_ms) noexcept
 {
     std::uint64_t delay = backoff_ms;
     for(std::uint32_t i = 0; i < attempt && delay < lease_ttl_ms; ++i)
@@ -64,12 +63,6 @@ std::chrono::milliseconds backoff_delay(std::uint32_t attempt,
 
 struct Subscription::Impl
 {
-    struct Transition
-    {
-        SubscriberState state{SubscriberState::Closed};
-        BulkError error;
-    };
-
     Impl(SubscriberConfig cfg,
          detail::CoordinationChannel coordination,
          detail::TransportFactory transport_factory,
@@ -78,14 +71,16 @@ struct Subscription::Impl
         channel(std::move(coordination)),
         factory(std::move(transport_factory)),
         frame_callback(std::move(cbs.on_frame)),
-        state_callback(std::move(cbs.on_state)),
         delivery(std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
                                                  config.drop_policy))
     {
     }
 
 
-    bool open_subscription(BulkError &error) noexcept
+    bool open_subscription(
+        BulkError &error,
+        std::chrono::steady_clock::time_point establishment_deadline =
+            std::chrono::steady_clock::time_point::max()) noexcept
     {
         std::unique_ptr<detail::SubscriberTransport> fresh;
 
@@ -141,8 +136,9 @@ struct Subscription::Impl
             return false;
         }
 
+        const Geometry granted = detail::to_geometry(candidate.granted_geometry());
         if(retired_geometry.generation != 0 &&
-           !describes_same_array(retired_geometry, candidate.granted_geometry()))
+           !retired_geometry.describes_same_array(granted))
         {
             geometry_changes.fetch_add(1, std::memory_order_relaxed);
             error = BulkError{Status::GeometryMismatch,
@@ -158,6 +154,7 @@ struct Subscription::Impl
         {
             std::lock_guard<std::mutex> lock(observation);
             session = candidate;
+            current_geometry = granted;
         }
 
         delivered_at_open = delivery->stats().taken;
@@ -179,8 +176,9 @@ struct Subscription::Impl
         publish_transport(std::move(fresh));
         transition(SubscriberState::Probing, BulkError{});
 
-        const auto deadline =
+        const auto probe_deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(config.probe_timeout_ms);
+        const auto deadline = std::min(probe_deadline, establishment_deadline);
 
         for(;;)
         {
@@ -406,6 +404,13 @@ struct Subscription::Impl
         }
 
         close_session();
+        if(state.load(std::memory_order_acquire) == SubscriberState::Failed)
+        {
+            running.store(false, std::memory_order_release);
+            delivery->stop();
+            delivery->discard();
+            wake.notify_all();
+        }
     }
 
     bool reconnect(std::uint32_t &attempt, BulkError error) noexcept
@@ -453,14 +458,33 @@ struct Subscription::Impl
         return false;
     }
 
-    bool backoff(std::uint32_t attempt) noexcept
+    bool backoff(
+        std::uint32_t attempt,
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max()) noexcept
     {
-        const auto delay =
-            backoff_delay(attempt, config.reconnect_backoff_ms, last_lease_ttl_ms);
+        auto delay =
+            detail::backoff_delay(attempt, config.reconnect_backoff_ms, last_lease_ttl_ms);
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if(remaining < delay)
+        {
+            delay = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+        }
+        if(delay <= std::chrono::milliseconds::zero())
+        {
+            return false;
+        }
 
         std::unique_lock<std::mutex> lock(mutex);
         wake.wait_for(lock, delay, [this] { return !running.load(std::memory_order_acquire); });
-        return running.load(std::memory_order_acquire);
+        return running.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline;
+    }
+
+    static bool retryable_establishment(Status status) noexcept
+    {
+        return status == Status::TransportFailure || status == Status::UnknownStream ||
+               status == Status::UnknownSession || status == Status::SessionExpired;
     }
 
 
@@ -474,12 +498,13 @@ struct Subscription::Impl
             live = SubscriberCounters{};
             last_lease_ttl_ms = std::max(last_lease_ttl_ms, session.lease_ttl_ms());
 
-            if(session.granted_geometry().generation != 0)
+            if(current_geometry.generation != 0)
             {
-                retired_geometry = session.granted_geometry();
+                retired_geometry = current_geometry;
             }
 
             session = detail::SessionClient{};
+            current_geometry = Geometry{};
         }
 
         const bool retired_one = transport != nullptr;
@@ -508,64 +533,29 @@ struct Subscription::Impl
     }
 
 
-    static constexpr std::size_t k_max_transitions = 64;
-
     void transition(SubscriberState next, BulkError error) noexcept
     {
         state.store(next, std::memory_order_release);
-
+        if(next == SubscriberState::Failed)
         {
-            std::lock_guard<std::mutex> lock(queue_mutex);
-            if(transitions.size() >= k_max_transitions)
-            {
-                transitions.pop_front();
-                transitions_dropped.fetch_add(1, std::memory_order_relaxed);
-            }
-            transitions.push_back(Transition{next, std::move(error)});
+            std::lock_guard<std::mutex> lock(observation);
+            last_error = std::move(error);
+        }
+        else if(next == SubscriberState::Active)
+        {
+            std::lock_guard<std::mutex> lock(observation);
+            last_error = BulkError{};
         }
         wake.notify_all();
     }
 
-    std::size_t drain_transitions() noexcept
-    {
-        std::size_t delivered = 0;
-
-        for(;;)
-        {
-            Transition item;
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex);
-                if(transitions.empty())
-                {
-                    break;
-                }
-                item = std::move(transitions.front());
-                transitions.pop_front();
-            }
-
-            if(state_callback)
-            {
-                try
-                {
-                    state_callback(item.state, item.error);
-                }
-                catch(...)
-                {
-                }
-            }
-            ++delivered;
-        }
-
-        return delivered;
-    }
-
     std::size_t deliver_frames(std::chrono::milliseconds timeout,
-                               std::size_t max_frames = 0) noexcept
+                               std::size_t max_frames)
     {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         std::size_t delivered = 0;
 
-        while(max_frames == 0 || delivered < max_frames)
+        while(delivered < max_frames)
         {
             FrameView view;
 
@@ -585,6 +575,12 @@ struct Subscription::Impl
             }
             catch(...)
             {
+                fail_delivery();
+                if(config.delivery_mode == DeliveryMode::Manual)
+                {
+                    throw;
+                }
+                break;
             }
 
             view.reset();
@@ -593,15 +589,22 @@ struct Subscription::Impl
         return delivered;
     }
 
+    void fail_delivery() noexcept
+    {
+        transition(SubscriberState::Failed,
+                   BulkError{Status::Internal, "the frame callback threw", "subscriber"});
+        running.store(false, std::memory_order_release);
+        delivery->stop();
+        delivery->discard();
+        wake.notify_all();
+    }
+
     void dispatch_loop() noexcept
     {
         while(running.load(std::memory_order_acquire))
         {
-            drain_transitions();
-            deliver_frames(k_dispatch_quantum);
+            deliver_frames(k_dispatch_quantum, 32);
         }
-
-        drain_transitions();
     }
 
     std::uint64_t next_correlation_id() noexcept
@@ -611,18 +614,57 @@ struct Subscription::Impl
 
     void shutdown(bool announce_closed) noexcept
     {
+        {
+            std::unique_lock<std::mutex> lock(shutdown_mutex);
+            if(shutdown_complete)
+            {
+                return;
+            }
+
+            const std::thread::id self = std::this_thread::get_id();
+            if(shutdown_started)
+            {
+                if(shutdown_owner == self)
+                {
+                    return;
+                }
+
+                shutdown_wake.wait(lock, [this] { return shutdown_complete; });
+                return;
+            }
+
+            shutdown_started = true;
+            shutdown_owner = self;
+        }
+
         running.store(false, std::memory_order_release);
         wake.notify_all();
 
         delivery->stop();
+        delivery->discard();
 
+        const std::thread::id self = std::this_thread::get_id();
         if(control.joinable())
         {
-            control.join();
+            if(control.get_id() == self)
+            {
+                control.detach();
+            }
+            else
+            {
+                control.join();
+            }
         }
         if(dispatch.joinable())
         {
-            dispatch.join();
+            if(dispatch.get_id() == self)
+            {
+                dispatch.detach();
+            }
+            else
+            {
+                dispatch.join();
+            }
         }
 
         close_session();
@@ -632,7 +674,11 @@ struct Subscription::Impl
             transition(SubscriberState::Closed, BulkError{});
         }
 
-        drain_transitions();
+        {
+            std::lock_guard<std::mutex> lock(shutdown_mutex);
+            shutdown_complete = true;
+        }
+        shutdown_wake.notify_all();
     }
 
 
@@ -641,7 +687,6 @@ struct Subscription::Impl
     detail::TransportFactory factory;
 
     FrameCallback frame_callback;
-    StateCallback state_callback;
 
     detail::SessionClient session;
 
@@ -651,6 +696,7 @@ struct Subscription::Impl
 
     std::atomic<SubscriberState> state{SubscriberState::Closed};
     std::atomic<bool> running{false};
+    std::atomic<bool> interrupted{false};
 
     std::mutex mutex;
     std::condition_variable wake;
@@ -662,14 +708,18 @@ struct Subscription::Impl
     SubscriberCounters live{};
     std::uint32_t last_lease_ttl_ms{0};
 
-    Protocol::GeometryBlock retired_geometry{};
-
-    std::mutex queue_mutex;
-    std::deque<Transition> transitions;
-    std::atomic<std::uint64_t> transitions_dropped{0};
+    Geometry current_geometry{};
+    Geometry retired_geometry{};
+    BulkError last_error{};
 
     std::thread control;
     std::thread dispatch;
+
+    std::mutex shutdown_mutex;
+    std::condition_variable shutdown_wake;
+    std::thread::id shutdown_owner;
+    bool shutdown_started{false};
+    bool shutdown_complete{false};
 
     std::atomic<std::uint64_t> correlation{0};
     std::atomic<std::uint64_t> reconnects{0};
@@ -679,20 +729,32 @@ struct Subscription::Impl
 };
 
 
-Subscription::Subscription(std::unique_ptr<Impl> impl) noexcept :
+Subscription::Subscription(std::shared_ptr<Impl> impl) noexcept :
     impl_(std::move(impl))
 {
 }
 
 Subscription::~Subscription()
 {
+    close();
+}
+
+void Subscription::close() noexcept
+{
     impl_->shutdown(true);
 }
 
-std::unique_ptr<Subscription> Subscription::open(SubscriberConfig config,
-                                                  detail::CoordinationChannel channel,
-                                                  detail::TransportFactory factory,
-                                                           SubscriptionCallbacks callbacks)
+void Subscription::interrupt() noexcept
+{
+    impl_->interrupted.store(true, std::memory_order_release);
+    impl_->shutdown(true);
+}
+
+std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
+    SubscriberConfig config,
+    detail::CoordinationChannel channel,
+    detail::TransportFactory factory,
+    SubscriptionCallbacks callbacks)
 {
     const Status status = config.validate();
     if(status != Status::Ok)
@@ -709,40 +771,71 @@ std::unique_ptr<Subscription> Subscription::open(SubscriberConfig config,
                                       "subscriber"});
     }
 
-    if(!callbacks.on_frame || !callbacks.on_state)
+    if(!callbacks.on_frame)
     {
         throw BulkException(BulkError{Status::Internal,
-                                      "SubscriptionCallbacks needs both on_frame and on_state",
+                                      "SubscriptionCallbacks needs on_frame",
                                       "subscriber"});
     }
 
-    auto impl = std::make_unique<Impl>(
+    auto impl = std::make_shared<Subscription::Impl>(
         std::move(config), std::move(channel), std::move(factory), std::move(callbacks));
 
     impl->running.store(true, std::memory_order_release);
 
-    if(impl->config.delivery_mode == DeliveryMode::DispatchThread)
-    {
-        Impl &ref = *impl;
-        impl->dispatch = std::thread([&ref] { ref.dispatch_loop(); });
-    }
-
     impl->transition(SubscriberState::Opening, BulkError{});
 
     BulkError error;
-    if(impl->open_subscription(error))
+    const auto establishment_deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(impl->config.establishment_timeout_ms);
+    if(impl->open_subscription(error, establishment_deadline))
     {
-        Impl &ref = *impl;
-        impl->control = std::thread([&ref] { ref.control_loop(); });
+        if(impl->config.delivery_mode == DeliveryMode::DispatchThread)
+        {
+            impl->dispatch = std::thread([worker = impl] { worker->dispatch_loop(); });
+        }
+        impl->control = std::thread([worker = impl] { worker->control_loop(); });
         return std::unique_ptr<Subscription>(new Subscription(std::move(impl)));
     }
 
     if(impl->config.reconnect_policy == ReconnectPolicy::BoundedRetry)
     {
-        impl->transition(SubscriberState::Reconnecting, error);
-        Impl &ref = *impl;
-        impl->control = std::thread([&ref] { ref.control_loop(); });
-        return std::unique_ptr<Subscription>(new Subscription(std::move(impl)));
+        bool opened = false;
+        for(std::uint32_t attempt = 0; attempt < impl->config.reconnect_max_attempts;
+            ++attempt)
+        {
+            if(!Subscription::Impl::retryable_establishment(error.status) ||
+               std::chrono::steady_clock::now() >= establishment_deadline)
+            {
+                break;
+            }
+            impl->transition(SubscriberState::Reconnecting, error);
+            if(!impl->backoff(attempt, establishment_deadline))
+            {
+                break;
+            }
+            impl->transition(SubscriberState::Opening, BulkError{});
+            if(impl->open_subscription(error, establishment_deadline))
+            {
+                opened = true;
+                break;
+            }
+            if(!Subscription::Impl::retryable_establishment(error.status))
+            {
+                break;
+            }
+        }
+
+        if(opened)
+        {
+            if(impl->config.delivery_mode == DeliveryMode::DispatchThread)
+            {
+                impl->dispatch = std::thread([worker = impl] { worker->dispatch_loop(); });
+            }
+            impl->control = std::thread([worker = impl] { worker->control_loop(); });
+            return std::unique_ptr<Subscription>(new Subscription(std::move(impl)));
+        }
     }
 
     impl->transition(SubscriberState::Failed, error);
@@ -762,9 +855,49 @@ std::size_t Subscription::poll(std::chrono::milliseconds timeout, std::size_t ma
                                       "subscriber"});
     }
 
-    impl.drain_transitions();
-    const std::size_t frames = impl.deliver_frames(timeout, max_frames);
-    impl.drain_transitions();
+    if(max_frames == 0)
+    {
+        throw BulkException(BulkError{Status::DepthTooLarge,
+                                      "poll() requires a positive max_frames bound",
+                                      "subscriber"});
+    }
+
+    std::size_t frames = 0;
+    try
+    {
+        frames = impl.deliver_frames(timeout, max_frames);
+    }
+    catch(...)
+    {
+        throw;
+    }
+
+    if(frames == 0)
+    {
+        if(impl.interrupted.load(std::memory_order_acquire))
+        {
+            throw BulkException(BulkError{Status::Shutdown,
+                                          "the subscription was interrupted",
+                                          "subscriber"});
+        }
+
+        const SubscriberState state = impl.state.load(std::memory_order_acquire);
+        if(state == SubscriberState::Failed)
+        {
+            std::lock_guard<std::mutex> lock(impl.observation);
+            throw BulkException(impl.last_error.status == Status::Ok
+                                    ? BulkError{Status::TransportFailure,
+                                                "the subscription failed",
+                                                "subscriber"}
+                                    : impl.last_error);
+        }
+        if(state == SubscriberState::Closed)
+        {
+            throw BulkException(BulkError{Status::Shutdown,
+                                          "the subscription is closed",
+                                          "subscriber"});
+        }
+    }
     return frames;
 }
 
@@ -775,19 +908,33 @@ SubscriberState Subscription::state() const noexcept
 
 int Subscription::fd() const noexcept
 {
-    return impl_->delivery->fd();
+    return impl_->config.delivery_mode == DeliveryMode::Manual ? impl_->delivery->fd() : -1;
 }
 
-Protocol::GeometryBlock Subscription::granted_geometry() const noexcept
+Geometry Subscription::geometry() const noexcept
 {
     const std::lock_guard<std::mutex> lock(impl_->observation);
-    return impl_->session.granted_geometry();
+    return impl_->current_geometry;
 }
 
-std::uint32_t Subscription::generation() const noexcept
+ReceivePlan Subscription::plan() const noexcept
 {
     const std::lock_guard<std::mutex> lock(impl_->observation);
-    return impl_->session.generation();
+    return ReceivePlan::derive(impl_->current_geometry,
+                               impl_->config.pinned_memory_limit_bytes);
+}
+
+SubscriptionSnapshot Subscription::snapshot() const noexcept
+{
+    SubscriptionSnapshot out;
+    out.state = state();
+    out.counters = counters();
+    out.interrupted = impl_->interrupted.load(std::memory_order_acquire);
+    {
+        const std::lock_guard<std::mutex> lock(impl_->observation);
+        out.error = impl_->last_error;
+    }
+    return out;
 }
 
 SubscriberCounters Subscription::counters() const noexcept

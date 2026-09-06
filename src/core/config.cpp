@@ -7,6 +7,10 @@
 
 #include <tango-bulk/limits.h>
 
+#include <cstdint>
+#include <algorithm>
+#include <limits>
+
 /// Configuration validation, per IMPLEMENTATION_SPEC.md 6.1.
 ///
 /// Every quantity there has a default, a range, and a hard cap that
@@ -160,14 +164,6 @@ Status PublisherConfig::validate() const noexcept
         return Status::MalformedMessage;
     }
 
-    // 6.1: DropOldest is illegal on the producer ring.  A slot already handed to
-    // UCX cannot be reclaimed, so offering the option would be offering
-    // corruption -- silently, and only under load.
-    if(drop_policy == DropPolicy::DropOldest)
-    {
-        return Status::MalformedMessage;
-    }
-
     return Status::Ok;
 }
 
@@ -183,6 +179,11 @@ Status SubscriberConfig::validate() const noexcept
     if(delivery_queue_depth < k_min_delivery_queue || delivery_queue_depth > k_max_delivery_queue)
     {
         return Status::DepthTooLarge;
+    }
+
+    if(establishment_timeout_ms == 0)
+    {
+        return Status::MalformedMessage;
     }
 
 
@@ -211,6 +212,12 @@ Status SubscriberConfig::validate() const noexcept
         return Status::MalformedMessage;
     }
 
+    if(ring_depth != 0 &&
+       max_frame_bytes > pinned_memory_limit_bytes / static_cast<std::uint64_t>(ring_depth))
+    {
+        return Status::ResourceExhausted;
+    }
+
     if(has_receive_buffer &&
        receive_buffer_bytes < max_frame_bytes * static_cast<std::uint64_t>(ring_depth))
     {
@@ -222,6 +229,41 @@ Status SubscriberConfig::validate() const noexcept
     // choice about which frames matter, not a memory-safety question.
 
     return Status::Ok;
+}
+
+Status ReceivePlan::validate() const noexcept
+{
+    if(max_frame_bytes < k_min_frame_bytes || max_frame_bytes > k_max_frame_bytes_hard_cap ||
+       ring_depth < k_min_ring_depth || ring_depth > k_max_ring_depth || credit_window == 0 ||
+       credit_window > ring_depth ||
+       (ring_depth != 0 && max_frame_bytes > pinned_bytes / ring_depth))
+    {
+        return Status::ResourceExhausted;
+    }
+    return Status::Ok;
+}
+
+ReceivePlan ReceivePlan::derive(const Geometry &geometry,
+                                std::uint64_t pinned_memory_limit_bytes) noexcept
+{
+    ReceivePlan out;
+    out.max_frame_bytes = geometry.max_frame_bytes;
+    out.ring_depth = geometry.ring_depth;
+    out.credit_window = geometry.credit_window;
+
+    if(out.max_frame_bytes == 0)
+    {
+        return out;
+    }
+
+    const std::uint64_t budget_depth = pinned_memory_limit_bytes / out.max_frame_bytes;
+    out.ring_depth = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+        out.ring_depth, std::numeric_limits<std::uint32_t>::max()));
+    out.ring_depth = static_cast<std::uint32_t>(std::min<std::uint64_t>(out.ring_depth,
+                                                                         budget_depth));
+    out.credit_window = std::min(out.credit_window, out.ring_depth);
+    out.pinned_bytes = out.max_frame_bytes * out.ring_depth;
+    return out;
 }
 
 } // namespace TangoBulk

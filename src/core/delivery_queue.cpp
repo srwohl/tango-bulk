@@ -56,15 +56,20 @@ bool DeliveryQueue::push(FrameView frame) noexcept
         dropped_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    if(wakeup_fd_ >= 0 && !queue_.empty() &&
-       consumer_waiting_.exchange(false, std::memory_order_acq_rel))
+    return queued;
+}
+
+void DeliveryQueue::notify() noexcept
+{
+    if(wakeup_fd_ < 0 || queue_.empty() ||
+       !consumer_waiting_.exchange(false, std::memory_order_acq_rel))
     {
-        const std::uint64_t one = 1;
-        const ssize_t written = ::write(wakeup_fd_, &one, sizeof(one));
-        static_cast<void>(written); // EAGAIN: already signalled
+        return;
     }
 
-    return queued;
+    const std::uint64_t one = 1;
+    const ssize_t written = ::write(wakeup_fd_, &one, sizeof(one));
+    static_cast<void>(written); // EAGAIN: already signalled
 }
 
 std::size_t DeliveryQueue::discard() noexcept

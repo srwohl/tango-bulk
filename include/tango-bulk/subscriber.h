@@ -8,11 +8,8 @@
 #include <tango-bulk/counters.h>
 #include <tango-bulk/errors.h>
 #include <tango-bulk/frame.h>
-#include <tango-bulk/limits.h>
-#include <tango-bulk/protocol.h>
-#include <tango-bulk/publisher.h> // DropPolicy
+#include <tango-bulk/geometry.h>
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -33,33 +30,6 @@ enum class SubscriberState : std::uint32_t
 };
 
 const char *to_string(SubscriberState state) noexcept;
-
-/// A subscription's state, coarsened to what an application should act on.
-///
-/// Distinct from `Protocol::SessionState`, which is the publisher's
-/// wire-level view of one session (Armed, Active, Closed). This is the
-/// client's view of its own subscription, and it is the shape
-/// RFC_BULK_DATA_PLANE.md 6.5 argues a control surface should publish.
-///
-/// Deliberately coarser than `SubscriberState`: probing and reconnection are
-/// internal interlocks, and publishing them commits this library to supporting
-/// them for as long as anything reads them.
-enum class SubscriptionState : std::uint32_t
-{
-    NoSession = 0,
-    Opening = 1,
-    Active = 2,
-};
-
-const char *to_string(SubscriptionState state) noexcept;
-
-/// Project a `SubscriberState` onto the three states the RFC publishes.
-///
-/// Lossy, and worth being explicit about which way: `Closed` and `Failed` both
-/// become `NoSession`, so this projection cannot tell an orderly shutdown from a
-/// subscriber that gave up reconnecting. `SubscriberState` remains the
-/// diagnostic answer, and nothing in this library reports the projection yet.
-SubscriptionState to_subscription_state(SubscriberState state) noexcept;
 
 enum class DeliveryMode : std::uint32_t
 {
@@ -86,6 +56,7 @@ struct SubscriberConfig
     std::uint32_t reconnect_max_attempts{10};
     std::uint32_t reconnect_backoff_ms{500}; ///< exponential, capped at lease TTL
     std::uint32_t command_timeout_ms{5'000}; ///< one Tango command round trip
+    std::uint32_t establishment_timeout_ms{30'000}; ///< total initial subscribe budget
 
     /// How long to wait for the publisher's `Probe` after `Open` is granted.
     ///
@@ -113,7 +84,22 @@ struct SubscriberConfig
 };
 
 using FrameCallback = std::function<void(FrameView)>;
-using StateCallback = std::function<void(SubscriberState, const BulkError &)>;
+
+/// The receive dimensions selected for a subscription.
+struct ReceivePlan
+{
+    std::uint64_t max_frame_bytes{0};
+    std::uint32_t ring_depth{0};
+    std::uint32_t credit_window{0};
+    std::uint64_t pinned_bytes{0};
+
+    Status validate() const noexcept;
+
+    /// Select the largest safe ring accepted by the negotiated geometry and
+    /// the caller's pinned-memory budget.
+    static ReceivePlan derive(const Geometry &geometry,
+                              std::uint64_t pinned_memory_limit_bytes) noexcept;
+};
 
 } // namespace TangoBulk
 

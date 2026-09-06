@@ -7,6 +7,8 @@
 
 #include <tango-bulk/frame.h>
 
+#include <core/frame_fields.h>
+
 #include <cstdint>
 #include <memory>
 
@@ -70,7 +72,7 @@ class ReceiveSlotLease
     /// There is no path that produces a view without one.
     static FrameView make_view(std::shared_ptr<ReceiveSlotLease> lease,
                                const std::byte *data,
-                               const FrameView::Fields *fields) noexcept;
+                               const FrameFields *fields) noexcept;
 
   private:
     std::shared_ptr<CreditSink> sink_;
@@ -85,7 +87,7 @@ class ReceiveSlotLease
 /// stay valid without copying 96 bytes of description with it.
 struct ReceiveSlot
 {
-    FrameView::Fields fields{};
+    FrameFields fields{};
     std::byte *data{nullptr};       ///< into the registered receive ring
     std::size_t capacity{0};        ///< granted max_frame_bytes
     bool occupied{false};           ///< engine thread only

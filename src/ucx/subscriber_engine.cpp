@@ -327,6 +327,10 @@ void SubscriberEngine::engine_loop()
             worked = true;
         }
 
+        // AM callbacks only enqueue.  Signalling after progress returns keeps
+        // the eventfd out of the UCX callback path and gives the waiter one
+        // stable notification point for a batch of received frames.
+        delivery_->notify();
 
         if(worked)
         {
@@ -699,7 +703,8 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         return UCS_OK;
     }
 
-    if(const Protocol::GeometryBlock &granted = granted_; granted.rank > 0)
+    const Protocol::GeometryBlock &granted = granted_;
+    if(granted.rank != 0)
     {
         if(frame.element_type != granted.element_type ||
            frame.element_size != granted.element_size || frame.rank != granted.rank ||

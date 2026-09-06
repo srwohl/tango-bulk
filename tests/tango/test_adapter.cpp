@@ -72,7 +72,6 @@ struct Sink
 {
     std::mutex mutex;
     std::vector<FrameView> frames;
-    std::vector<SubscriberState> states;
     std::vector<std::thread::id> callback_threads;
     std::atomic<std::size_t> frame_count{0};
 
@@ -88,19 +87,7 @@ struct Sink
             frame_count.fetch_add(1, std::memory_order_relaxed);
         };
 
-        out.on_state = [this](SubscriberState state, const BulkError &)
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            states.push_back(state);
-        };
-
         return out;
-    }
-
-    bool saw(SubscriberState state)
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        return std::find(states.begin(), states.end(), state) != states.end();
     }
 };
 
@@ -204,12 +191,8 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
     Sink sink;
     auto subscriber = subscribe(proxy, subscriber_config(), sink.callbacks());
 
-    // 4.1: `Active` means frames can flow, and the state callback fires on every
-    // transition on the way there.
+    // `Active` means the bounded initial establishment is complete and frames can flow.
     REQUIRE(subscriber->state() == SubscriberState::Active);
-    REQUIRE(eventually([&sink] { return sink.saw(SubscriberState::Active); }));
-    CHECK(sink.saw(SubscriberState::Opening));
-    CHECK(sink.saw(SubscriberState::Probing));
 
     Tango::DeviceData accepted = publish(proxy, 4);
     Tango::DevLong count = 0;
@@ -275,8 +258,9 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
     CHECK(counters.frames_dropped_bad_header == 0);
     CHECK(counters.frames_dropped_oversize == 0);
 
+    subscriber->close();
+    CHECK(subscriber->state() == SubscriberState::Closed);
     subscriber.reset();
-    CHECK(sink.saw(SubscriberState::Closed));
 
     // 3.8: `Close` releases the session, so the publisher is back where it
     // started and did not have to wait out a lease to get there.
@@ -295,11 +279,9 @@ TEST_CASE("The granted geometry reaches the application", "[tango][m4]")
 
     REQUIRE(subscriber->state() == SubscriberState::Active);
 
-    const Protocol::GeometryBlock granted = subscriber->granted_geometry();
+    const Geometry granted = subscriber->geometry();
 
     CHECK(granted.generation != 0);
-    CHECK(granted.generation == subscriber->generation());
-
     CHECK(granted.element_type == reported.element_type);
     CHECK(granted.element_size == reported.element_size);
     CHECK(granted.rank == reported.rank);
@@ -339,7 +321,7 @@ TEST_CASE("The renew timer keeps a session past its lease", "[tango][m4]")
     // is whatever the cases before this one left behind.  A test that reads a
     // global counter to make a local claim passes for the wrong reason exactly
     // when the suite is run in one process.
-    CHECK_FALSE(sink.saw(SubscriberState::Reconnecting));
+    CHECK(subscriber->state() != SubscriberState::Reconnecting);
     CHECK(bulk_query(proxy).active_sessions >= 1);
 
     // A session that is still alive can still carry data, which is the thing the
@@ -379,7 +361,7 @@ TEST_CASE("Manual delivery runs the callback on the polling thread", "[tango][m4
     REQUIRE(eventually(
         [&]
         {
-            delivered += subscriber->poll(20ms);
+            delivered += subscriber->poll(20ms, 8);
             return delivered >= 2;
         }));
 
@@ -470,7 +452,9 @@ TEST_CASE("A subscriber reopens its session after the stream comes back", "[tang
     // the client must not treat it as authority to release anything.
     proxy.command_inout("Detach");
 
-    REQUIRE(eventually([&sink] { return sink.saw(SubscriberState::Reconnecting); }));
+    REQUIRE(eventually([&subscriber] {
+        return subscriber->state() == SubscriberState::Reconnecting;
+    }));
     CHECK(subscriber->state() != SubscriberState::Closed);
 
     proxy.command_inout("Attach");

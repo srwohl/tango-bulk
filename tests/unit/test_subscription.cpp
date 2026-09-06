@@ -9,8 +9,10 @@
 #include <poll.h>
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -23,15 +25,15 @@ using namespace TangoBulkTests;
 
 TEST_CASE("the reconnect backoff doubles and is capped at the lease", "[core][subscription]")
 {
-    CHECK(backoff_delay(0, 200, 1'000) == std::chrono::milliseconds{200});
-    CHECK(backoff_delay(1, 200, 1'000) == std::chrono::milliseconds{400});
-    CHECK(backoff_delay(2, 200, 1'000) == std::chrono::milliseconds{800});
+    CHECK(detail::backoff_delay(0, 200, 1'000) == std::chrono::milliseconds{200});
+    CHECK(detail::backoff_delay(1, 200, 1'000) == std::chrono::milliseconds{400});
+    CHECK(detail::backoff_delay(2, 200, 1'000) == std::chrono::milliseconds{800});
 
-    CHECK(backoff_delay(3, 200, 1'000) == std::chrono::milliseconds{1'000});
-    CHECK(backoff_delay(9, 200, 1'000) == std::chrono::milliseconds{1'000});
+    CHECK(detail::backoff_delay(3, 200, 1'000) == std::chrono::milliseconds{1'000});
+    CHECK(detail::backoff_delay(9, 200, 1'000) == std::chrono::milliseconds{1'000});
 
-    CHECK(backoff_delay(0, 500, 0) == std::chrono::milliseconds{1});
-    CHECK(backoff_delay(4, 500, 0) == std::chrono::milliseconds{1});
+    CHECK(detail::backoff_delay(0, 500, 0) == std::chrono::milliseconds{1});
+    CHECK(detail::backoff_delay(4, 500, 0) == std::chrono::milliseconds{1});
 }
 
 
@@ -42,18 +44,10 @@ TEST_CASE("a subscription cannot be opened without somewhere to deliver",
 
     SubscriptionCallbacks missing_frame = noop_callbacks();
     missing_frame.on_frame = nullptr;
-    CHECK_THROWS_AS(Subscription::open(subscription_config(),
+    CHECK_THROWS_AS(detail::SubscriptionFactory::open(subscription_config(),
                                                     fake_channel(script),
                                                     fake_factory(script),
                                                     std::move(missing_frame)),
-                    BulkException);
-
-    SubscriptionCallbacks missing_state = noop_callbacks();
-    missing_state.on_state = nullptr;
-    CHECK_THROWS_AS(Subscription::open(subscription_config(),
-                                                    fake_channel(script),
-                                                    fake_factory(script),
-                                                    std::move(missing_state)),
                     BulkException);
 
     CHECK(script.transports_built.load() == 0);
@@ -68,7 +62,7 @@ TEST_CASE("a transport factory that returns nothing is refused, not dereferenced
     config.reconnect_policy = ReconnectPolicy::FailFast;
 
     CHECK_THROWS_AS(
-        Subscription::open(
+        detail::SubscriptionFactory::open(
             config,
             fake_channel(script),
             [](const SubscriberConfig &, std::shared_ptr<detail::DeliveryQueue>)
@@ -88,7 +82,7 @@ TEST_CASE("a granted session that never probes gives up on its own budget",
     config.probe_timeout_ms = 40;
 
     const auto started = std::chrono::steady_clock::now();
-    CHECK_THROWS_AS(Subscription::open(config,
+    CHECK_THROWS_AS(detail::SubscriptionFactory::open(config,
                                                     fake_channel(script),
                                                     fake_factory(script),
                                                     noop_callbacks()),
@@ -101,6 +95,24 @@ TEST_CASE("a granted session that never probes gives up on its own budget",
     CHECK(script.closes.load() >= 1);
 }
 
+TEST_CASE("bounded retry completes initial establishment before returning",
+          "[core][subscription]")
+{
+    Script script;
+    script.open_results = {Status::UnknownStream, Status::Ok};
+
+    SubscriberConfig config = subscription_config();
+    config.reconnect_backoff_ms = 1;
+    config.reconnect_max_attempts = 2;
+
+    auto subscription = detail::SubscriptionFactory::open(
+        config, fake_channel(script), fake_factory(script), noop_callbacks());
+
+    CHECK(subscription->state() == SubscriberState::Active);
+    CHECK(script.opens.load() == 2);
+    CHECK(subscription->geometry().generation == 1);
+}
+
 
 TEST_CASE("RenewTooFrequent slows the timer and does not end the session",
           "[core][subscription]")
@@ -111,7 +123,7 @@ TEST_CASE("RenewTooFrequent slows the timer and does not end the session",
         script.renew_results = {Status::RenewTooFrequent, Status::RenewTooFrequent};
     }
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(subscription->state() == SubscriberState::Active);
@@ -131,7 +143,7 @@ TEST_CASE("a lost session is not resurrected, it is replaced", "[core][subscript
         script.renew_results = {Status::SessionExpired};
     }
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
@@ -161,39 +173,18 @@ TEST_CASE("reconnect gives up after the configured attempts and says so",
 
     config.delivery_mode = DeliveryMode::DispatchThread;
 
-    std::mutex seen_mutex;
-    std::vector<SubscriberState> seen;
-    BulkError final_error;
-
     SubscriptionCallbacks callbacks = noop_callbacks();
-    callbacks.on_state = [&](SubscriberState state, const BulkError &error) {
-        std::lock_guard<std::mutex> lock(seen_mutex);
-        seen.push_back(state);
-        if(state == SubscriberState::Failed)
-        {
-            final_error = error;
-        }
-    };
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         config, fake_channel(script), fake_factory(script), std::move(callbacks));
 
     REQUIRE(eventually([&subscription] { return subscription->state() == SubscriberState::Failed; }));
 
     CHECK(subscription->counters().reconnects == 3);
 
-    REQUIRE(eventually([&] {
-        std::lock_guard<std::mutex> lock(seen_mutex);
-        return std::count(seen.begin(), seen.end(), SubscriberState::Failed) == 1;
-    }));
-
-    {
-        std::lock_guard<std::mutex> lock(seen_mutex);
-        CHECK(std::count(seen.begin(), seen.end(), SubscriberState::Reconnecting) == 3);
-    }
-
-    CHECK(final_error.message.find("reconnect attempts exhausted") != std::string::npos);
-    CHECK(final_error.message.find("UnknownStream") != std::string::npos);
+    const SubscriptionSnapshot snapshot = subscription->snapshot();
+    CHECK(snapshot.error.message.find("reconnect attempts exhausted") != std::string::npos);
+    CHECK(snapshot.error.message.find("UnknownStream") != std::string::npos);
 }
 
 TEST_CASE("FailFast does not retry", "[core][subscription]")
@@ -208,7 +199,7 @@ TEST_CASE("FailFast does not retry", "[core][subscription]")
     SubscriberConfig config = subscription_config();
     config.reconnect_policy = ReconnectPolicy::FailFast;
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         config, fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually([&subscription] { return subscription->state() == SubscriberState::Failed; }));
@@ -230,7 +221,7 @@ TEST_CASE("teardown during a reconnect backoff neither hangs nor reopens",
     config.reconnect_backoff_ms = 400; // long enough to be inside it
     config.reconnect_max_attempts = 10;
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         config, fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually(
@@ -262,21 +253,12 @@ TEST_CASE("a reopened session that describes a different array is refused",
     config.delivery_mode = DeliveryMode::DispatchThread;
     config.reconnect_max_attempts = 10;
 
-    std::mutex seen_mutex;
-    BulkError final_error;
     SubscriptionCallbacks callbacks = noop_callbacks();
-    callbacks.on_state = [&](SubscriberState state, const BulkError &error) {
-        if(state == SubscriberState::Failed)
-        {
-            std::lock_guard<std::mutex> lock(seen_mutex);
-            final_error = error;
-        }
-    };
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         config, fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    REQUIRE(subscription->granted_geometry().shape[0] == 8);
+    REQUIRE(subscription->geometry().shape[0] == 8);
 
     REQUIRE(eventually([&subscription] { return subscription->state() == SubscriberState::Failed; }));
 
@@ -284,18 +266,11 @@ TEST_CASE("a reopened session that describes a different array is refused",
 
     CHECK(subscription->counters().reconnects <= 1);
 
-    REQUIRE(eventually([&] {
-        std::lock_guard<std::mutex> lock(seen_mutex);
-        return final_error.status != Status::Ok;
-    }));
+    const SubscriptionSnapshot snapshot = subscription->snapshot();
+    CHECK(snapshot.error.status == Status::GeometryMismatch);
+    CHECK(snapshot.error.message.find("different array") != std::string::npos);
 
-    {
-        std::lock_guard<std::mutex> lock(seen_mutex);
-        CHECK(final_error.status == Status::GeometryMismatch);
-        CHECK(final_error.message.find("different array") != std::string::npos);
-    }
-
-    CHECK(subscription->granted_geometry().generation == 0);
+    CHECK(subscription->geometry().generation == 0);
 
     CHECK(script.transports_built.load() >= 2);
     CHECK(script.activations.load() == 1);
@@ -311,14 +286,14 @@ TEST_CASE("a reopened session with the same array is adopted normally",
         script.reshape_after_first = false;
     }
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
     REQUIRE(eventually([&subscription] { return subscription->state() == SubscriberState::Active; }));
 
     CHECK(subscription->counters().geometry_changes == 0);
-    CHECK(subscription->granted_geometry().shape[0] == 8);
+    CHECK(subscription->geometry().shape[0] == 8);
 }
 
 
@@ -326,7 +301,7 @@ TEST_CASE("coordination calls never overlap", "[core][subscription]")
 {
     Script script;
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually([&script] { return script.renews.load() >= 3; }));
@@ -344,10 +319,10 @@ TEST_CASE("the granted geometry survives to the interface", "[core][subscription
 {
     Script script;
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
-    const Protocol::GeometryBlock granted = subscription->granted_geometry();
+    const Geometry granted = subscription->geometry();
 
     CHECK(granted.generation == 1);
     CHECK(granted.element_type == ElementType::UInt16);
@@ -372,7 +347,7 @@ TEST_CASE("no session means an all-zero geometry, not a stale one",
     config.reconnect_policy = ReconnectPolicy::FailFast;
     config.probe_timeout_ms = 30;
 
-    CHECK_THROWS_AS(Subscription::open(config,
+    CHECK_THROWS_AS(detail::SubscriptionFactory::open(config,
                                                     fake_channel(script),
                                                     fake_factory(script),
                                                     noop_callbacks()),
@@ -390,10 +365,20 @@ TEST_CASE("poll() is refused when a dispatch thread is already delivering",
     SubscriberConfig config = subscription_config();
     config.delivery_mode = DeliveryMode::DispatchThread;
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         config, fake_channel(script), fake_factory(script), noop_callbacks());
 
-    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{1}), BulkException);
+    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{1}, 1), BulkException);
+}
+
+TEST_CASE("poll() requires an explicit positive bound", "[core][subscription]")
+{
+    Script script;
+    auto subscription = detail::SubscriptionFactory::open(
+        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+
+    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{0}, 0), BulkException);
+    CHECK(subscription->plan().validate() == Status::Ok);
 }
 
 
@@ -447,16 +432,116 @@ TEST_CASE("a frame the transport received reaches the application", "[core][subs
     SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(subscription->poll(std::chrono::milliseconds{200}) == 3);
+    CHECK(subscription->poll(std::chrono::milliseconds{200}, 3) == 3);
 
     REQUIRE(seen.count() == 3);
     CHECK(seen.sequences == std::vector<std::uint64_t>{1, 2, 3});
 
     CHECK(seen.first_elements == std::vector<std::uint16_t>{1, 2, 3});
     CHECK(seen.sizes == std::vector<std::size_t>(3, std::size_t{128}));
+}
+
+TEST_CASE("a manual callback failure is surfaced and stops the subscription",
+          "[core][subscription]")
+{
+    Script script;
+    script.receive(1);
+
+    SubscriptionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [](FrameView) { throw std::runtime_error("callback failed"); };
+
+    auto subscription = detail::SubscriptionFactory::open(
+        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{200}, 1), std::runtime_error);
+    CHECK(subscription->state() == SubscriberState::Failed);
+    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{0}, 1), BulkException);
+}
+
+TEST_CASE("a dispatch callback may destroy its subscription",
+          "[core][subscription]")
+{
+    Script script;
+    SubscriberConfig config = subscription_config();
+    config.delivery_mode = DeliveryMode::DispatchThread;
+
+    std::unique_ptr<Subscription> subscription;
+    std::atomic<bool> callback_finished{false};
+
+    SubscriptionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [&](FrameView) {
+        subscription.reset();
+        callback_finished.store(true, std::memory_order_release);
+    };
+
+    subscription = detail::SubscriptionFactory::open(
+        config, fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    script.receive(1);
+    REQUIRE(eventually([&callback_finished] {
+        return callback_finished.load(std::memory_order_acquire);
+    }));
+    CHECK_FALSE(subscription);
+}
+
+TEST_CASE("a dispatch callback failure terminates delivery once",
+          "[core][subscription]")
+{
+    Script script;
+    script.receive(1);
+    script.receive(2);
+
+    SubscriberConfig config = subscription_config();
+    config.delivery_mode = DeliveryMode::DispatchThread;
+
+    SubscriptionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [](FrameView) { throw std::runtime_error("callback failed"); };
+
+    auto subscription = detail::SubscriptionFactory::open(
+        config, fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    REQUIRE(eventually([&subscription] { return subscription->state() == SubscriberState::Failed; }));
+    CHECK(subscription->counters().delivery_queue_depth == 0);
+}
+
+TEST_CASE("close is explicit, idempotent, and returns the subscription to Closed",
+          "[core][subscription]")
+{
+    Script script;
+    auto subscription = detail::SubscriptionFactory::open(
+        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+
+    script.receive(1);
+    REQUIRE(eventually([&subscription] {
+        return subscription->counters().delivery_queue_depth == 1;
+    }));
+    subscription->close();
+    CHECK(subscription->state() == SubscriberState::Closed);
+    CHECK(subscription->counters().delivery_queue_depth == 0);
+    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{0}, 1), BulkException);
+    CHECK(script.closes.load() == 1);
+
+    subscription->close();
+    CHECK(subscription->state() == SubscriberState::Closed);
+    CHECK(script.closes.load() == 1);
+}
+
+TEST_CASE("interrupt is sticky and distinct from an orderly close",
+          "[core][subscription]")
+{
+    Script script;
+    auto subscription = detail::SubscriptionFactory::open(
+        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+
+    subscription->interrupt();
+    CHECK(subscription->snapshot().interrupted);
+    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{0}, 1), BulkException);
+
+    subscription->interrupt();
+    CHECK(subscription->snapshot().interrupted);
 }
 
 TEST_CASE("frames arriving after the open are delivered too", "[core][subscription]")
@@ -467,13 +552,13 @@ TEST_CASE("frames arriving after the open are delivered too", "[core][subscripti
     SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(subscription->poll(std::chrono::milliseconds{5}) == 0);
+    CHECK(subscription->poll(std::chrono::milliseconds{5}, 1) == 0);
 
     script.receive(7);
-    CHECK(subscription->poll(std::chrono::milliseconds{500}) == 1);
+    CHECK(subscription->poll(std::chrono::milliseconds{500}, 1) == 1);
     REQUIRE(seen.count() == 1);
     CHECK(seen.sequences.front() == 7);
 }
@@ -490,7 +575,7 @@ TEST_CASE("a dispatch thread delivers without the application asking",
     SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         config, fake_channel(script), fake_factory(script), std::move(callbacks));
 
     for(std::uint64_t sequence = 1; sequence <= 4; ++sequence)
@@ -518,13 +603,13 @@ TEST_CASE("poll() delivers no more frames than it was asked for", "[core][subscr
     SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
     CHECK(subscription->poll(std::chrono::milliseconds{200}, 2) == 2);
     CHECK(seen.count() == 2);
 
-    CHECK(subscription->poll(std::chrono::milliseconds{200}) == 3);
+    CHECK(subscription->poll(std::chrono::milliseconds{200}, 3) == 3);
     REQUIRE(seen.count() == 5);
     CHECK(seen.sequences == std::vector<std::uint64_t>{1, 2, 3, 4, 5});
 }
@@ -541,10 +626,10 @@ TEST_CASE("frames are delivered on the polling thread, never on a coordination t
     SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(subscription->poll(std::chrono::milliseconds{200}) == 2);
+    CHECK(subscription->poll(std::chrono::milliseconds{200}, 2) == 2);
 
     CHECK(seen.thread_count() == 1);
     CHECK(seen.on(std::this_thread::get_id()));
@@ -561,10 +646,10 @@ TEST_CASE("a frame the application kept outlives the session that delivered it",
     SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&retained](FrameView frame) { retained = std::move(frame); };
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(subscription->poll(std::chrono::milliseconds{200}) == 1);
+    CHECK(subscription->poll(std::chrono::milliseconds{200}, 1) == 1);
     REQUIRE(static_cast<bool>(retained));
 
     subscription.reset();
@@ -587,10 +672,10 @@ TEST_CASE("a frame delivered before a reconnect survives the session that replac
     SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&retained](FrameView frame) { retained = std::move(frame); };
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(subscription->poll(std::chrono::milliseconds{200}) == 1);
+    CHECK(subscription->poll(std::chrono::milliseconds{200}, 1) == 1);
     REQUIRE(static_cast<bool>(retained));
 
     script.refuse_next_renew(Status::SessionExpired);
@@ -600,7 +685,7 @@ TEST_CASE("a frame delivered before a reconnect survives the session that replac
     CHECK(*reinterpret_cast<const std::uint16_t *>(retained.data()) == 11);
 
     script.receive(12);
-    CHECK(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}) == 1; }));
+    CHECK(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}, 1) == 1; }));
 }
 
 
@@ -617,14 +702,14 @@ TEST_CASE("a consumer blocked in poll() does not delay replacing the transport",
 {
     Script script;
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually([&script] { return script.transports_built.load() == 1; }));
 
     std::atomic<bool> still_polling{true};
     std::thread consumer([&] {
-        subscription->poll(std::chrono::seconds{2});
+        subscription->poll(std::chrono::seconds{2}, 1);
         still_polling.store(false);
     });
 
@@ -650,7 +735,7 @@ TEST_CASE("the readiness descriptor survives a reconnect", "[core][subscription]
 {
     Script script;
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     const int before = subscription->fd();
@@ -663,7 +748,7 @@ TEST_CASE("the readiness descriptor survives a reconnect", "[core][subscription]
 
     Delivered seen;
     script.receive(9);
-    REQUIRE(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}) == 1; }));
+    REQUIRE(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}, 1) == 1; }));
 }
 
 TEST_CASE("an empty poll arms the descriptor, and a frame makes it readable",
@@ -675,18 +760,18 @@ TEST_CASE("an empty poll arms the descriptor, and a frame makes it readable",
     SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
     REQUIRE(subscription->fd() >= 0);
 
-    CHECK(subscription->poll(std::chrono::milliseconds{0}) == 0);
+    CHECK(subscription->poll(std::chrono::milliseconds{0}, 1) == 0);
     CHECK_FALSE(readable(subscription->fd()));
 
     script.receive(4);
 
     CHECK(readable(subscription->fd()));
-    CHECK(subscription->poll(std::chrono::milliseconds{0}) == 1);
+    CHECK(subscription->poll(std::chrono::milliseconds{0}, 1) == 1);
     REQUIRE(seen.count() == 1);
     CHECK(seen.sequences.front() == 4);
 }
@@ -700,7 +785,7 @@ TEST_CASE("frames the retired session left behind are discarded, not delivered l
     SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
     script.receive(1);
@@ -711,11 +796,11 @@ TEST_CASE("frames the retired session left behind are discarded, not delivered l
     script.refuse_next_renew(Status::SessionExpired);
     REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
 
-    CHECK(subscription->poll(std::chrono::milliseconds{50}) == 0);
+    CHECK(subscription->poll(std::chrono::milliseconds{50}, 1) == 0);
     CHECK(seen.count() == 0);
 
     script.receive(2);
-    REQUIRE(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}) == 1; }));
+    REQUIRE(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}, 1) == 1; }));
     REQUIRE(seen.count() == 1);
     CHECK(seen.sequences.front() == 2);
 }
@@ -733,7 +818,7 @@ TEST_CASE("a refusal sent as an Error message is adopted like any other",
 
     try
     {
-        Subscription::open(
+        detail::SubscriptionFactory::open(
             config, fake_channel(script), fake_factory(script), noop_callbacks());
         FAIL("the open should have been refused");
     }
@@ -757,7 +842,7 @@ TEST_CASE("a reply that does not decode is a refusal, not a crash",
 
     try
     {
-        Subscription::open(
+        detail::SubscriptionFactory::open(
             config, fake_channel(script), fake_factory(script), noop_callbacks());
         FAIL("an undecodable reply should have been refused");
     }
@@ -774,7 +859,7 @@ TEST_CASE("the lease terms the publisher granted are what the renew timer uses",
     script.renew_interval_ms = 15;
     script.lease_ttl_ms = 150;
 
-    auto subscription = Subscription::open(
+    auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually([&script] { return script.renews.load() >= 3; },

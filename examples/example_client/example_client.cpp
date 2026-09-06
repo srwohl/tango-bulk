@@ -112,18 +112,6 @@ int main(int argc, char *argv[])
                 bytes.fetch_add(view.size(), std::memory_order_relaxed);
             };
 
-        callbacks.on_state =
-            [](TangoBulk::SubscriberState state, const TangoBulk::BulkError &error)
-            {
-                std::cout << "state: " << TangoBulk::to_string(state);
-                if(error.status != TangoBulk::Status::Ok)
-                {
-                    std::cout << " (" << TangoBulk::to_string(error.status) << ": "
-                              << error.message << ")";
-                }
-                std::cout << std::endl;
-            };
-
         auto subscription = TangoBulk::subscribe(proxy, config, std::move(callbacks));
 
         auto last = std::chrono::steady_clock::now();

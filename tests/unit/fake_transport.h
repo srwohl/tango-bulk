@@ -6,8 +6,8 @@
 #define TANGO_BULK_TESTS_UNIT_FAKE_TRANSPORT_H
 
 #include <core/delivery_queue.h>
-
-#include <tango-bulk/subscription.h>
+#include <core/frame_fields.h>
+#include <core/subscription_internal.h>
 
 #include <algorithm>
 #include <array>
@@ -30,7 +30,7 @@ using namespace std::chrono_literals;
 struct ScriptedFrame
 {
     std::shared_ptr<std::vector<std::uint16_t>> payload;
-    FrameView::Fields fields;
+    detail::FrameFields fields;
 
     const std::byte *bytes() const noexcept
     {
@@ -233,7 +233,9 @@ struct Script
   private:
     void deliver_locked(ScriptedFrame &frame)
     {
-        delivery->push(FrameView::detached(frame.payload, frame.bytes(), frame.fields));
+        delivery->push(
+            detail::DetachedFrameFactory::make(frame.payload, frame.bytes(), frame.fields));
+        delivery->notify();
     }
 };
 
@@ -394,7 +396,6 @@ inline SubscriptionCallbacks noop_callbacks()
 {
     SubscriptionCallbacks callbacks;
     callbacks.on_frame = [](FrameView) {};
-    callbacks.on_state = [](SubscriberState, const BulkError &) {};
     return callbacks;
 }
 

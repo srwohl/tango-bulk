@@ -14,7 +14,7 @@
 #include <core/delivery_queue.h>
 #include <core/lease_pool.h>
 #include <core/receive_slot.h>
-#include <tango-bulk/unstable/subscriber_transport.h>
+#include <core/subscriber_transport.h>
 
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/subscriber.h>
@@ -25,19 +25,9 @@
 #include <thread>
 #include <vector>
 
-/// The receiving half of the transport, below `BulkSubscriber`.
-///
-/// This is deliberately **not** `BulkSubscriber`.  2.4 gives that class a
-/// `Tango::DeviceProxy &` constructor parameter, and 1.1 forbids `src/ucx/` from
-/// seeing `tango/*`; docs/EXTRACTION.md deviation 2 resolves the pair by putting
-/// the transport engine in this layer and `BulkSubscriber` in the Tango layer,
-/// meeting at an interface.  This is that engine, and the interface it meets is
-///
-/// M4 built the other half: `BulkSubscriber` in `src/tango/proxy_client.cpp` is
-/// a shell over this class, reached through that interface and constructed
-/// through `make_subscriber_transport()`.  The UCX tests keep driving the
-/// coordination bytes by hand -- which is what 9.3 asks for, and what keeps this
-/// layer testable on a machine with no Tango database.
+/// The UCX receive engine behind the internal SubscriberTransport seam.
+/// Coordination remains outside this layer, so the engine can be tested with
+/// protocol bytes without a Tango device proxy.
 namespace TangoBulk::detail
 {
 

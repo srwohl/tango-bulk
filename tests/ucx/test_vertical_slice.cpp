@@ -112,7 +112,7 @@ TEST_CASE("Slots recycle: sequence s lands in slot s % ring_depth", "[m2][slice]
     // Every producer slot came back.  A wraparound bug that leaked one slot per
     // lap shows up here and nowhere else.
     CHECK(eventually([&] { return slice.publisher.counters().frames_credited == total; }));
-    CHECK(eventually([&] { return slice.publisher.retained() == 0; }));
+    CHECK(eventually([&] { return slice.publisher.counters().leases_retained == 0; }));
 }
 
 TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring",
@@ -268,7 +268,7 @@ TEST_CASE("With every view retained, publish reports CreditStalled and never blo
     // No slot was reused: every accepted frame still holds its own, and every
     // stalled frame gave its slot straight back.
     CHECK(counters.leases_retained == accepted);
-    CHECK(slice.publisher.retained() == accepted);
+    CHECK(slice.publisher.counters().leases_retained == accepted);
 }
 
 TEST_CASE("A slot handle outlives the publisher that issued it", "[m2][slice]")
@@ -281,7 +281,7 @@ TEST_CASE("A slot handle outlives the publisher that issued it", "[m2][slice]")
         REQUIRE(handle);
 
         fill(handle, k_frame_bytes, 5);
-        CHECK(publisher.retained() == 1);
+        CHECK(publisher.counters().leases_retained == 1);
     }
 
     REQUIRE(handle);
@@ -331,7 +331,6 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
     for(std::size_t n = 0; n < leases.size(); ++n)
     {
         const void *before = leases[n].data();
-        const std::size_t index_before = leases[n].index();
 
         const PublishResult result =
             slice.publisher.publish(std::move(leases[n]), meta_for(k_frame_bytes, n));
@@ -348,7 +347,6 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
         // the same slot, still the bytes it was filled with.
         REQUIRE(leases[n]);
         CHECK(leases[n].data() == before);
-        CHECK(leases[n].index() == index_before);
         CHECK(leases[n].capacity() == k_frame_bytes);
 
         // And usable: a retry once the engine has drained must be accepted.
