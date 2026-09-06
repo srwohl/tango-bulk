@@ -7,6 +7,7 @@
 #include <ucx/subscriber_engine.h>
 
 #include <core/delivery_queue.h>
+#include <core/session_client.h>
 
 #include <tango-bulk/publisher.h>
 
@@ -482,20 +483,30 @@ int run_subscriber(const Options &options)
     config.delivery_mode = DeliveryMode::Manual;
     config.ucx_tls = options.tls;
 
-    // The queue belongs to the subscription, and here the benchmark is the
-    // subscription: it supplies somewhere for the engine to push frames, and
-    // takes them out of that rather than out of the engine.
+    // The benchmark is the subscription here: it owns the delivery queue the
+    // engine pushes into, and the session contract the engine is started on.
+    // A transport owns neither.
     const auto delivery = std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
                                                                   config.drop_policy);
+    detail::SessionClient session;
     detail::SubscriberEngine engine(config, delivery);
 
     const OobChannel oob = OobChannel::connect_to(options.host, options.port);
 
-    oob.send(engine.make_open_request(1));
+    oob.send(session.make_open_request(config, engine.local_address(), 1));
     const std::vector<std::byte> reply = oob.recv();
-    if(const Status status = engine.adopt_open_reply(reply.data(), reply.size()); status != Status::Ok)
+    if(const Status status = session.adopt_open_reply(reply.data(), reply.size(), config);
+       status != Status::Ok)
     {
         fail(std::string("Open was refused: ") + to_string(status));
+    }
+
+    // Only now, and only with a grant that survived validation.
+    if(const Status status = engine.activate(
+           session.stream_id(), session.granted_geometry(), session.server_address());
+       status != Status::Ok)
+    {
+        fail(std::string("the transport could not adopt the grant: ") + to_string(status));
     }
 
     const auto active_by = Clock::now() + std::chrono::seconds(10);
@@ -608,7 +619,7 @@ int run_subscriber(const Options &options)
         status = 1;
     }
 
-    oob.send(engine.make_close_request(2));
+    oob.send(session.make_close_request(2));
     const std::vector<std::byte> close_reply = oob.recv();
     (void) close_reply;
 

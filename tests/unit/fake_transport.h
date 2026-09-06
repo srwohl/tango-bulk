@@ -6,7 +6,6 @@
 #define TANGO_BULK_TESTS_UNIT_FAKE_TRANSPORT_H
 
 #include <core/delivery_queue.h>
-#include <core/session_client.h>
 
 #include <tango-bulk/unstable/session_supervisor.h>
 
@@ -101,6 +100,14 @@ struct Script
     std::vector<std::byte> server_address{std::byte{9}, std::byte{8}, std::byte{7}};
 
     std::atomic<int> transports_built{0};
+
+    /// How many transports were actually started on a grant.
+    ///
+    /// Distinct from `transports_built`, and the gap between them is the point:
+    /// a transport whose grant the subscription refuses is built and destroyed
+    /// without ever being activated, so it never had an endpoint and never
+    /// could have queued a frame.
+    std::atomic<int> activations{0};
     std::atomic<int> opens{0};
     std::atomic<int> renews{0};
     std::atomic<int> closes{0};
@@ -327,36 +334,29 @@ class FakeTransport final : public detail::SubscriberTransport
     /// There is no `poll()` here any more, and that is the point: a transport
     /// is given somewhere to put frames rather than asked for them, so nothing
     /// above has to hold it alive across an application callback.
-    FakeTransport(Script &script,
-                  SubscriberConfig config,
-                  std::shared_ptr<detail::DeliveryQueue> delivery) :
-        script_(script),
-        config_(std::move(config))
+    FakeTransport(Script &script, std::shared_ptr<detail::DeliveryQueue> delivery) :
+        script_(script)
     {
         script_.transports_built.fetch_add(1, std::memory_order_relaxed);
         script_.attach(std::move(delivery));
     }
 
-    // -- the session contract, through the same module the engine uses --------
+    // -- what is left of the seam --------------------------------------------
     //
-    // `SessionClient` rather than a hand-written stand-in, deliberately. A fake
-    // that adopts a grant by consulting a flag proves nothing about adopting a
-    // grant; this one runs the real encoder, the real decoder and the real
-    // validation, so the supervisor tests exercise the whole coordination path
-    // and not merely the control loop's shape around it.
+    // No codec, no lease terms, no grant. All of that is the subscription's
+    // now, so a fake transport has nothing to fake about it: it says where it
+    // is, takes a settled contract, and reports what happened.
 
-    std::vector<std::byte> make_open_request(std::uint64_t correlation_id) const override
+    const std::vector<std::byte> &local_address() const noexcept override
     {
-        return session_.make_open_request(config_, k_client_address, correlation_id);
+        return k_client_address;
     }
 
-    Status adopt_open_reply(const std::byte *data, std::size_t size) override
+    Status activate(Protocol::StreamId,
+                    const Protocol::GeometryBlock &,
+                    const std::vector<std::byte> &) override
     {
-        const Status status = session_.adopt_open_reply(data, size, config_);
-        if(status != Status::Ok)
-        {
-            return status;
-        }
+        script_.activations.fetch_add(1, std::memory_order_relaxed);
 
         // A real engine reaches Active when the publisher's Probe is answered.
         // This is the knob a real one does not have.
@@ -365,51 +365,15 @@ class FakeTransport final : public detail::SubscriberTransport
         return Status::Ok;
     }
 
-    std::vector<std::byte> make_renew_request(std::uint64_t correlation_id) override
-    {
-        return session_.make_renew_request(
-            correlation_id, 0, 0, static_cast<std::uint32_t>(state()));
-    }
-
-    Status adopt_renew_reply(const std::byte *data, std::size_t size) override
-    {
-        return session_.adopt_renew_reply(data, size).status;
-    }
-
-    std::vector<std::byte> make_close_request(std::uint64_t correlation_id) const override
-    {
-        return session_.make_close_request(correlation_id);
-    }
-
-    std::uint32_t lease_ttl_ms() const noexcept override
-    {
-        return session_.lease_ttl_ms();
-    }
-
-    std::uint32_t renew_interval_ms() const noexcept override
-    {
-        return session_.renew_interval_ms();
-    }
-
     BulkError last_error() const noexcept override
     {
         return failed_ ? BulkError{Status::TransportFailure, "the fake was told to fail", "transport"}
                        : BulkError{};
     }
 
-    Protocol::GeometryBlock granted_geometry() const noexcept override
-    {
-        return session_.granted_geometry();
-    }
-
     SubscriberState state() const noexcept override
     {
         return state_.load(std::memory_order_acquire);
-    }
-
-    std::uint32_t generation() const noexcept override
-    {
-        return session_.generation();
     }
 
     SubscriberCounters counters() const noexcept override
@@ -433,8 +397,6 @@ class FakeTransport final : public detail::SubscriberTransport
         std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
 
     Script &script_;
-    SubscriberConfig config_;
-    detail::SessionClient session_;
     std::atomic<SubscriberState> state_{SubscriberState::Opening};
     std::atomic<bool> failed_{false};
 };
@@ -444,11 +406,11 @@ class FakeTransport final : public detail::SubscriberTransport
 inline detail::TransportFactory fake_factory(Script &script,
                                              std::shared_ptr<FakeTransport *> latest = nullptr)
 {
-    return [&script, latest](const SubscriberConfig &config,
+    return [&script, latest](const SubscriberConfig &,
                              std::shared_ptr<detail::DeliveryQueue> delivery)
         -> std::unique_ptr<detail::SubscriberTransport>
     {
-        auto transport = std::make_unique<FakeTransport>(script, config, std::move(delivery));
+        auto transport = std::make_unique<FakeTransport>(script, std::move(delivery));
         if(latest)
         {
             *latest = transport.get();

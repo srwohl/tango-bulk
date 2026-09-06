@@ -283,32 +283,19 @@ void SubscriberEngine::register_am_handlers()
 // class publishes to the layer above.  `SessionClient` owns the rest, and owns
 // it in `core/` where it can be tested without a NIC.
 
-std::vector<std::byte> SubscriberEngine::make_open_request(std::uint64_t correlation_id) const
+Status SubscriberEngine::activate(Protocol::StreamId stream_id,
+                                  const Protocol::GeometryBlock &granted,
+                                  const std::vector<std::byte> &server_address)
 {
-    return session_.make_open_request(config_, worker_->address(), correlation_id);
-}
-
-Status SubscriberEngine::adopt_open_reply(const std::byte *data, std::size_t size)
-{
-    const Status status = session_.adopt_open_reply(data, size, config_);
-    if(status != Status::Ok)
-    {
-        fail(status, "the publisher refused the Open, or its grant was unusable");
-        return status;
-    }
+    stream_id_ = stream_id;
+    granted_ = granted;
 
     tracker_.reset(0);
-
-    // Where this session's delivery count starts. The queue spans every session
-    // the subscription has had; `Renew` reports the progress of this one.
-    // Written before the engine thread exists, which is what publishes it.
-    delivered_at_open_ = delivery_->taken();
 
     // Still the only thread touching this worker: the engine has not started.
     try
     {
-        endpoint_ = worker_->create_endpoint(session_.server_address().data(),
-                                             session_.server_address().size());
+        endpoint_ = worker_->create_endpoint(server_address.data(), server_address.size());
     }
     catch(const BulkException &)
     {
@@ -326,39 +313,6 @@ Status SubscriberEngine::adopt_open_reply(const std::byte *data, std::size_t siz
     engine_ = std::thread([this] { engine_loop(); });
     return Status::Ok;
 }
-
-std::vector<std::byte> SubscriberEngine::make_renew_request(std::uint64_t correlation_id)
-{
-    renewals_sent_.fetch_add(1, std::memory_order_relaxed);
-    return session_.make_renew_request(
-        correlation_id,
-        delivery_->taken() - delivered_at_open_,
-        arena_ ? arena_->credits_returned() : 0,
-        static_cast<std::uint32_t>(state_.load(std::memory_order_acquire)));
-}
-
-Status SubscriberEngine::adopt_renew_reply(const std::byte *data, std::size_t size)
-{
-    const SessionClient::RenewOutcome outcome = session_.adopt_renew_reply(data, size);
-
-    if(outcome.status != Status::Ok)
-    {
-        renewals_failed_.fetch_add(1, std::memory_order_relaxed);
-    }
-    if(outcome.session_lost)
-    {
-        fail(outcome.status, "the publisher no longer recognises this session");
-    }
-
-    return outcome.status;
-}
-
-std::vector<std::byte> SubscriberEngine::make_close_request(std::uint64_t correlation_id) const
-{
-    return session_.make_close_request(correlation_id);
-}
-
-// -- engine thread ----------------------------------------------------------
 
 void SubscriberEngine::engine_loop()
 {
@@ -538,7 +492,7 @@ bool SubscriberEngine::drain_credit_returns()
         // The slot is free the moment its credit is on its way back.  Clearing
         // the flag here, on the engine thread, is what keeps `occupied` a purely
         // engine-thread quantity despite releases happening anywhere.
-        const std::uint32_t depth = session_.granted_ring_depth();
+        const std::uint32_t depth = granted_.ring_depth;
         if(depth != 0)
         {
             arena_->slot(static_cast<std::size_t>(sequence % depth)).occupied = false;
@@ -565,8 +519,8 @@ bool SubscriberEngine::send_pending_credit()
     }
 
     Protocol::CreditMessage credit;
-    credit.generation = session_.generation();
-    credit.stream_id = session_.stream_id();
+    credit.generation = granted_.generation;
+    credit.stream_id = stream_id_;
     // 3.12: cumulative.  Every sequence at or below this has been released, and
     // 5.5 advances it only across the contiguous prefix -- one message per
     // progress iteration however many views were let go, which is what makes
@@ -621,7 +575,7 @@ ucs_status_t SubscriberEngine::on_probe_am(void *arg,
     Protocol::ProbeMessage probe;
     const auto *bytes = static_cast<const std::byte *>(header);
     if(Protocol::decode(bytes, header_length, probe) != Status::Ok ||
-       probe.stream_id != self->session_.stream_id())
+       probe.stream_id != self->stream_id_)
     {
         self->dropped_bad_header_.fetch_add(1, std::memory_order_relaxed);
         return UCS_OK;
@@ -643,8 +597,8 @@ bool SubscriberEngine::send_pending_probe_ack()
     }
 
     Protocol::ProbeAckMessage ack;
-    ack.generation = session_.generation();
-    ack.stream_id = session_.stream_id();
+    ack.generation = granted_.generation;
+    ack.stream_id = stream_id_;
     ack.probe_token = pending_probe_token_;
 
     const std::array<std::byte, Protocol::k_probe_ack_bytes> bytes = Protocol::encode(ack);
@@ -746,7 +700,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         return UCS_OK;
     }
 
-    if(frame.stream_id != session_.stream_id())
+    if(frame.stream_id != stream_id_)
     {
         // 4.4: a frame for an unknown stream_id is dropped, never treated as a
         // request to create a session.
@@ -757,7 +711,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
     // Ahead of the size checks, deviating from 3.11's written order, because the
     // releases below depend on it: a sequence only means something inside its
     // own epoch, since sequences restart at a re-arm.
-    if(frame.generation != session_.generation())
+    if(frame.generation != granted_.generation)
     {
         dropped_stale_epoch_.fetch_add(1, std::memory_order_relaxed);
         return UCS_OK;
@@ -776,7 +730,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
     // Only checked when the grant is typed. A rank-0 `Byte` grant is the opaque
     // tier -- bytes, length and ordering, with the per-frame hint free to say
     // more -- so there is no contract to contradict.
-    if(const Protocol::GeometryBlock &granted = session_.granted_geometry(); granted.rank > 0)
+    if(const Protocol::GeometryBlock &granted = granted_; granted.rank > 0)
     {
         if(frame.element_type != granted.element_type ||
            frame.element_size != granted.element_size || frame.rank != granted.rank ||
@@ -809,7 +763,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         return UCS_OK;
     }
 
-    if(frame.payload_bytes > session_.granted_frame_bytes())
+    if(frame.payload_bytes > granted_.max_frame_bytes)
     {
         dropped_oversize_.fetch_add(1, std::memory_order_relaxed);
         tracker_.release(frame.sequence);
@@ -817,7 +771,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
     }
 
     const auto slot_index =
-        static_cast<std::size_t>(frame.sequence % session_.granted_ring_depth());
+        static_cast<std::size_t>(frame.sequence % granted_.ring_depth);
     ReceiveSlot &slot = arena_->slot(slot_index);
 
     if(slot.occupied || frame.sequence < tracker_.released_end())
@@ -1041,9 +995,7 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
     out.credits_returned = arena_->credits_returned();
     out.credit_messages_sent = credit_messages_sent_.load(std::memory_order_relaxed);
     out.views_outstanding = arena_->views_outstanding();
-    out.sessions_opened = session_.stream_id() != 0 ? 1u : 0u;
-    out.renewals_sent = renewals_sent_.load(std::memory_order_relaxed);
-    out.renewals_failed = renewals_failed_.load(std::memory_order_relaxed);
+    out.sessions_opened = stream_id_ != 0 ? 1u : 0u;
     out.transport_errors = transport_errors_.load(std::memory_order_relaxed);
     out.pinned_bytes = arena_->ring().mapped_bytes();
     return out;
