@@ -268,9 +268,20 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
         sink.frames.clear();
     }
 
+    // frames_delivered and the queue gauges are the subscription's own, so they
+    // are exact the moment the frame is handed over.
+    CHECK(subscriber.counters().frames_delivered >= 4);
+
+    // frames_received is the transport's, and the subscription reads a copy its
+    // control thread published rather than reaching into a live transport to
+    // ask. That copy refreshes on the control quantum, so it lags -- which is
+    // the trade ADR 0004 accepts, and what paid for retirement no longer having
+    // to wait on whoever happens to be reading a counter. `eventually` is the
+    // assertion the contract supports; a bare CHECK asserted an exactness that
+    // was never promised and cost a borrow handshake to provide.
+    REQUIRE(eventually([&subscriber] { return subscriber.counters().frames_received >= 4; }));
+
     const SubscriberCounters counters = subscriber.counters();
-    CHECK(counters.frames_received >= 4);
-    CHECK(counters.frames_delivered >= 4);
     CHECK(counters.frames_dropped_bad_header == 0);
     CHECK(counters.frames_dropped_oversize == 0);
 

@@ -122,83 +122,6 @@ struct SessionSupervisor::Impl
         BulkError error;
     };
 
-    /// A transport borrowed for the duration of one call.
-    ///
-    /// The dispatch thread polls the transport while the control thread may be
-    /// replacing it, so a `shared_ptr` alone will not do: dropping the last
-    /// reference *is* the destruction, and the engine must not be destroyed on
-    /// the dispatch thread from inside its own `poll()`.  A borrow keeps the
-    /// slot's own reference alive too -- `publish_transport()` waits for every
-    /// borrow to be given back before it swaps -- so the destructor always runs
-    /// on the control thread.
-    class Ref
-    {
-      public:
-        Ref() noexcept = default;
-
-        Ref(Impl &owner, std::shared_ptr<SubscriberTransport> transport) noexcept :
-            owner_(&owner),
-            transport_(std::move(transport))
-        {
-        }
-
-        ~Ref()
-        {
-            reset();
-        }
-
-        Ref(Ref &&other) noexcept :
-            owner_(other.owner_),
-            transport_(std::move(other.transport_))
-        {
-            other.owner_ = nullptr;
-        }
-
-        Ref &operator=(Ref &&other) noexcept
-        {
-            if(this != &other)
-            {
-                reset();
-                owner_ = other.owner_;
-                transport_ = std::move(other.transport_);
-                other.owner_ = nullptr;
-            }
-            return *this;
-        }
-
-        Ref(const Ref &) = delete;
-        Ref &operator=(const Ref &) = delete;
-
-        void reset() noexcept
-        {
-            if(owner_ == nullptr)
-            {
-                return;
-            }
-
-            // The reference goes first, the borrow count second: after the
-            // count reaches zero no borrower may still hold a pointer, which is
-            // precisely what publish_transport() waits on.
-            transport_.reset();
-            owner_->end_borrow();
-            owner_ = nullptr;
-        }
-
-        explicit operator bool() const noexcept
-        {
-            return static_cast<bool>(transport_);
-        }
-
-        SubscriberTransport *operator->() const noexcept
-        {
-            return transport_.get();
-        }
-
-      private:
-        Impl *owner_{nullptr};
-        std::shared_ptr<SubscriberTransport> transport_;
-    };
-
     Impl(SubscriberConfig cfg,
          CoordinationChannel coordination,
          TransportFactory transport_factory,
@@ -222,7 +145,7 @@ struct SessionSupervisor::Impl
     /// lease exists to prevent on the other side.
     bool open_session(BulkError &error) noexcept
     {
-        std::shared_ptr<SubscriberTransport> fresh;
+        std::unique_ptr<SubscriberTransport> fresh;
 
         try
         {
@@ -310,7 +233,7 @@ struct SessionSupervisor::Impl
         {
             // The grant is settled. Under the lock because granted_geometry()
             // reads it from an application thread.
-            std::lock_guard<std::mutex> lock(mutex);
+            std::lock_guard<std::mutex> lock(observation);
             session = candidate;
         }
 
@@ -348,8 +271,8 @@ struct SessionSupervisor::Impl
 
         for(;;)
         {
-            const Ref live = borrow();
-            const SubscriberState observed = live ? live->state() : SubscriberState::Failed;
+            const SubscriberState observed =
+                transport ? transport->state() : SubscriberState::Failed;
 
             if(observed == SubscriberState::Active)
             {
@@ -359,7 +282,7 @@ struct SessionSupervisor::Impl
 
             if(observed == SubscriberState::Failed || !running.load(std::memory_order_acquire))
             {
-                error = live ? live->last_error() : BulkError{};
+                error = transport ? transport->last_error() : BulkError{};
                 if(error.status == Status::Ok)
                 {
                     error = BulkError{Status::TransportFailure,
@@ -394,8 +317,7 @@ struct SessionSupervisor::Impl
     void close_session() noexcept
     {
         {
-            const Ref live = borrow();
-            if(live)
+            if(transport)
             {
                 try
                 {
@@ -436,25 +358,20 @@ struct SessionSupervisor::Impl
                 return true;
             }
 
-            SubscriberState observed = SubscriberState::Failed;
-            BulkError reported;
+            if(!transport)
             {
-                const Ref live = borrow();
-                if(!live)
-                {
-                    error = BulkError{Status::Internal, "the transport disappeared", "subscriber"};
-                    return false;
-                }
-                observed = live->state();
-
-                // Read while the borrow is still held: the reason belongs to
-                // the transport, and the transport can be swapped the moment it
-                // is given back.
-                if(observed == SubscriberState::Failed)
-                {
-                    reported = live->last_error();
-                }
+                error = BulkError{Status::Internal, "the transport disappeared", "subscriber"};
+                return false;
             }
+
+            const SubscriberState observed = transport->state();
+            const BulkError reported =
+                observed == SubscriberState::Failed ? transport->last_error() : BulkError{};
+
+            // Diagnostics are refreshed on the same schedule this loop already
+            // runs on, so a reader never has to reach for a transport to see
+            // how the session is doing.
+            publish_observation();
 
             if(observed == SubscriberState::Failed)
             {
@@ -504,20 +421,20 @@ struct SessionSupervisor::Impl
         std::uint64_t credits_returned = 0;
         std::uint32_t client_state = static_cast<std::uint32_t>(SubscriberState::Failed);
 
+        if(!transport)
         {
-            const Ref live = borrow();
-            if(!live)
-            {
-                error = BulkError{Status::Internal, "the transport disappeared", "subscriber"};
-                return Status::Internal;
-            }
+            error = BulkError{Status::Internal, "the transport disappeared", "subscriber"};
+            return Status::Internal;
+        }
 
-            // The client's own progress report, and the only thing the renewal
-            // needs from the transport. Everything else it says -- who this
-            // session is, how many frames reached the application -- the
-            // subscription knows without asking.
-            credits_returned = live->counters().credits_returned;
-            client_state = static_cast<std::uint32_t>(live->state());
+        // The client's own progress report, and the only thing the renewal
+        // needs from the transport. Everything else it says -- who this session
+        // is, how many frames reached the application -- the subscription knows
+        // without asking.
+        {
+            const SubscriberCounters sampled = transport->counters();
+            credits_returned = sampled.credits_returned;
+            client_state = static_cast<std::uint32_t>(transport->state());
         }
 
         Status status = Status::Ok;
@@ -689,93 +606,89 @@ struct SessionSupervisor::Impl
 
     // -- the transport slot -------------------------------------------------
 
-    Ref borrow() noexcept
+    /// Retire the current transport and install `next`.
+    ///
+    /// Control thread, like every other use of `transport`, which is what
+    /// replaced the borrow handshake this used to need: a `Ref` class, a borrow
+    /// count, a `swapping` flag and a condvar wait for the count to reach zero.
+    /// All of that existed to stop a transport being destroyed underneath a
+    /// caller, and every caller but one was this thread. The one that was not
+    /// -- `counters()` -- reads a published copy instead.
+    void publish_transport(std::unique_ptr<SubscriberTransport> next) noexcept
     {
-        std::lock_guard<std::mutex> lock(mutex);
-
-        // `swapping` is what makes this a handshake rather than a race.  Without
-        // it the dispatch thread re-borrows the instant it gives a borrow back
-        // -- it is a loop whose whole body is one poll -- and the control thread
-        // waiting for the count to reach zero has to win a scheduling coin flip
-        // against a thread that is already running and already holds the lock a
-        // microsecond later.  It loses that flip often enough to hang: observed
-        // as a subscriber that stayed `Active` after its stream was taken away,
-        // because the control thread never got past `close_session()` to say
-        // `Reconnecting`.
-        if(!transport || swapping)
+        if(transport)
         {
-            return Ref{};
-        }
+            // Fold the retiring transport's totals in, so a reconnect does not
+            // reset the counters an operator is watching, and keep what this
+            // session was describing so the next grant can be compared against
+            // it rather than silently replacing it.
+            std::lock_guard<std::mutex> lock(observation);
 
-        ++borrowed;
-        return Ref{*this, transport};
-    }
+            accumulate(retired, transport->counters());
+            live = SubscriberCounters{};
+            last_lease_ttl_ms = std::max(last_lease_ttl_ms, session.lease_ttl_ms());
 
-    void end_borrow() noexcept
-    {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            --borrowed;
-        }
-        wake.notify_all();
-    }
-
-    void publish_transport(std::shared_ptr<SubscriberTransport> next) noexcept
-    {
-        std::shared_ptr<SubscriberTransport> previous;
-
-        {
-            std::unique_lock<std::mutex> lock(mutex);
-
-            // Closes the door first, then waits for the room to empty.
-            swapping = true;
-            wake.wait(lock, [this] { return borrowed == 0; });
-
-            if(transport)
+            if(session.granted_geometry().generation != 0)
             {
-                // Fold the retiring transport's totals in, so a reconnect does
-                // not reset the counters an operator is watching.
-                accumulate(retired, transport->counters());
-                last_lease_ttl_ms = std::max(last_lease_ttl_ms, session.lease_ttl_ms());
-
-                // And keep what this session was describing, so the next grant
-                // can be compared against it rather than silently replacing it.
-                if(session.granted_geometry().generation != 0)
-                {
-                    retired_geometry = session.granted_geometry();
-                }
-
-                // The session ends with its transport. What it was granted is
-                // remembered above; what it *is* stops being the answer.
-                session = SessionClient{};
+                retired_geometry = session.granted_geometry();
             }
 
-            previous = std::move(transport);
-            transport = std::move(next);
-            swapping = false;
+            // The session ends with its transport. What it was granted is
+            // remembered above; what it *is* stops being the answer.
+            session = SessionClient{};
         }
 
-        wake.notify_all();
+        const bool retired_one = transport != nullptr;
 
-        // `previous` dies here, on the control thread, outside the lock, and
-        // that is what stops it producing. Only then is it safe to empty the
-        // queue: the frames left in it were granted under a contract that has
-        // ended, and the next session may describe a different array entirely.
-        //
-        // The ordering holds because a transport is always retired before the
-        // next one is built -- `control_loop` closes the session before it
-        // reconnects -- so there is never a live producer on the other side of
-        // this call.
-        const bool retired_one = previous != nullptr;
-        previous.reset();
+        // Destroyed here, on this thread, before the replacement goes in. That
+        // is what stops the old producer: no engine thread, no endpoint, no
+        // further push into the queue.
+        transport = nullptr;
 
         if(retired_one)
         {
+            // The frames it left behind were granted under a contract that has
+            // ended, and the next session may describe a different array.
             delivery->discard();
         }
+
+        transport = std::move(next);
+        publish_observation();
+    }
+
+    /// Copy what an application thread is allowed to read.
+    ///
+    /// Control thread. The transport's counters are the only thing here that
+    /// cannot be read directly from another thread without keeping the
+    /// transport alive to read it -- which is the whole cost the borrow was
+    /// paying. ADR 0004 accepts the trade: diagnostics may lag by a control
+    /// quantum, and live authority stays elsewhere.
+    void publish_observation() noexcept
+    {
+        SubscriberCounters sampled;
+        if(transport)
+        {
+            sampled = transport->counters();
+        }
+
+        std::lock_guard<std::mutex> lock(observation);
+        live = sampled;
     }
 
     // -- delivery -----------------------------------------------------------
+
+    /// The longest run of undelivered state changes kept.
+    ///
+    /// It was unbounded, which is a leak with a schedule: in `Manual` delivery
+    /// nothing drains this until the application polls, and a `BoundedRetry`
+    /// subscriber that cannot reach its publisher produces two transitions per
+    /// attempt for as long as it is left running. An application that stopped
+    /// polling grew it without limit.
+    ///
+    /// Bounded by dropping the *oldest*, because the newest is the one that
+    /// says where the subscription is now, and the terminal one is the one an
+    /// application is waiting for.
+    static constexpr std::size_t k_max_transitions = 64;
 
     void transition(SubscriberState next, BulkError error) noexcept
     {
@@ -783,6 +696,11 @@ struct SessionSupervisor::Impl
 
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
+            if(transitions.size() >= k_max_transitions)
+            {
+                transitions.pop_front();
+                transitions_dropped.fetch_add(1, std::memory_order_relaxed);
+            }
             transitions.push_back(Transition{next, std::move(error)});
         }
         wake.notify_all();
@@ -974,13 +892,29 @@ struct SessionSupervisor::Impl
     std::atomic<SubscriberState> state{SubscriberState::Closed};
     std::atomic<bool> running{false};
 
+    /// The control thread's timed waits, and nothing else.
+    ///
+    /// It served four unrelated purposes once: this, the borrow handshake, the
+    /// transport swap and a wakeup on every `counters()` call from any thread.
+    /// Three of those are gone with the borrow.
     std::mutex mutex;
     std::condition_variable wake;
-    std::shared_ptr<SubscriberTransport> transport;
-    std::size_t borrowed{0};
-    bool swapping{false}; ///< a swap is waiting for the borrows to come back
-    std::uint32_t last_lease_ttl_ms{0};
+
+    /// The live transport. **Control thread only** -- created, replaced and
+    /// destroyed there, and read nowhere else. No lock, because there is no
+    /// second thread to lock against.
+    std::unique_ptr<SubscriberTransport> transport;
+
+    /// Everything an application thread may read while the control thread is
+    /// running: the session contract above, and these.
+    ///
+    /// `retired` used to be written under `mutex` and read without it, which
+    /// was a race on twenty non-atomic fields; the borrow protected the
+    /// transport, not the accumulator.
+    std::mutex observation;
     SubscriberCounters retired{};
+    SubscriberCounters live{};
+    std::uint32_t last_lease_ttl_ms{0};
 
     /// What the last session was describing. All-zero until one is retired,
     /// which is why the comparison is skipped on a first open.
@@ -988,6 +922,7 @@ struct SessionSupervisor::Impl
 
     std::mutex queue_mutex;
     std::deque<Transition> transitions;
+    std::atomic<std::uint64_t> transitions_dropped{0};
 
     std::thread control;
     std::thread dispatch;
@@ -1110,26 +1045,27 @@ int SessionSupervisor::fd() const noexcept
 
 Protocol::GeometryBlock SessionSupervisor::granted_geometry() const noexcept
 {
-    const std::lock_guard<std::mutex> lock(impl_->mutex);
+    const std::lock_guard<std::mutex> lock(impl_->observation);
     return impl_->session.granted_geometry();
 }
 
 std::uint32_t SessionSupervisor::generation() const noexcept
 {
-    const std::lock_guard<std::mutex> lock(impl_->mutex);
+    const std::lock_guard<std::mutex> lock(impl_->observation);
     return impl_->session.generation();
 }
 
 SubscriberCounters SessionSupervisor::counters() const noexcept
 {
-    SubscriberCounters total = impl_->retired;
+    SubscriberCounters total;
 
     {
-        const Impl::Ref live = impl_->borrow();
-        if(live)
-        {
-            accumulate(total, live->counters());
-        }
+        // A copy the control thread published, never a live transport. The
+        // transport-owned fields may lag by a control quantum (ADR 0004); the
+        // ones this object owns -- below -- are exact, because it owns them.
+        const std::lock_guard<std::mutex> lock(impl_->observation);
+        total = impl_->retired;
+        accumulate(total, impl_->live);
     }
 
     total.reconnects = impl_->reconnects.load(std::memory_order_relaxed);
