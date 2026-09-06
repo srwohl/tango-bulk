@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include <tango-bulk/unstable/session_supervisor.h>
+#include <tango-bulk/subscription.h>
 
 #include <core/delivery_queue.h>
 #include <core/session_client.h>
@@ -15,7 +15,7 @@
 #include <thread>
 #include <utility>
 
-/// `SessionSupervisor`: everything `BulkSubscriber` used to do that was not
+/// `Subscription`: everything `BulkSubscriber` used to do that was not
 /// Tango.
 ///
 /// This code came out of `src/tango/proxy_client.cpp` with two substitutions and
@@ -38,7 +38,7 @@
 /// stuck application cannot stall coordination. Neither runs on the other's
 /// thread, and delivery goes through a queue this object owns rather than
 /// through the transport, so replacing a transport waits for nobody.
-namespace TangoBulk::detail
+namespace TangoBulk
 {
 namespace
 {
@@ -100,7 +100,7 @@ std::chrono::milliseconds backoff_delay(std::uint32_t attempt,
 
 // ---------------------------------------------------------------------------
 
-struct SessionSupervisor::Impl
+struct Subscription::Impl
 {
     struct Transition
     {
@@ -109,15 +109,15 @@ struct SessionSupervisor::Impl
     };
 
     Impl(SubscriberConfig cfg,
-         CoordinationChannel coordination,
-         TransportFactory transport_factory,
-         SessionCallbacks cbs) :
+         detail::CoordinationChannel coordination,
+         detail::TransportFactory transport_factory,
+         SubscriptionCallbacks cbs) :
         config(std::move(cfg)),
         channel(std::move(coordination)),
         factory(std::move(transport_factory)),
         frame_callback(std::move(cbs.on_frame)),
         state_callback(std::move(cbs.on_state)),
-        delivery(std::make_shared<DeliveryQueue>(config.delivery_queue_depth,
+        delivery(std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
                                                  config.drop_policy))
     {
     }
@@ -129,9 +129,9 @@ struct SessionSupervisor::Impl
     /// Every failure path leaves no transport behind: a half-open subscriber
     /// with a registered ring and no session is exactly the resource leak the
     /// lease exists to prevent on the other side.
-    bool open_session(BulkError &error) noexcept
+    bool open_subscription(BulkError &error) noexcept
     {
-        std::unique_ptr<SubscriberTransport> fresh;
+        std::unique_ptr<detail::SubscriberTransport> fresh;
 
         try
         {
@@ -158,7 +158,7 @@ struct SessionSupervisor::Impl
         // A candidate, not the live session: a grant about to be refused must
         // not become the answer granted_geometry() gives, and must not start a
         // transport. The check below sits between the two.
-        SessionClient candidate;
+        detail::SessionClient candidate;
 
         try
         {
@@ -502,7 +502,7 @@ struct SessionSupervisor::Impl
         close_session();
     }
 
-    /// Reopen under the configured policy.  Returns false if the supervisor is
+    /// Reopen under the configured policy.  Returns false if the subscription is
     /// finished -- `Failed`, or torn down while backing off.
     bool reconnect(std::uint32_t &attempt, BulkError error) noexcept
     {
@@ -510,7 +510,7 @@ struct SessionSupervisor::Impl
         {
             // 4.1: FailFast makes any transition to `Reconnecting` a `Failed`,
             // and Manual enters `Failed` and waits for the application to open a
-            // new supervisor.  They differ in what the application does next,
+            // new subscription.  They differ in what the application does next,
             // not in what happens here.
             transition(SubscriberState::Failed, error);
             return false;
@@ -538,7 +538,7 @@ struct SessionSupervisor::Impl
             ++attempt;
 
             transition(SubscriberState::Opening, BulkError{});
-            if(open_session(error))
+            if(open_subscription(error))
             {
                 return true;
             }
@@ -580,7 +580,7 @@ struct SessionSupervisor::Impl
 
     /// Retire the current transport and install `next`. Control thread, like
     /// every other use of `transport`.
-    void publish_transport(std::unique_ptr<SubscriberTransport> next) noexcept
+    void publish_transport(std::unique_ptr<detail::SubscriberTransport> next) noexcept
     {
         if(transport)
         {
@@ -598,7 +598,7 @@ struct SessionSupervisor::Impl
                 retired_geometry = session.granted_geometry();
             }
 
-            session = SessionClient{};
+            session = detail::SessionClient{};
         }
 
         const bool retired_one = transport != nullptr;
@@ -751,7 +751,7 @@ struct SessionSupervisor::Impl
         return correlation.fetch_add(1, std::memory_order_relaxed) + 1;
     }
 
-    /// Stop everything.  Idempotent, and safe to call on a supervisor whose
+    /// Stop everything.  Idempotent, and safe to call on a subscription whose
     /// first open never succeeded.
     ///
     /// `announce_closed` is false on exactly one path: a first open that failed
@@ -797,8 +797,8 @@ struct SessionSupervisor::Impl
     // -----------------------------------------------------------------------
 
     SubscriberConfig config;
-    CoordinationChannel channel;
-    TransportFactory factory;
+    detail::CoordinationChannel channel;
+    detail::TransportFactory factory;
 
     FrameCallback frame_callback;
     StateCallback state_callback;
@@ -806,7 +806,7 @@ struct SessionSupervisor::Impl
     /// Who this session is, what it was granted, what its lease says. Written
     /// by the control thread under `observation`, read by `granted_geometry()`
     /// from an application thread.
-    SessionClient session;
+    detail::SessionClient session;
 
     /// Frames the queue had handed over when the live session was granted, so
     /// `Renew` can report this session rather than the subscription. Control
@@ -817,7 +817,7 @@ struct SessionSupervisor::Impl
     /// transport is what makes `fd()` stable across a reconnect. `shared_ptr`
     /// because a transport that could not be quiesced is quarantined rather
     /// than destroyed, and may still hold it.
-    std::shared_ptr<DeliveryQueue> delivery;
+    std::shared_ptr<detail::DeliveryQueue> delivery;
 
     std::atomic<SubscriberState> state{SubscriberState::Closed};
     std::atomic<bool> running{false};
@@ -829,7 +829,7 @@ struct SessionSupervisor::Impl
     /// The live transport. **Control thread only** -- created, replaced and
     /// destroyed there, and read nowhere else. No lock, because there is no
     /// second thread to lock against.
-    std::unique_ptr<SubscriberTransport> transport;
+    std::unique_ptr<detail::SubscriberTransport> transport;
 
     /// Guards everything an application thread may read while the control
     /// thread runs: the session contract above, and these.
@@ -858,20 +858,20 @@ struct SessionSupervisor::Impl
 
 // ---------------------------------------------------------------------------
 
-SessionSupervisor::SessionSupervisor(std::unique_ptr<Impl> impl) noexcept :
+Subscription::Subscription(std::unique_ptr<Impl> impl) noexcept :
     impl_(std::move(impl))
 {
 }
 
-SessionSupervisor::~SessionSupervisor()
+Subscription::~Subscription()
 {
     impl_->shutdown(true);
 }
 
-std::unique_ptr<SessionSupervisor> SessionSupervisor::open(SubscriberConfig config,
-                                                           CoordinationChannel channel,
-                                                           TransportFactory factory,
-                                                           SessionCallbacks callbacks)
+std::unique_ptr<Subscription> Subscription::open(SubscriberConfig config,
+                                                  detail::CoordinationChannel channel,
+                                                  detail::TransportFactory factory,
+                                                           SubscriptionCallbacks callbacks)
 {
     const Status status = config.validate();
     if(status != Status::Ok)
@@ -883,7 +883,7 @@ std::unique_ptr<SessionSupervisor> SessionSupervisor::open(SubscriberConfig conf
     if(!channel || !factory)
     {
         throw BulkException(BulkError{Status::Internal,
-                                      "a SessionSupervisor needs both a coordination channel "
+                                      "a Subscription needs both a coordination channel "
                                       "and a transport factory",
                                       "subscriber"});
     }
@@ -895,7 +895,7 @@ std::unique_ptr<SessionSupervisor> SessionSupervisor::open(SubscriberConfig conf
     if(!callbacks.on_frame || !callbacks.on_state)
     {
         throw BulkException(BulkError{Status::Internal,
-                                      "SessionCallbacks needs both on_frame and on_state",
+                                      "SubscriptionCallbacks needs both on_frame and on_state",
                                       "subscriber"});
     }
 
@@ -913,11 +913,11 @@ std::unique_ptr<SessionSupervisor> SessionSupervisor::open(SubscriberConfig conf
     impl->transition(SubscriberState::Opening, BulkError{});
 
     BulkError error;
-    if(impl->open_session(error))
+    if(impl->open_subscription(error))
     {
         Impl &ref = *impl;
         impl->control = std::thread([&ref] { ref.control_loop(); });
-        return std::unique_ptr<SessionSupervisor>(new SessionSupervisor(std::move(impl)));
+        return std::unique_ptr<Subscription>(new Subscription(std::move(impl)));
     }
 
     // The first open failed.  Under BoundedRetry that is the control thread's
@@ -929,7 +929,7 @@ std::unique_ptr<SessionSupervisor> SessionSupervisor::open(SubscriberConfig conf
         impl->transition(SubscriberState::Reconnecting, error);
         Impl &ref = *impl;
         impl->control = std::thread([&ref] { ref.control_loop(); });
-        return std::unique_ptr<SessionSupervisor>(new SessionSupervisor(std::move(impl)));
+        return std::unique_ptr<Subscription>(new Subscription(std::move(impl)));
     }
 
     impl->transition(SubscriberState::Failed, error);
@@ -937,7 +937,7 @@ std::unique_ptr<SessionSupervisor> SessionSupervisor::open(SubscriberConfig conf
     throw BulkException(error);
 }
 
-std::size_t SessionSupervisor::poll(std::chrono::milliseconds timeout, std::size_t max_frames)
+std::size_t Subscription::poll(std::chrono::milliseconds timeout, std::size_t max_frames)
 {
     Impl &impl = *impl_;
 
@@ -955,29 +955,29 @@ std::size_t SessionSupervisor::poll(std::chrono::milliseconds timeout, std::size
     return frames;
 }
 
-SubscriberState SessionSupervisor::state() const noexcept
+SubscriberState Subscription::state() const noexcept
 {
     return impl_->state.load(std::memory_order_acquire);
 }
 
-int SessionSupervisor::fd() const noexcept
+int Subscription::fd() const noexcept
 {
     return impl_->delivery->fd();
 }
 
-Protocol::GeometryBlock SessionSupervisor::granted_geometry() const noexcept
+Protocol::GeometryBlock Subscription::granted_geometry() const noexcept
 {
     const std::lock_guard<std::mutex> lock(impl_->observation);
     return impl_->session.granted_geometry();
 }
 
-std::uint32_t SessionSupervisor::generation() const noexcept
+std::uint32_t Subscription::generation() const noexcept
 {
     const std::lock_guard<std::mutex> lock(impl_->observation);
     return impl_->session.generation();
 }
 
-SubscriberCounters SessionSupervisor::counters() const noexcept
+SubscriberCounters Subscription::counters() const noexcept
 {
     SubscriberCounters total;
 
@@ -997,7 +997,7 @@ SubscriberCounters SessionSupervisor::counters() const noexcept
     total.renewals_sent = impl_->renewals_sent.load(std::memory_order_relaxed);
     total.renewals_failed = impl_->renewals_failed.load(std::memory_order_relaxed);
 
-    const DeliveryQueue::Stats queue = impl_->delivery->stats();
+    const detail::DeliveryQueue::Stats queue = impl_->delivery->stats();
     total.frames_delivered = queue.taken;
     total.frames_dropped_queue_full = queue.dropped;
     total.delivery_queue_depth = queue.depth;
@@ -1006,4 +1006,4 @@ SubscriberCounters SessionSupervisor::counters() const noexcept
     return total;
 }
 
-} // namespace TangoBulk::detail
+} // namespace TangoBulk

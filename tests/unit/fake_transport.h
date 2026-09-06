@@ -7,7 +7,7 @@
 
 #include <core/delivery_queue.h>
 
-#include <tango-bulk/unstable/session_supervisor.h>
+#include <tango-bulk/subscription.h>
 
 #include <algorithm>
 #include <array>
@@ -30,7 +30,7 @@
 /// device server and keeps covering them; nothing here replaces it.
 ///
 /// Everything scripted lives in `Script`, not in the transport, because the
-/// supervisor builds a *new* transport per session and a script that died with
+/// subscription builds a *new* transport per session and a script that died with
 /// the transport could not describe a reconnect.
 namespace TangoBulkTests
 {
@@ -113,7 +113,7 @@ struct Script
     std::atomic<int> closes{0};
 
     /// Which threads have called the channel, and whether two were ever inside
-    /// it at once. The supervisor promises the calls never overlap -- which is
+    /// it at once. The subscription promises the calls never overlap -- which is
     /// what the Python binding's GIL story rests on -- so it is asserted rather
     /// than assumed. It does NOT promise a single thread: the first open runs
     /// on the caller's.
@@ -121,7 +121,7 @@ struct Script
     std::atomic<int> channel_inside{0};
     std::atomic<int> channel_max_concurrent{0};
 
-    /// Queue one renewal outcome on a supervisor that is already running.
+    /// Queue one renewal outcome on a subscription that is already running.
     ///
     /// The plain `renew_results = {...}` the other cases use is safe only
     /// because they all write it before `open()`, when no control thread
@@ -262,7 +262,7 @@ struct Script
 
     /// Frames sent before any transport existed.
     ///
-    /// A test arranges arrivals before it opens a supervisor, and until then
+    /// A test arranges arrivals before it opens a subscription, and until then
     /// there is nowhere to put them -- the queue is created by the subscription,
     /// which does not exist yet. They go in on the first attach, which is what a
     /// publisher that had frames waiting would produce anyway.
@@ -486,7 +486,7 @@ inline detail::CoordinationChannel fake_channel(Script &script)
     };
 }
 
-inline SubscriberConfig supervisor_config()
+inline SubscriberConfig subscription_config()
 {
     SubscriberConfig config;
     config.stream_name = "bulk.unit";
@@ -502,9 +502,9 @@ inline SubscriberConfig supervisor_config()
     return config;
 }
 
-inline detail::SessionCallbacks noop_callbacks()
+inline SubscriptionCallbacks noop_callbacks()
 {
-    detail::SessionCallbacks callbacks;
+    SubscriptionCallbacks callbacks;
     callbacks.on_frame = [](FrameView) {};
     callbacks.on_state = [](SubscriberState, const BulkError &) {};
     return callbacks;

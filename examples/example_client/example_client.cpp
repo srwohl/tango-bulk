@@ -95,16 +95,12 @@ int main(int argc, char *argv[])
         // exponential backoff capped at the lease TTL.
         config.reconnect_policy = TangoBulk::ReconnectPolicy::BoundedRetry;
 
-        TangoBulk::BulkSubscriber subscriber(proxy, config);
-
-        // If the device's commands carry a prefix, say so before start():
-        //
-        //     set_command_names(subscriber, TangoBulk::CommandNames::with_prefix("Xyz"));
-
         std::atomic<std::uint64_t> frames{0};
         std::atomic<std::uint64_t> bytes{0};
 
-        subscriber.set_frame_callback(
+        TangoBulk::SubscriptionCallbacks callbacks;
+
+        callbacks.on_frame =
             [&frames, &bytes](TangoBulk::FrameView view)
             {
                 // `view.data()` points into the registered receive ring.  It is
@@ -114,9 +110,9 @@ int main(int argc, char *argv[])
                 // and expect the stream to keep flowing.
                 frames.fetch_add(1, std::memory_order_relaxed);
                 bytes.fetch_add(view.size(), std::memory_order_relaxed);
-            });
+            };
 
-        subscriber.set_state_callback(
+        callbacks.on_state =
             [](TangoBulk::SubscriberState state, const TangoBulk::BulkError &error)
             {
                 std::cout << "state: " << TangoBulk::to_string(state);
@@ -126,9 +122,12 @@ int main(int argc, char *argv[])
                               << error.message << ")";
                 }
                 std::cout << std::endl;
-            });
+            };
 
-        subscriber.start();
+        // If the device's commands carry a prefix, pass the names here:
+        //
+        //     TangoBulk::CommandNames::with_prefix("Xyz")
+        auto subscription = TangoBulk::subscribe(proxy, config, std::move(callbacks));
 
         auto last = std::chrono::steady_clock::now();
         std::uint64_t last_frames = 0;
@@ -155,13 +154,11 @@ int main(int argc, char *argv[])
             last_bytes = total_bytes;
         }
 
-        // Sends BulkClose, joins the threads, and releases the ring.  Idempotent,
-        // and the destructor would do it anyway -- but a client that closes
-        // explicitly gives the publisher its slots back now rather than one
-        // lease TTL from now.
-        subscriber.stop();
+        const TangoBulk::SubscriberCounters counters = subscription->counters();
 
-        const TangoBulk::SubscriberCounters counters = subscriber.counters();
+        // Sends BulkClose, joins the threads and releases the ring. Destroying
+        // it is closing it; there is no second way to say so.
+        subscription.reset();
         std::cout << "received=" << counters.frames_received
                   << " delivered=" << counters.frames_delivered
                   << " dropped_queue_full=" << counters.frames_dropped_queue_full

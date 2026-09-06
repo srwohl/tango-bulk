@@ -30,44 +30,44 @@ namespace
 using namespace TangoBulk;
 using namespace TangoBulkTests;
 
-// -- the backoff schedule, with no supervisor at all -------------------------
+// -- the backoff schedule, with no subscription at all -------------------------
 
-TEST_CASE("the reconnect backoff doubles and is capped at the lease", "[core][supervisor]")
+TEST_CASE("the reconnect backoff doubles and is capped at the lease", "[core][subscription]")
 {
     // Exponential from the configured base.
-    CHECK(detail::backoff_delay(0, 200, 1'000) == std::chrono::milliseconds{200});
-    CHECK(detail::backoff_delay(1, 200, 1'000) == std::chrono::milliseconds{400});
-    CHECK(detail::backoff_delay(2, 200, 1'000) == std::chrono::milliseconds{800});
+    CHECK(backoff_delay(0, 200, 1'000) == std::chrono::milliseconds{200});
+    CHECK(backoff_delay(1, 200, 1'000) == std::chrono::milliseconds{400});
+    CHECK(backoff_delay(2, 200, 1'000) == std::chrono::milliseconds{800});
 
     // Capped at the lease TTL: backing off for longer than a lease cannot help,
     // because by then the publisher has reclaimed everything this client held.
-    CHECK(detail::backoff_delay(3, 200, 1'000) == std::chrono::milliseconds{1'000});
-    CHECK(detail::backoff_delay(9, 200, 1'000) == std::chrono::milliseconds{1'000});
+    CHECK(backoff_delay(3, 200, 1'000) == std::chrono::milliseconds{1'000});
+    CHECK(backoff_delay(9, 200, 1'000) == std::chrono::milliseconds{1'000});
 
     // A lease TTL that is not known yet must not collapse the delay to zero and
     // spin.
-    CHECK(detail::backoff_delay(0, 500, 0) == std::chrono::milliseconds{1});
-    CHECK(detail::backoff_delay(4, 500, 0) == std::chrono::milliseconds{1});
+    CHECK(backoff_delay(0, 500, 0) == std::chrono::milliseconds{1});
+    CHECK(backoff_delay(4, 500, 0) == std::chrono::milliseconds{1});
 }
 
 // -- opening -----------------------------------------------------------------
 
-TEST_CASE("a supervisor cannot be opened without somewhere to deliver",
-          "[core][supervisor]")
+TEST_CASE("a subscription cannot be opened without somewhere to deliver",
+          "[core][subscription]")
 {
     Script script;
 
-    detail::SessionCallbacks missing_frame = noop_callbacks();
+    SubscriptionCallbacks missing_frame = noop_callbacks();
     missing_frame.on_frame = nullptr;
-    CHECK_THROWS_AS(detail::SessionSupervisor::open(supervisor_config(),
+    CHECK_THROWS_AS(Subscription::open(subscription_config(),
                                                     fake_channel(script),
                                                     fake_factory(script),
                                                     std::move(missing_frame)),
                     BulkException);
 
-    detail::SessionCallbacks missing_state = noop_callbacks();
+    SubscriptionCallbacks missing_state = noop_callbacks();
     missing_state.on_state = nullptr;
-    CHECK_THROWS_AS(detail::SessionSupervisor::open(supervisor_config(),
+    CHECK_THROWS_AS(Subscription::open(subscription_config(),
                                                     fake_channel(script),
                                                     fake_factory(script),
                                                     std::move(missing_state)),
@@ -79,14 +79,14 @@ TEST_CASE("a supervisor cannot be opened without somewhere to deliver",
 }
 
 TEST_CASE("a transport factory that returns nothing is refused, not dereferenced",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     Script script;
-    SubscriberConfig config = supervisor_config();
+    SubscriberConfig config = subscription_config();
     config.reconnect_policy = ReconnectPolicy::FailFast;
 
     CHECK_THROWS_AS(
-        detail::SessionSupervisor::open(
+        Subscription::open(
             config,
             fake_channel(script),
             [](const SubscriberConfig &, std::shared_ptr<detail::DeliveryQueue>)
@@ -96,7 +96,7 @@ TEST_CASE("a transport factory that returns nothing is refused, not dereferenced
 }
 
 TEST_CASE("a granted session that never probes gives up on its own budget",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     // The case a real publisher cannot be asked to produce: Open succeeds, so
     // the publisher has allocated for this client, but its Probe never arrives
@@ -104,12 +104,12 @@ TEST_CASE("a granted session that never probes gives up on its own budget",
     Script script;
     script.probe_arrives = false;
 
-    SubscriberConfig config = supervisor_config();
+    SubscriberConfig config = subscription_config();
     config.reconnect_policy = ReconnectPolicy::FailFast;
     config.probe_timeout_ms = 40;
 
     const auto started = std::chrono::steady_clock::now();
-    CHECK_THROWS_AS(detail::SessionSupervisor::open(config,
+    CHECK_THROWS_AS(Subscription::open(config,
                                                     fake_channel(script),
                                                     fake_factory(script),
                                                     noop_callbacks()),
@@ -130,7 +130,7 @@ TEST_CASE("a granted session that never probes gives up on its own budget",
 // -- renewal -----------------------------------------------------------------
 
 TEST_CASE("RenewTooFrequent slows the timer and does not end the session",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     // 3.7: the lease is not shortened as a penalty, so the session is healthy
     // and the only correct response is to renew less often. Tearing it down
@@ -142,20 +142,20 @@ TEST_CASE("RenewTooFrequent slows the timer and does not end the session",
         script.renew_results = {Status::RenewTooFrequent, Status::RenewTooFrequent};
     }
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
-    REQUIRE(supervisor->state() == SubscriberState::Active);
+    REQUIRE(subscription->state() == SubscriberState::Active);
     REQUIRE(eventually([&script] { return script.renews.load() >= 3; }));
 
-    CHECK(supervisor->state() == SubscriberState::Active);
-    CHECK(supervisor->counters().reconnects == 0);
+    CHECK(subscription->state() == SubscriberState::Active);
+    CHECK(subscription->counters().reconnects == 0);
 
     // One transport for the whole episode: no reconnect happened.
     CHECK(script.transports_built.load() == 1);
 }
 
-TEST_CASE("a lost session is not resurrected, it is replaced", "[core][supervisor]")
+TEST_CASE("a lost session is not resurrected, it is replaced", "[core][subscription]")
 {
     // 3.7: SessionExpired and UnknownSession are terminal for that session --
     // "there is no resurrection". The correct response is a new session, which
@@ -167,19 +167,19 @@ TEST_CASE("a lost session is not resurrected, it is replaced", "[core][superviso
         script.renew_results = {Status::SessionExpired};
     }
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
-    CHECK(eventually([&supervisor] { return supervisor->state() == SubscriberState::Active; }));
+    CHECK(eventually([&subscription] { return subscription->state() == SubscriberState::Active; }));
     CHECK(script.opens.load() >= 2);
-    CHECK(supervisor->counters().reconnects >= 1);
+    CHECK(subscription->counters().reconnects >= 1);
 }
 
 // -- reconnect ---------------------------------------------------------------
 
 TEST_CASE("reconnect gives up after the configured attempts and says so",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     Script script;
     {
@@ -194,7 +194,7 @@ TEST_CASE("reconnect gives up after the configured attempts and says so",
         script.renew_results = {Status::SessionExpired};
     }
 
-    SubscriberConfig config = supervisor_config();
+    SubscriberConfig config = subscription_config();
     config.reconnect_max_attempts = 3;
 
     // A dispatch thread, because state transitions are queued and Manual mode
@@ -206,7 +206,7 @@ TEST_CASE("reconnect gives up after the configured attempts and says so",
     std::vector<SubscriberState> seen;
     BulkError final_error;
 
-    detail::SessionCallbacks callbacks = noop_callbacks();
+    SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_state = [&](SubscriberState state, const BulkError &error) {
         std::lock_guard<std::mutex> lock(seen_mutex);
         seen.push_back(state);
@@ -216,13 +216,13 @@ TEST_CASE("reconnect gives up after the configured attempts and says so",
         }
     };
 
-    auto supervisor = detail::SessionSupervisor::open(
+    auto subscription = Subscription::open(
         config, fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    REQUIRE(eventually([&supervisor] { return supervisor->state() == SubscriberState::Failed; }));
+    REQUIRE(eventually([&subscription] { return subscription->state() == SubscriberState::Failed; }));
 
     // Exactly the configured number of reopen attempts, not one more.
-    CHECK(supervisor->counters().reconnects == 3);
+    CHECK(subscription->counters().reconnects == 3);
 
     REQUIRE(eventually([&] {
         std::lock_guard<std::mutex> lock(seen_mutex);
@@ -240,7 +240,7 @@ TEST_CASE("reconnect gives up after the configured attempts and says so",
     CHECK(final_error.message.find("UnknownStream") != std::string::npos);
 }
 
-TEST_CASE("FailFast does not retry", "[core][supervisor]")
+TEST_CASE("FailFast does not retry", "[core][subscription]")
 {
     Script script;
     {
@@ -249,19 +249,19 @@ TEST_CASE("FailFast does not retry", "[core][supervisor]")
         script.renew_results = {Status::SessionExpired};
     }
 
-    SubscriberConfig config = supervisor_config();
+    SubscriberConfig config = subscription_config();
     config.reconnect_policy = ReconnectPolicy::FailFast;
 
-    auto supervisor = detail::SessionSupervisor::open(
+    auto subscription = Subscription::open(
         config, fake_channel(script), fake_factory(script), noop_callbacks());
 
-    REQUIRE(eventually([&supervisor] { return supervisor->state() == SubscriberState::Failed; }));
-    CHECK(supervisor->counters().reconnects == 0);
+    REQUIRE(eventually([&subscription] { return subscription->state() == SubscriberState::Failed; }));
+    CHECK(subscription->counters().reconnects == 0);
     CHECK(script.transports_built.load() == 1);
 }
 
 TEST_CASE("teardown during a reconnect backoff neither hangs nor reopens",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     Script script;
     {
@@ -270,20 +270,20 @@ TEST_CASE("teardown during a reconnect backoff neither hangs nor reopens",
         script.renew_results = {Status::SessionExpired};
     }
 
-    SubscriberConfig config = supervisor_config();
+    SubscriberConfig config = subscription_config();
     config.reconnect_backoff_ms = 400; // long enough to be inside it
     config.reconnect_max_attempts = 10;
 
-    auto supervisor = detail::SessionSupervisor::open(
+    auto subscription = Subscription::open(
         config, fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually(
-        [&supervisor] { return supervisor->state() == SubscriberState::Reconnecting; }));
+        [&subscription] { return subscription->state() == SubscriberState::Reconnecting; }));
 
     const int opens_before = script.opens.load();
 
     const auto started = std::chrono::steady_clock::now();
-    supervisor.reset(); // the destructor is how a session stops
+    subscription.reset(); // the destructor is how a session stops
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
     // It woke from the backoff rather than sleeping it out.
@@ -296,7 +296,7 @@ TEST_CASE("teardown during a reconnect backoff neither hangs nor reopens",
 // -- geometry drift across a reconnect ---------------------------------------
 
 TEST_CASE("a reopened session that describes a different array is refused",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     // The silent version of this is how a client ends up interpreting
     // 1024x1024 frames as 2048x2048: the stream drops, it reconnects, the
@@ -309,13 +309,13 @@ TEST_CASE("a reopened session that describes a different array is refused",
         script.reshape_after_first = true;
     }
 
-    SubscriberConfig config = supervisor_config();
+    SubscriberConfig config = subscription_config();
     config.delivery_mode = DeliveryMode::DispatchThread;
     config.reconnect_max_attempts = 10;
 
     std::mutex seen_mutex;
     BulkError final_error;
-    detail::SessionCallbacks callbacks = noop_callbacks();
+    SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_state = [&](SubscriberState state, const BulkError &error) {
         if(state == SubscriberState::Failed)
         {
@@ -324,18 +324,18 @@ TEST_CASE("a reopened session that describes a different array is refused",
         }
     };
 
-    auto supervisor = detail::SessionSupervisor::open(
+    auto subscription = Subscription::open(
         config, fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    REQUIRE(supervisor->granted_geometry().shape[0] == 8);
+    REQUIRE(subscription->granted_geometry().shape[0] == 8);
 
-    REQUIRE(eventually([&supervisor] { return supervisor->state() == SubscriberState::Failed; }));
+    REQUIRE(eventually([&subscription] { return subscription->state() == SubscriberState::Failed; }));
 
-    CHECK(supervisor->counters().geometry_changes == 1);
+    CHECK(subscription->counters().geometry_changes == 1);
 
     // Terminal, and quickly. Retrying cannot help -- neither side changes
     // between attempts -- so it must not spend ten attempts finding that out.
-    CHECK(supervisor->counters().reconnects <= 1);
+    CHECK(subscription->counters().reconnects <= 1);
 
     // state() flips inside transition(); the callback carrying the reason is
     // queued and delivered by the dispatch thread afterwards. Waiting for the
@@ -353,7 +353,7 @@ TEST_CASE("a reopened session that describes a different array is refused",
     }
 
     // The new grant was never adopted, so nothing describes the new shape.
-    CHECK(supervisor->granted_geometry().generation == 0);
+    CHECK(subscription->granted_geometry().generation == 0);
 
     // And the transport carrying it was never started. That is what makes this
     // safe rather than merely tidy: a transport is built, its grant is checked,
@@ -366,7 +366,7 @@ TEST_CASE("a reopened session that describes a different array is refused",
 }
 
 TEST_CASE("a reopened session with the same array is adopted normally",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     // The counterpart, so the check above cannot pass by refusing everything.
     Script script;
@@ -376,19 +376,19 @@ TEST_CASE("a reopened session with the same array is adopted normally",
         script.reshape_after_first = false;
     }
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
-    REQUIRE(eventually([&supervisor] { return supervisor->state() == SubscriberState::Active; }));
+    REQUIRE(eventually([&subscription] { return subscription->state() == SubscriberState::Active; }));
 
-    CHECK(supervisor->counters().geometry_changes == 0);
-    CHECK(supervisor->granted_geometry().shape[0] == 8);
+    CHECK(subscription->counters().geometry_changes == 0);
+    CHECK(subscription->granted_geometry().shape[0] == 8);
 }
 
 // -- threading ---------------------------------------------------------------
 
-TEST_CASE("coordination calls never overlap", "[core][supervisor]")
+TEST_CASE("coordination calls never overlap", "[core][subscription]")
 {
     // The promise the interface makes, and the one a Python adapter's GIL
     // behaviour depends on. Asserted rather than assumed -- the first version of
@@ -396,11 +396,11 @@ TEST_CASE("coordination calls never overlap", "[core][supervisor]")
     // makes every call, and was right to fail.
     Script script;
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually([&script] { return script.renews.load() >= 3; }));
-    supervisor.reset(); // sends Close, so teardown is covered too
+    subscription.reset(); // sends Close, so teardown is covered too
 
     CHECK(script.channel_max_concurrent.load() == 1);
 
@@ -415,7 +415,7 @@ TEST_CASE("coordination calls never overlap", "[core][supervisor]")
 
 // -- the granted geometry ----------------------------------------------------
 
-TEST_CASE("the granted geometry survives to the interface", "[core][supervisor]")
+TEST_CASE("the granted geometry survives to the interface", "[core][subscription]")
 {
     // It used to be copied out of and thrown away: adopt_open_reply kept ring
     // depth, frame size, generation and the lease terms, and dropped element
@@ -423,10 +423,10 @@ TEST_CASE("the granted geometry survives to the interface", "[core][supervisor]"
     // the array it was receiving.
     Script script;
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
-    const Protocol::GeometryBlock granted = supervisor->granted_geometry();
+    const Protocol::GeometryBlock granted = subscription->granted_geometry();
 
     CHECK(granted.generation == 1);
     CHECK(granted.element_type == ElementType::UInt16);
@@ -440,21 +440,21 @@ TEST_CASE("the granted geometry survives to the interface", "[core][supervisor]"
     // Whatever a binding builds a schema from, it must be able to tell "no
     // session" apart from a real grant. generation == 0 is never legal on the
     // wire, which is what makes it the field to test.
-    supervisor.reset();
-    CHECK(supervisor == nullptr);
+    subscription.reset();
+    CHECK(subscription == nullptr);
 }
 
 TEST_CASE("no session means an all-zero geometry, not a stale one",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     Script script;
     script.probe_arrives = false;
 
-    SubscriberConfig config = supervisor_config();
+    SubscriberConfig config = subscription_config();
     config.reconnect_policy = ReconnectPolicy::FailFast;
     config.probe_timeout_ms = 30;
 
-    CHECK_THROWS_AS(detail::SessionSupervisor::open(config,
+    CHECK_THROWS_AS(Subscription::open(config,
                                                     fake_channel(script),
                                                     fake_factory(script),
                                                     noop_callbacks()),
@@ -469,23 +469,23 @@ TEST_CASE("no session means an all-zero geometry, not a stale one",
 // -- delivery mode -----------------------------------------------------------
 
 TEST_CASE("poll() is refused when a dispatch thread is already delivering",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     Script script;
-    SubscriberConfig config = supervisor_config();
+    SubscriberConfig config = subscription_config();
     config.delivery_mode = DeliveryMode::DispatchThread;
 
-    auto supervisor = detail::SessionSupervisor::open(
+    auto subscription = Subscription::open(
         config, fake_channel(script), fake_factory(script), noop_callbacks());
 
-    CHECK_THROWS_AS(supervisor->poll(std::chrono::milliseconds{1}), BulkException);
+    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{1}), BulkException);
 }
 
 // -- delivery ----------------------------------------------------------------
 //
 // Everything below reaches the frame path, which had no device-free test at
 // all: the fake's poll() used to sleep and return 0, so no unit test had ever
-// seen a frame cross SessionSupervisor. That is the surface a Python binding
+// seen a frame cross Subscription. That is the surface a Python binding
 // consists almost entirely of, and it is the reason the transport seam moves
 // first (docs/ARCHITECTURE_SIMPLIFICATION.md section 4.1).
 
@@ -533,7 +533,7 @@ struct Delivered
     }
 };
 
-TEST_CASE("a frame the transport received reaches the application", "[core][supervisor]")
+TEST_CASE("a frame the transport received reaches the application", "[core][subscription]")
 {
     Script script;
     Delivered seen;
@@ -542,13 +542,13 @@ TEST_CASE("a frame the transport received reaches the application", "[core][supe
     script.receive(2);
     script.receive(3);
 
-    detail::SessionCallbacks callbacks = noop_callbacks();
+    SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(supervisor->poll(std::chrono::milliseconds{200}) == 3);
+    CHECK(subscription->poll(std::chrono::milliseconds{200}) == 3);
 
     REQUIRE(seen.count() == 3);
     CHECK(seen.sequences == std::vector<std::uint64_t>{1, 2, 3});
@@ -559,7 +559,7 @@ TEST_CASE("a frame the transport received reaches the application", "[core][supe
     CHECK(seen.sizes == std::vector<std::size_t>(3, std::size_t{128}));
 }
 
-TEST_CASE("frames arriving after the open are delivered too", "[core][supervisor]")
+TEST_CASE("frames arriving after the open are delivered too", "[core][subscription]")
 {
     // The ordering that matters operationally: the application is already
     // polling when the frame turns up, rather than the queue being primed
@@ -567,33 +567,33 @@ TEST_CASE("frames arriving after the open are delivered too", "[core][supervisor
     Script script;
     Delivered seen;
 
-    detail::SessionCallbacks callbacks = noop_callbacks();
+    SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(supervisor->poll(std::chrono::milliseconds{5}) == 0);
+    CHECK(subscription->poll(std::chrono::milliseconds{5}) == 0);
 
     script.receive(7);
-    CHECK(supervisor->poll(std::chrono::milliseconds{500}) == 1);
+    CHECK(subscription->poll(std::chrono::milliseconds{500}) == 1);
     REQUIRE(seen.count() == 1);
     CHECK(seen.sequences.front() == 7);
 }
 
 TEST_CASE("a dispatch thread delivers without the application asking",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     Script script;
     Delivered seen;
 
-    SubscriberConfig config = supervisor_config();
+    SubscriberConfig config = subscription_config();
     config.delivery_mode = DeliveryMode::DispatchThread;
 
-    detail::SessionCallbacks callbacks = noop_callbacks();
+    SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto supervisor = detail::SessionSupervisor::open(
+    auto subscription = Subscription::open(
         config, fake_channel(script), fake_factory(script), std::move(callbacks));
 
     for(std::uint64_t sequence = 1; sequence <= 4; ++sequence)
@@ -611,7 +611,7 @@ TEST_CASE("a dispatch thread delivers without the application asking",
     CHECK_FALSE(seen.on(std::this_thread::get_id()));
 }
 
-TEST_CASE("poll() delivers no more frames than it was asked for", "[core][supervisor]")
+TEST_CASE("poll() delivers no more frames than it was asked for", "[core][subscription]")
 {
     Script script;
     Delivered seen;
@@ -621,25 +621,25 @@ TEST_CASE("poll() delivers no more frames than it was asked for", "[core][superv
         script.receive(sequence);
     }
 
-    detail::SessionCallbacks callbacks = noop_callbacks();
+    SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
     // Two, then the rest. A bounded take is what lets one frame be consumed at
     // a time -- a read(), an iterator step -- without a second delivery path,
     // and the frames it did not take must still be there.
-    CHECK(supervisor->poll(std::chrono::milliseconds{200}, 2) == 2);
+    CHECK(subscription->poll(std::chrono::milliseconds{200}, 2) == 2);
     CHECK(seen.count() == 2);
 
-    CHECK(supervisor->poll(std::chrono::milliseconds{200}) == 3);
+    CHECK(subscription->poll(std::chrono::milliseconds{200}) == 3);
     REQUIRE(seen.count() == 5);
     CHECK(seen.sequences == std::vector<std::uint64_t>{1, 2, 3, 4, 5});
 }
 
 TEST_CASE("frames are delivered on the polling thread, never on a coordination thread",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     Script script;
     Delivered seen;
@@ -647,13 +647,13 @@ TEST_CASE("frames are delivered on the polling thread, never on a coordination t
     script.receive(1);
     script.receive(2);
 
-    detail::SessionCallbacks callbacks = noop_callbacks();
+    SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(supervisor->poll(std::chrono::milliseconds{200}) == 2);
+    CHECK(subscription->poll(std::chrono::milliseconds{200}) == 2);
 
     // Manual delivery: the caller's thread, and no other. The control thread
     // renews on its own schedule throughout, and it must not be a place user
@@ -663,7 +663,7 @@ TEST_CASE("frames are delivered on the polling thread, never on a coordination t
 }
 
 TEST_CASE("a frame the application kept outlives the session that delivered it",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     // ADR 0003: closing ends participation, not the validity of memory an
     // application still holds. Retention is the whole reason FrameView is
@@ -674,17 +674,17 @@ TEST_CASE("a frame the application kept outlives the session that delivered it",
 
     FrameView retained;
 
-    detail::SessionCallbacks callbacks = noop_callbacks();
+    SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&retained](FrameView frame) { retained = std::move(frame); };
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(supervisor->poll(std::chrono::milliseconds{200}) == 1);
+    CHECK(subscription->poll(std::chrono::milliseconds{200}) == 1);
     REQUIRE(static_cast<bool>(retained));
 
     // The session, its transport and both its threads go away here.
-    supervisor.reset();
+    subscription.reset();
 
     REQUIRE(static_cast<bool>(retained));
     CHECK(retained.sequence() == 42);
@@ -694,20 +694,20 @@ TEST_CASE("a frame the application kept outlives the session that delivered it",
 }
 
 TEST_CASE("a frame delivered before a reconnect survives the session that replaced it",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     Script script;
     script.receive(11);
 
     FrameView retained;
 
-    detail::SessionCallbacks callbacks = noop_callbacks();
+    SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&retained](FrameView frame) { retained = std::move(frame); };
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(supervisor->poll(std::chrono::milliseconds{200}) == 1);
+    CHECK(subscription->poll(std::chrono::milliseconds{200}) == 1);
     REQUIRE(static_cast<bool>(retained));
 
     // Lose the session. The control thread retires that transport and builds a
@@ -721,7 +721,7 @@ TEST_CASE("a frame delivered before a reconnect survives the session that replac
 
     // And the replacement session delivers, so the reconnect really happened.
     script.receive(12);
-    CHECK(eventually([&] { return supervisor->poll(std::chrono::milliseconds{50}) == 1; }));
+    CHECK(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}) == 1; }));
 }
 
 // -- the transport is no longer in the delivery path -------------------------
@@ -740,7 +740,7 @@ bool readable(int fd)
 }
 
 TEST_CASE("a consumer blocked in poll() does not delay replacing the transport",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     // The worst interaction in the subscriber, and the reason section 4.2
     // exists. Delivery used to hold a borrow on the transport for the whole of
@@ -750,8 +750,8 @@ TEST_CASE("a consumer blocked in poll() does not delay replacing the transport",
     // held the GIL while doing it.
     Script script;
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     REQUIRE(eventually([&script] { return script.transports_built.load() == 1; }));
 
@@ -759,7 +759,7 @@ TEST_CASE("a consumer blocked in poll() does not delay replacing the transport",
     // for two seconds.
     std::atomic<bool> still_polling{true};
     std::thread consumer([&] {
-        supervisor->poll(std::chrono::seconds{2});
+        subscription->poll(std::chrono::seconds{2});
         still_polling.store(false);
     });
 
@@ -785,7 +785,7 @@ TEST_CASE("a consumer blocked in poll() does not delay replacing the transport",
     consumer.join();
 }
 
-TEST_CASE("the readiness descriptor survives a reconnect", "[core][supervisor]")
+TEST_CASE("the readiness descriptor survives a reconnect", "[core][subscription]")
 {
     // Section 4.2: the descriptor belongs to the subscription, so an event loop
     // registers it once. A per-transport descriptor would have to be swapped
@@ -793,26 +793,26 @@ TEST_CASE("the readiness descriptor survives a reconnect", "[core][supervisor]")
     // not something asyncio's add_reader lets you do quietly.
     Script script;
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
-    const int before = supervisor->fd();
+    const int before = subscription->fd();
     REQUIRE(before >= 0);
 
     script.refuse_next_renew(Status::SessionExpired);
     REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
 
-    CHECK(supervisor->fd() == before);
+    CHECK(subscription->fd() == before);
 
     // Still the live one, not a stale number: the replacement session's frames
     // arrive through it.
     Delivered seen;
     script.receive(9);
-    REQUIRE(eventually([&] { return supervisor->poll(std::chrono::milliseconds{50}) == 1; }));
+    REQUIRE(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}) == 1; }));
 }
 
 TEST_CASE("an empty poll arms the descriptor, and a frame makes it readable",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     // The whole asyncio story in one case: register fd(), poll when it fires,
     // and never touch an arm/drain protocol. Section 4.1 removed those two
@@ -820,28 +820,28 @@ TEST_CASE("an empty poll arms the descriptor, and a frame makes it readable",
     Script script;
     Delivered seen;
 
-    detail::SessionCallbacks callbacks = noop_callbacks();
+    SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    REQUIRE(supervisor->fd() >= 0);
+    REQUIRE(subscription->fd() >= 0);
 
     // Nothing queued: the poll comes up empty and arms on the way out.
-    CHECK(supervisor->poll(std::chrono::milliseconds{0}) == 0);
-    CHECK_FALSE(readable(supervisor->fd()));
+    CHECK(subscription->poll(std::chrono::milliseconds{0}) == 0);
+    CHECK_FALSE(readable(subscription->fd()));
 
     script.receive(4);
 
-    CHECK(readable(supervisor->fd()));
-    CHECK(supervisor->poll(std::chrono::milliseconds{0}) == 1);
+    CHECK(readable(subscription->fd()));
+    CHECK(subscription->poll(std::chrono::milliseconds{0}) == 1);
     REQUIRE(seen.count() == 1);
     CHECK(seen.sequences.front() == 4);
 }
 
 TEST_CASE("frames the retired session left behind are discarded, not delivered later",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     // Section 4.2: stop the old producer and discard its queued frames before
     // starting the next. The queue outlives the session now, so without this a
@@ -851,28 +851,28 @@ TEST_CASE("frames the retired session left behind are discarded, not delivered l
     Script script;
     Delivered seen;
 
-    detail::SessionCallbacks callbacks = noop_callbacks();
+    SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
     // Queued and deliberately not taken.
     script.receive(1);
-    REQUIRE(eventually([&supervisor] {
-        return supervisor->counters().delivery_queue_depth == 1;
+    REQUIRE(eventually([&subscription] {
+        return subscription->counters().delivery_queue_depth == 1;
     }));
 
     script.refuse_next_renew(Status::SessionExpired);
     REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
 
     // Gone with the session that queued it.
-    CHECK(supervisor->poll(std::chrono::milliseconds{50}) == 0);
+    CHECK(subscription->poll(std::chrono::milliseconds{50}) == 0);
     CHECK(seen.count() == 0);
 
     // And the replacement session delivers normally.
     script.receive(2);
-    REQUIRE(eventually([&] { return supervisor->poll(std::chrono::milliseconds{50}) == 1; }));
+    REQUIRE(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}) == 1; }));
     REQUIRE(seen.count() == 1);
     CHECK(seen.sequences.front() == 2);
 }
@@ -886,7 +886,7 @@ TEST_CASE("frames the retired session left behind are discarded, not delivered l
 // byte and the transport consulted a flag.
 
 TEST_CASE("a refusal sent as an Error message is adopted like any other",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     // A client MUST accept `Error` in place of any expected reply. It is a
     // different path through the decoder than a reply carrying a non-Ok status,
@@ -895,12 +895,12 @@ TEST_CASE("a refusal sent as an Error message is adopted like any other",
     script.refuse_with_error_message = true;
     script.open_results = {Status::NotAuthorized};
 
-    SubscriberConfig config = supervisor_config();
+    SubscriberConfig config = subscription_config();
     config.reconnect_policy = ReconnectPolicy::FailFast;
 
     try
     {
-        detail::SessionSupervisor::open(
+        Subscription::open(
             config, fake_channel(script), fake_factory(script), noop_callbacks());
         FAIL("the open should have been refused");
     }
@@ -916,7 +916,7 @@ TEST_CASE("a refusal sent as an Error message is adopted like any other",
 }
 
 TEST_CASE("a reply that does not decode is a refusal, not a crash",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     // A peer that is not this library, an older version, or a transport that
     // truncated. The bytes have to be treated as data rather than trusted, and
@@ -924,12 +924,12 @@ TEST_CASE("a reply that does not decode is a refusal, not a crash",
     Script script;
     script.garble_replies = 1;
 
-    SubscriberConfig config = supervisor_config();
+    SubscriberConfig config = subscription_config();
     config.reconnect_policy = ReconnectPolicy::FailFast;
 
     try
     {
-        detail::SessionSupervisor::open(
+        Subscription::open(
             config, fake_channel(script), fake_factory(script), noop_callbacks());
         FAIL("an undecodable reply should have been refused");
     }
@@ -940,7 +940,7 @@ TEST_CASE("a reply that does not decode is a refusal, not a crash",
 }
 
 TEST_CASE("the lease terms the publisher granted are what the renew timer uses",
-          "[core][supervisor]")
+          "[core][subscription]")
 {
     // 3.7 lets the server set the terms and requires the client to adopt them.
     // They now travel as encoded fields rather than as a constant compiled into
@@ -949,8 +949,8 @@ TEST_CASE("the lease terms the publisher granted are what the renew timer uses",
     script.renew_interval_ms = 15;
     script.lease_ttl_ms = 150;
 
-    auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+    auto subscription = Subscription::open(
+        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
 
     // Several renewals inside a window that only the granted 15 ms interval
     // fits into; the 1 s fallback for an unstated interval would manage one.
