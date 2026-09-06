@@ -411,54 +411,6 @@ TEST_CASE("Probe and ProbeAck round trip and do not alias", "[protocol][roundtri
     CHECK(got_ack.probe_token == probe.probe_token);
 }
 
-TEST_CASE("Geometry and GeometryAck round trip", "[protocol][roundtrip]")
-{
-    GeometryMessage sent;
-    sent.generation = 12;
-    sent.stream_id = 77;
-    sent.first_sequence = 100'000;
-    sent.geometry = filled_geometry();
-
-    const auto bytes = encode(sent);
-
-    GeometryMessage got;
-    REQUIRE(decode(bytes.data(), bytes.size(), got) == Status::Ok);
-
-    CHECK(got.generation == sent.generation);
-    CHECK(got.stream_id == sent.stream_id);
-    CHECK(got.first_sequence == sent.first_sequence);
-    CHECK(got.geometry == sent.geometry);
-
-    GeometryAckMessage ack;
-    ack.generation = 12;
-    ack.stream_id = 77;
-    ack.first_sequence = 100'000;
-
-    const auto ack_bytes = encode(ack);
-
-    GeometryAckMessage got_ack;
-    REQUIRE(decode(ack_bytes.data(), ack_bytes.size(), got_ack) == Status::Ok);
-    CHECK(got_ack.generation == ack.generation);
-    CHECK(got_ack.first_sequence == ack.first_sequence);
-}
-
-TEST_CASE("Geometry rejects a prefix and block that disagree", "[protocol][roundtrip]")
-{
-    // Both halves carry the new epoch.  Adopting either value when they disagree
-    // would be guessing which one the sender meant.
-    GeometryMessage sent;
-    sent.generation = 12;
-    sent.stream_id = 77;
-    sent.first_sequence = 0;
-    sent.geometry = filled_geometry();
-    sent.geometry.generation = 11;
-
-    const auto bytes = encode(sent);
-
-    GeometryMessage got;
-    CHECK(decode(bytes.data(), bytes.size(), got) == Status::GeometryMismatch);
-}
-
 TEST_CASE("decode_data_prefix classifies every data message", "[protocol][roundtrip]")
 {
     const auto check = [](const auto &bytes, DataType expected, std::uint32_t generation)
@@ -480,5 +432,4 @@ TEST_CASE("decode_data_prefix classifies every data message", "[protocol][roundt
     check(encode(CreditMessage{5, 1, 0}), DataType::Credit, 5);
     check(encode(ProbeMessage{6, 1, 2}), DataType::Probe, 6);
     check(encode(ProbeAckMessage{7, 1, 2}), DataType::ProbeAck, 7);
-    check(encode(GeometryAckMessage{8, 1, 0}), DataType::GeometryAck, 8);
 }

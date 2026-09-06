@@ -387,8 +387,6 @@ TEST_CASE("data-plane header sizes and AM ids match spec 3.10", "[protocol][layo
     CHECK(k_credit_bytes == 32);
     CHECK(k_probe_bytes == 32);
     CHECK(k_probe_ack_bytes == 32);
-    CHECK(k_geometry_bytes == 128);
-    CHECK(k_geometry_ack_bytes == 32);
 
     // Credit and ProbeAck have distinct ids.  The prototype shared one, which is
     // what forced a reserved sequence sentinel to keep a probe ack from sliding
@@ -399,12 +397,6 @@ TEST_CASE("data-plane header sizes and AM ids match spec 3.10", "[protocol][layo
     CHECK(k_am_id_credit == 1);
     CHECK(k_am_id_probe == 2);
     CHECK(k_am_id_probe_ack == 3);
-    CHECK(k_am_id_geometry == 4);
-    CHECK(k_am_id_geometry_ack == 5);
-
-    // The engine must confirm the transport can carry the largest header before
-    // the first frame, not at it.
-    CHECK(k_max_am_header_bytes == 160);
 }
 
 // ---------------------------------------------------------------------------
@@ -499,36 +491,6 @@ TEST_CASE("Probe and ProbeAck match spec 3.13", "[protocol][layout]")
     CHECK_FIELD(ack_bytes, 24, 8, 0xFEEDFACECAFEBEEFull);
 }
 
-TEST_CASE("Geometry and GeometryAck match spec 3.14", "[protocol][layout]")
-{
-    GeometryMessage geom;
-    geom.generation = 7;
-    geom.stream_id = k_probe_u64;
-    geom.first_sequence = 4096;
-    geom.geometry = sample_geometry();
-
-    const auto geom_bytes = encode(geom);
-
-    REQUIRE(geom_bytes.size() == 128);
-    CHECK_FIELD(geom_bytes, 6, 2, 128);           // header_bytes
-    CHECK_FIELD(geom_bytes, 8, 2, 5);             // msg_type = Geometry
-    CHECK_FIELD(geom_bytes, 12, 4, 7);            // generation = the NEW epoch
-    CHECK_FIELD(geom_bytes, 16, 8, k_probe_u64);  // stream_id
-    CHECK_FIELD(geom_bytes, 24, 8, 4096);         // first_sequence
-    CHECK_FIELD(geom_bytes, 32, 4, 7);            // geometry.generation
-
-    GeometryAckMessage ack;
-    ack.generation = 7;
-    ack.stream_id = k_probe_u64;
-    ack.first_sequence = 4096;
-
-    const auto ack_bytes = encode(ack);
-
-    REQUIRE(ack_bytes.size() == 32);
-    CHECK_FIELD(ack_bytes, 8, 2, 6);      // msg_type = GeometryAck
-    CHECK_FIELD(ack_bytes, 24, 8, 4096);  // first_sequence echoed
-}
-
 // ---------------------------------------------------------------------------
 // 3.0.2 -- every fixed part is a multiple of 8
 // ---------------------------------------------------------------------------
@@ -551,5 +513,4 @@ TEST_CASE("every fixed part is a multiple of eight bytes", "[protocol][layout]")
     CHECK(k_data_prefix_bytes % 8 == 0);
     CHECK(k_frame_header_bytes % 8 == 0);
     CHECK(k_credit_bytes % 8 == 0);
-    CHECK(k_geometry_bytes % 8 == 0);
 }

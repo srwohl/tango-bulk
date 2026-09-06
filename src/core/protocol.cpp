@@ -401,10 +401,6 @@ const char *to_string(DataType type) noexcept
         return "Probe";
     case DataType::ProbeAck:
         return "ProbeAck";
-    case DataType::Geometry:
-        return "Geometry";
-    case DataType::GeometryAck:
-        return "GeometryAck";
     }
 
     return "Unknown";
@@ -1104,10 +1100,6 @@ std::size_t min_header_bytes(DataType type) noexcept
         return k_probe_bytes;
     case DataType::ProbeAck:
         return k_probe_ack_bytes;
-    case DataType::Geometry:
-        return k_geometry_bytes;
-    case DataType::GeometryAck:
-        return k_geometry_ack_bytes;
     }
 
     return 0;
@@ -1372,80 +1364,5 @@ Status decode(const std::byte *data, std::size_t size, ProbeAckMessage &out) noe
     return Status::Ok;
 }
 
-std::array<std::byte, k_geometry_bytes> encode(const GeometryMessage &msg) noexcept
-{
-    std::array<std::byte, k_geometry_bytes> out{};
-    std::byte *p = out.data();
-
-    put_data_prefix(p, DataType::Geometry, k_geometry_bytes, msg.generation);
-    wire::put64(p + 16, msg.stream_id);
-    wire::put64(p + 24, msg.first_sequence);
-    put_geometry(p + 32, msg.geometry);
-
-    return out;
-}
-
-Status decode(const std::byte *data, std::size_t size, GeometryMessage &out) noexcept
-{
-    DataPrefix prefix;
-
-    if(const Status status = open_data(data, size, DataType::Geometry, prefix);
-       status != Status::Ok)
-    {
-        return status;
-    }
-
-    GeometryMessage msg;
-    msg.generation = prefix.generation;
-    msg.stream_id = wire::get64(data + 16);
-    msg.first_sequence = wire::get64(data + 24);
-    get_geometry(data + 32, msg.geometry);
-
-    if(const Status status = msg.geometry.validate(); status != Status::Ok)
-    {
-        return status;
-    }
-
-    // The prefix generation is the new epoch, and the embedded block carries it
-    // too.  Disagreement is a sender bug, and adopting either value would be a
-    // guess about which one the peer meant.
-    if(msg.geometry.generation != msg.generation)
-    {
-        return Status::GeometryMismatch;
-    }
-
-    out = msg;
-
-    return Status::Ok;
-}
-
-std::array<std::byte, k_geometry_ack_bytes> encode(const GeometryAckMessage &msg) noexcept
-{
-    std::array<std::byte, k_geometry_ack_bytes> out{};
-    std::byte *p = out.data();
-
-    put_data_prefix(p, DataType::GeometryAck, k_geometry_ack_bytes, msg.generation);
-    wire::put64(p + 16, msg.stream_id);
-    wire::put64(p + 24, msg.first_sequence);
-
-    return out;
-}
-
-Status decode(const std::byte *data, std::size_t size, GeometryAckMessage &out) noexcept
-{
-    DataPrefix prefix;
-
-    if(const Status status = open_data(data, size, DataType::GeometryAck, prefix);
-       status != Status::Ok)
-    {
-        return status;
-    }
-
-    out.generation = prefix.generation;
-    out.stream_id = wire::get64(data + 16);
-    out.first_sequence = wire::get64(data + 24);
-
-    return Status::Ok;
-}
 
 } // namespace TangoBulk::Protocol

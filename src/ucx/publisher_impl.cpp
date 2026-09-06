@@ -1543,15 +1543,6 @@ PublishResult BulkPublisher::publish(BulkSource::Lease &&lease, const FrameMetad
     return PublishResult::Accepted;
 }
 
-Status BulkPublisher::declare_geometry(const FrameMetadata &, std::uint64_t, std::uint32_t)
-{
-    // 4.3's interlock is not something to approximate: it has to hold both rings
-    // registered, route by generation, and free the old ring only when both the
-    // ack has arrived and the old epoch has drained.  Returning a status beats a
-    // partial version.  M5 in MVP_PLAN.md is where it lands.
-    return Status::Internal;
-}
-
 std::uint32_t BulkPublisher::generation() const noexcept
 {
     return impl_->generation;

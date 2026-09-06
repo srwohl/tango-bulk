@@ -185,15 +185,6 @@ FrameHeader canonical_frame()
     return msg;
 }
 
-GeometryMessage canonical_geometry_message()
-{
-    GeometryMessage msg;
-    msg.generation = 3;
-    msg.stream_id = 0x0123'4567'89AB'CDEFull;
-    msg.first_sequence = 4096;
-    msg.geometry = canonical_geometry();
-    return msg;
-}
 
 /// Correlation id shared by every coordination vector, so the envelope bytes are
 /// comparable across them.
@@ -245,9 +236,6 @@ TEST_CASE("golden vectors, data plane", "[protocol][golden]")
                                               0x0BAD'C0DE'DEAD'BEEFull}));
     CHECK_GOLDEN(k_probe_ack, encode(ProbeAckMessage{3, 0x0123'4567'89AB'CDEFull,
                                                      0x0BAD'C0DE'DEAD'BEEFull}));
-    CHECK_GOLDEN(k_geometry, encode(canonical_geometry_message()));
-    CHECK_GOLDEN(k_geometry_ack,
-                 encode(GeometryAckMessage{3, 0x0123'4567'89AB'CDEFull, 4096}));
 }
 
 TEST_CASE("every golden vector decodes to the values it was built from",
