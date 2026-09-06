@@ -7,12 +7,6 @@
 #include <memory>
 #include <utility>
 
-/// The one translation unit that knows both halves.
-///
-/// `Subscription` lives in core and must not name a UCX symbol;
-/// `make_subscriber_transport()` is defined in this library. Joining them is a
-/// three-line function, and it belongs here because here is the only place
-/// where naming both is legal.
 namespace TangoBulk
 {
 

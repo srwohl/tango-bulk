@@ -440,11 +440,6 @@ int run_publisher(const Options &options)
 
 // -- subscriber --------------------------------------------------------------
 
-/// Take up to `max_frames` within `timeout`, invoking `cb` on this thread.
-///
-/// The engine used to offer this. It no longer does: the delivery queue belongs
-/// to the subscription, and here the benchmark *is* the subscription, so the
-/// loop lives with the consumer rather than with the transport.
 std::size_t take_frames(detail::DeliveryQueue &delivery,
                         std::chrono::milliseconds timeout,
                         const FrameCallback &cb,
@@ -483,9 +478,6 @@ int run_subscriber(const Options &options)
     config.delivery_mode = DeliveryMode::Manual;
     config.ucx_tls = options.tls;
 
-    // The benchmark is the subscription here: it owns the delivery queue the
-    // engine pushes into, and the session contract the engine is started on.
-    // A transport owns neither.
     const auto delivery = std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
                                                                   config.drop_policy);
     detail::SessionClient session;
@@ -501,7 +493,6 @@ int run_subscriber(const Options &options)
         fail(std::string("Open was refused: ") + to_string(status));
     }
 
-    // Only now, and only with a grant that survived validation.
     if(const Status status = engine.activate(
            session.stream_id(), session.granted_geometry(), session.server_address());
        status != Status::Ok)
@@ -564,8 +555,6 @@ int run_subscriber(const Options &options)
 
     const SubscriberCounters counters = engine.counters();
 
-    // `frames_dropped_queue_full` is the queue's, not the engine's: the queue
-    // outlives any one session, so it is the thing that knows.
     const std::uint64_t dropped_queue_full = delivery->stats().dropped;
 
     report_rate("subscriber", received > options.warmup ? received - options.warmup : 0,

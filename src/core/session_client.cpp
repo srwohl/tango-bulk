@@ -79,10 +79,6 @@ Status SessionClient::adopt_open_reply(const std::byte *data,
     stream_id_ = reply.stream_id;
     server_address_ = reply.server_ucx_address;
 
-    // The whole block, not four fields out of it. Shape, strides and element
-    // type are the description the application needs and the receive path has
-    // to check each frame against; copying out the three numbers the transport
-    // happened to need was what made both impossible.
     granted_ = reply.geometry;
 
     lease_ttl_ms_ = reply.lease_ttl_ms;

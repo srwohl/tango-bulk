@@ -16,26 +16,9 @@
 #include <utility>
 #include <vector>
 
-/// `BulkSubscriber`: the Tango adapter, and nothing else.
 ///
-/// Everything that was session policy -- the control loop, the renew timer, the
-/// reconnect policy, the transport slot, the three threads -- is now
-/// `detail::Subscription` in `core/`, which knows nothing about Tango. What
-/// is left here is the part that could never move: turning a coordination
-/// message into a `command_inout` on a borrowed `DeviceProxy`, and turning what
-/// comes back (or what is thrown) into bytes and a `BulkError`.
 ///
-/// The public interface is unchanged. Two things about it are worth stating,
-/// because they are the reason this class still exists rather than being
-/// replaced by the subscription:
 ///
-///   * 2.4 documents that constructing a subscriber that is never started must
-///     cost nothing but memory, so a client can build one per stream and start
-///     a subset. A `Subscription` *is* its session and has no unstarted
-///     form -- so the two-phase shape lives here, as a `unique_ptr` that is null
-///     until `start()`.
-///   * That pointer is also the answer to "have you started?", which
-///     `set_command_names()` needs. There is no second flag to disagree with it.
 namespace TangoBulk
 {
 namespace
@@ -95,11 +78,6 @@ std::string describe(const Tango::DevFailed &failure)
 
 // ---------------------------------------------------------------------------
 
-/// The coordination adapter: Tango commands carrying encoded messages.
-///
-/// All that is left of what used to be a class wrapped around a Subscription.
-/// It holds no session state, no callbacks and no lifecycle -- only which
-/// command carries which message, and the proxy to call it on.
 class CommandChannel
 {
   public:
@@ -112,20 +90,12 @@ class CommandChannel
     {
     }
 
-    /// The coordination channel, and the only Tango in the data path's lifetime.
     ///
-    /// Called on the subscription's control thread and never concurrently, which
-    /// lets it scope the caller's proxy timeout without racing anyone for it.
     ///
-    /// 7.4: a `DevFailed` is a recovery hint, never cleanup authority, and it is
-    /// translated here so the subscription never names a Tango type.
     std::vector<std::byte> command(Protocol::CoordType kind,
                                    const std::vector<std::byte> &request);
 
   private:
-    /// Which command carries which coordination message. Below this function
-    /// the message is a `CoordType`, and what a device calls it is not a fact
-    /// the session policy could use.
     const std::string &name_for(Protocol::CoordType kind) const
     {
         switch(kind)
@@ -168,9 +138,6 @@ std::vector<std::byte> CommandChannel::command(Protocol::CoordType kind,
             Tango::DeviceData argument;
             argument << in;
 
-            // 7.4: only command_inout, set_timeout_millis, get_timeout_millis,
-            // name and status.  No subscribe_event, no callback registration, no
-            // second connection.
             const ScopedTimeout guard(proxy, command_timeout_ms);
             Tango::DeviceData reply = proxy.command_inout(name, argument);
 
@@ -197,16 +164,12 @@ std::vector<std::byte> CommandChannel::command(Protocol::CoordType kind,
 
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 
 std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
                                         SubscriberConfig config,
                                         SubscriptionCallbacks callbacks,
                                         const CommandNames &names)
 {
-    // The adapter owns its own state and outlives the call, because the control
-    // thread keeps calling it. It holds the proxy by reference, which is why the
-    // caller must keep the proxy alive.
     const auto adapter = std::make_shared<CommandChannel>(proxy, names, config.command_timeout_ms);
 
     return open_subscription(

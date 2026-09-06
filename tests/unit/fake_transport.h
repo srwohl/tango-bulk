@@ -21,30 +21,12 @@
 #include <thread>
 #include <vector>
 
-/// A transport and a coordination channel that can be told to misbehave.
-///
-/// This exists for one reason: a real publisher cannot be made to refuse a
-/// renewal, grant a session and then never probe, or fail an open four times in
-/// a row -- and those are the paths the control loop exists to handle. The
-/// integration suite in tests/tango covers the happy paths against a real
-/// device server and keeps covering them; nothing here replaces it.
-///
-/// Everything scripted lives in `Script`, not in the transport, because the
-/// subscription builds a *new* transport per session and a script that died with
-/// the transport could not describe a reconnect.
 namespace TangoBulkTests
 {
 
 using namespace TangoBulk;
 using namespace std::chrono_literals;
 
-/// One frame the fake has been told to receive, and the storage behind it.
-///
-/// The payload is a real allocation held by `shared_ptr` because
-/// `FrameView::detached()` keeps that owner alive for as long as any copy of
-/// the view does. That is what lets this fake be asked ADR 0003's question --
-/// does a frame the application kept outlive the session that delivered it --
-/// and not only the delivery question.
 struct ScriptedFrame
 {
     std::shared_ptr<std::vector<std::uint16_t>> payload;
@@ -60,39 +42,20 @@ struct Script
 {
     std::mutex mutex;
 
-    /// What each successive `adopt_open_reply` returns. Exhausted entries mean
-    /// `Ok` -- a script says what is unusual and stays quiet otherwise.
     std::deque<Status> open_results;
 
-    /// What each successive `adopt_renew_reply` returns.
     std::deque<Status> renew_results;
 
-    /// Whether a granted session ever reaches `Active`. False models a
-    /// publisher that answered `Open` but cannot reach this client's endpoint.
     bool probe_arrives{true};
 
-    /// Set to make every grant after the first describe a different array, as a
-    /// detector reconfigured between sessions would.
     bool reshape_after_first{false};
 
-    /// Set to make the coordination channel throw, as an unreachable device
-    /// does. Counted down; zero means "answer normally".
     int channel_throws{0};
 
-    /// Send a refusal as an `Error` message rather than as a reply carrying a
-    /// non-Ok status.
-    ///
-    /// Both are legal -- a client must accept `Error` in place of any expected
-    /// reply -- and they take different paths through the decoder, so which one
-    /// a test provokes is a thing to choose rather than to inherit.
     bool refuse_with_error_message{false};
 
-    /// Return bytes that decode as nothing, as a peer that is not this library
-    /// -- or a truncating transport -- would. Counted down.
     int garble_replies{0};
 
-    /// What the grant says. The identifiers and lease terms a real publisher
-    /// would mint, fixed here so a test can assert on them.
     Protocol::SessionId session_id{{std::byte{0xA1}, std::byte{0xB2}, std::byte{0xC3}}};
     Protocol::StreamId stream_id{0x5EED};
     std::uint32_t lease_ttl_ms{200};
@@ -101,32 +64,15 @@ struct Script
 
     std::atomic<int> transports_built{0};
 
-    /// How many transports were actually started on a grant.
-    ///
-    /// Distinct from `transports_built`, and the gap between them is the point:
-    /// a transport whose grant the subscription refuses is built and destroyed
-    /// without ever being activated, so it never had an endpoint and never
-    /// could have queued a frame.
     std::atomic<int> activations{0};
     std::atomic<int> opens{0};
     std::atomic<int> renews{0};
     std::atomic<int> closes{0};
 
-    /// Which threads have called the channel, and whether two were ever inside
-    /// it at once. The subscription promises the calls never overlap -- which is
-    /// what the Python binding's GIL story rests on -- so it is asserted rather
-    /// than assumed. It does NOT promise a single thread: the first open runs
-    /// on the caller's.
     std::set<std::thread::id> channel_threads;
     std::atomic<int> channel_inside{0};
     std::atomic<int> channel_max_concurrent{0};
 
-    /// Queue one renewal outcome on a subscription that is already running.
-    ///
-    /// The plain `renew_results = {...}` the other cases use is safe only
-    /// because they all write it before `open()`, when no control thread
-    /// exists. Making a *live* session fail is a write the control thread races
-    /// with, and ThreadSanitizer says so.
     void refuse_next_renew(Status status)
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -141,15 +87,7 @@ struct Script
 
     int grants_made{0};
 
-    // -- the coordination plane, answered on the wire ------------------------
 
-    /// The `OpenReply` the publisher sends, encoded.
-    ///
-    /// Real protocol bytes rather than a sentinel, so that everything between
-    /// the request and the adopted grant -- the encoder, the envelope, the
-    /// decoder, the geometry validation, the downward-clamp check -- is on the
-    /// path a unit test exercises. None of it was, while this returned one byte
-    /// and the transport consulted a flag.
     std::vector<std::byte> open_reply(std::uint64_t correlation_id)
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -197,10 +135,6 @@ struct Script
         reply.session_id = session_id;
         reply.status = status;
 
-        // 3.7 lets the server change either term at any renewal. Repeating the
-        // current ones is what an unchanged lease looks like on the wire, and
-        // sending zeros instead would silently reset the client's renew timer
-        // to its fallback.
         reply.lease_ttl_ms = lease_ttl_ms;
         reply.renew_interval_ms = renew_interval_ms;
         reply.geometry = last_grant;
@@ -217,7 +151,6 @@ struct Script
         return Protocol::encode(reply, correlation_id);
     }
 
-    /// The grant, reshaped from the second one onward if asked.
     Protocol::GeometryBlock grant_locked()
     {
         const bool reshaped = reshape_after_first && grants_made > 0;
@@ -240,7 +173,6 @@ struct Script
         return granted;
     }
 
-    /// The grant as it stands, so a renewal can echo the current epoch.
     Protocol::GeometryBlock last_grant{};
 
     static Status next_status(std::deque<Status> &scripted)
@@ -254,21 +186,11 @@ struct Script
         return status;
     }
 
-    // -- the data path -------------------------------------------------------
 
-    /// The subscription's delivery queue, once a transport has been built over
-    /// it. The same queue for every session, which is the ownership under test.
     std::shared_ptr<detail::DeliveryQueue> delivery;
 
-    /// Frames sent before any transport existed.
-    ///
-    /// A test arranges arrivals before it opens a subscription, and until then
-    /// there is nowhere to put them -- the queue is created by the subscription,
-    /// which does not exist yet. They go in on the first attach, which is what a
-    /// publisher that had frames waiting would produce anyway.
     std::deque<ScriptedFrame> staged;
 
-    /// Called by the factory for every transport it builds.
     void attach(std::shared_ptr<detail::DeliveryQueue> queue)
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -281,12 +203,6 @@ struct Script
         staged.clear();
     }
 
-    /// Hand the transport one more frame to deliver, shaped like the grant.
-    ///
-    /// 8x8 UInt16, matching the geometry `adopt_open_reply` grants when it has
-    /// not been told to reshape, with `sequence` written into every element --
-    /// so a test can tell delivered frames apart by their contents and not
-    /// merely count them.
     void receive(std::uint64_t sequence)
     {
         ScriptedFrame frame;
@@ -315,8 +231,6 @@ struct Script
     }
 
   private:
-    /// Push straight into the subscription's queue, as the engine's AM callback
-    /// does.
     void deliver_locked(ScriptedFrame &frame)
     {
         delivery->push(FrameView::detached(frame.payload, frame.bytes(), frame.fields));
@@ -326,12 +240,6 @@ struct Script
 class FakeTransport final : public detail::SubscriberTransport
 {
   public:
-    /// Takes the subscription's queue and hands it to the script, which is what
-    /// gives a test somewhere to send frames from.
-    ///
-    /// There is no `poll()` here any more, and that is the point: a transport
-    /// is given somewhere to put frames rather than asked for them, so nothing
-    /// above has to hold it alive across an application callback.
     FakeTransport(Script &script, std::shared_ptr<detail::DeliveryQueue> delivery) :
         script_(script)
     {
@@ -339,11 +247,6 @@ class FakeTransport final : public detail::SubscriberTransport
         script_.attach(std::move(delivery));
     }
 
-    // -- what is left of the seam --------------------------------------------
-    //
-    // No codec, no lease terms, no grant. All of that is the subscription's
-    // now, so a fake transport has nothing to fake about it: it says where it
-    // is, takes a settled contract, and reports what happened.
 
     const std::vector<std::byte> &local_address() const noexcept override
     {
@@ -356,8 +259,6 @@ class FakeTransport final : public detail::SubscriberTransport
     {
         script_.activations.fetch_add(1, std::memory_order_relaxed);
 
-        // A real engine reaches Active when the publisher's Probe is answered.
-        // This is the knob a real one does not have.
         state_.store(script_.probes() ? SubscriberState::Active : SubscriberState::Probing,
                      std::memory_order_release);
         return Status::Ok;
@@ -388,9 +289,6 @@ class FakeTransport final : public detail::SubscriberTransport
     }
 
   private:
-    /// This client's own UCX address, as far as the coordination plane is
-    /// concerned: an opaque blob that goes out in `Open` and comes back to
-    /// nobody. There is no data path here to give it meaning.
     static inline const std::vector<std::byte> k_client_address{
         std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
 
@@ -399,8 +297,6 @@ class FakeTransport final : public detail::SubscriberTransport
     std::atomic<bool> failed_{false};
 };
 
-/// A factory over a script, and the last transport it built -- so a test can
-/// reach in and fail the live one.
 inline detail::TransportFactory fake_factory(Script &script,
                                              std::shared_ptr<FakeTransport *> latest = nullptr)
 {
@@ -411,7 +307,6 @@ inline detail::TransportFactory fake_factory(Script &script,
         auto transport = std::make_unique<FakeTransport>(script, std::move(delivery));
         if(latest)
         {
-            *latest = transport.get();
         }
         return transport;
     };
@@ -428,7 +323,6 @@ inline detail::CoordinationChannel fake_channel(Script &script)
               !script.channel_max_concurrent.compare_exchange_weak(observed, inside))
         {
         }
-        // Held for the whole body, so an overlap anywhere in it is recorded.
         struct Leave
         {
             Script &script;
@@ -449,14 +343,8 @@ inline detail::CoordinationChannel fake_channel(Script &script)
             }
         }
 
-        // Wide enough that an overlapping caller would be caught.
         std::this_thread::sleep_for(std::chrono::microseconds{200});
 
-        // The request is decoded rather than ignored, and the reply is encoded
-        // rather than invented. A device carries opaque bytes and answers with
-        // opaque bytes; a channel that answered `{0}` to anything could not tell
-        // a correlated reply from an uncorrelated one, and never had to produce
-        // a grant that survived validation.
         Protocol::Envelope envelope;
         if(Protocol::decode_envelope(request.data(), request.size(), envelope) != Status::Ok)
         {

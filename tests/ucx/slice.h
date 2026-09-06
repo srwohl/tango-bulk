@@ -77,29 +77,12 @@ bool eventually(Predicate predicate, std::chrono::milliseconds budget = 5s)
     return predicate();
 }
 
-/// The delivery queue a subscription would have created for this engine.
-///
-/// A transport no longer owns its queue: the subscription does, so that it
-/// survives a reconnect and so that taking a frame never reaches through the
-/// transport. A test driving an engine directly is therefore standing in for
-/// the subscription, and it says so by holding the queue itself -- one named
-/// variable per engine, rather than a helper that would hide the very ownership
-/// these tests exist to exercise.
 inline std::shared_ptr<detail::DeliveryQueue> queue_for(const SubscriberConfig &config)
 {
     return std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
                                                    config.drop_policy);
 }
 
-/// One subscriber, assembled the way a subscription assembles one.
-///
-/// A transport owns neither of these any more. The delivery queue belongs to
-/// the subscription so that it survives a reconnect, and the session contract
-/// -- the grant, the lease terms, the identifiers `Renew` and `Close` quote --
-/// belongs to it too, so that a grant is settled and checked *before* a
-/// transport is started on it. A test driving an engine directly is standing in
-/// for the subscription, and this is what that costs: two members and the open
-/// handshake spelled out.
 struct Subscriber
 {
     SubscriberConfig config;
@@ -119,8 +102,6 @@ struct Subscriber
         return session.make_open_request(config, engine.local_address(), correlation_id);
     }
 
-    /// Adopt the grant, then start the transport on it -- in that order, which
-    /// is the ordering the seam now enforces rather than merely documents.
     Status adopt_open_reply(const std::byte *data, std::size_t size)
     {
         const Status status = session.adopt_open_reply(data, size, config);
@@ -152,10 +133,6 @@ struct Subscriber
     }
 };
 
-/// Take up to `max_frames` within `timeout`, invoking `cb` on this thread.
-///
-/// What `SubscriberEngine::poll()` used to be, as a free function over the
-/// queue -- which is where the frames are now.
 /// Run the `Open` exchange, straight through `handle_coordination`.
 ///
 /// No Tango process, no DeviceProxy, no commands -- the bytes are the real

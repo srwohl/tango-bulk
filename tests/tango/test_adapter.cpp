@@ -267,27 +267,14 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
         sink.frames.clear();
     }
 
-    // frames_delivered and the queue gauges are the subscription's own, so they
-    // are exact the moment the frame is handed over.
     CHECK(subscriber->counters().frames_delivered >= 4);
 
-    // frames_received is the transport's, and the subscription reads a copy its
-    // control thread published rather than reaching into a live transport to
-    // ask. That copy refreshes on the control quantum, so it lags -- which is
-    // the trade ADR 0004 accepts, and what paid for retirement no longer having
-    // to wait on whoever happens to be reading a counter. `eventually` is the
-    // assertion the contract supports; a bare CHECK asserted an exactness that
-    // was never promised and cost a borrow handshake to provide.
     REQUIRE(eventually([&subscriber] { return subscriber->counters().frames_received >= 4; }));
 
     const SubscriberCounters counters = subscriber->counters();
     CHECK(counters.frames_dropped_bad_header == 0);
     CHECK(counters.frames_dropped_oversize == 0);
 
-    // Destroying it is closing it. There is no shell left behind to ask
-    // afterwards -- the `last_state` and retired-counter mirrors that used to
-    // answer are gone with the class that held them -- so the application's own
-    // record is what says the close was reported.
     subscriber.reset();
     CHECK(sink.saw(SubscriberState::Closed));
 
@@ -298,11 +285,6 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
 
 TEST_CASE("The granted geometry reaches the application", "[tango][m4]")
 {
-    // End to end: the geometry the publisher granted crosses the coordination
-    // plane, the session client, the transport seam and the adapter, and comes
-    // out the far side intact. Everything but ring depth, frame size and the
-    // lease terms used to be discarded at the first of those, so there was no
-    // way for an application to describe the array it was about to receive.
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
     const BulkQueryResult reported = bulk_query(proxy);
@@ -315,30 +297,21 @@ TEST_CASE("The granted geometry reaches the application", "[tango][m4]")
 
     const Protocol::GeometryBlock granted = subscriber->granted_geometry();
 
-    // A real epoch, which is what says a grant was adopted at all.
     CHECK(granted.generation != 0);
     CHECK(granted.generation == subscriber->generation());
 
-    // The array description is the publisher's and is not clamped, so it must
-    // match what an operator sees through the discovery path exactly.
     CHECK(granted.element_type == reported.element_type);
     CHECK(granted.element_size == reported.element_size);
     CHECK(granted.rank == reported.rank);
     CHECK(granted.shape == reported.shape);
     CHECK(granted.strides == reported.strides);
 
-    // The sizing terms ARE clamped, downward and never up (3.5 step 5).
     CHECK(granted.max_frame_bytes <= reported.max_frame_bytes);
     CHECK(granted.ring_depth <= reported.ring_depth);
     CHECK(granted.credit_window <= granted.ring_depth);
 
-    // And the whole block validates, which is what a binding would rely on
-    // before laying out a destination from it.
     CHECK(granted.validate() == Status::Ok);
 
-    // Destroying it closes the session. The assertion that used to follow --
-    // that geometry reads all-zero once there is no session -- asked a shell
-    // that outlived its subscription, and there is no longer one to ask.
     subscriber.reset();
     REQUIRE(eventually([&proxy] { return bulk_query(proxy).active_sessions == 0; }));
 }
@@ -440,7 +413,6 @@ TEST_CASE("A device with no publisher answers, and does not throw", "[tango][m4]
 
     Sink sink;
 
-    // FailFast reports an open failure by throwing, and leaves nothing behind.
     CHECK_THROWS_AS(subscribe(proxy, config, sink.callbacks()), BulkException);
 
     proxy.command_inout("Attach");
@@ -527,11 +499,6 @@ TEST_CASE("A subscriber reopens its session after the stream comes back", "[tang
 
 TEST_CASE("The command names given at subscribe are the ones used", "[tango][m4]")
 {
-    // This replaces a case that checked set_command_names() was refused after
-    // start(). The names are an argument to subscribe() now, so the session is
-    // opened, renewed and closed with the names it was given and there is no
-    // ordering left to get wrong. What is worth testing is that they are used
-    // at all.
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
     SubscriberConfig config = subscriber_config();

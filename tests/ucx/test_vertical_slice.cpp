@@ -273,11 +273,6 @@ TEST_CASE("With every view retained, publish reports CreditStalled and never blo
 
 TEST_CASE("A slot handle outlives the publisher that issued it", "[m2][slice]")
 {
-    // ADR 0003: closing ends participation, not the validity of memory an
-    // application still holds. This was a use-after-free until the ring moved
-    // into shared storage -- the handle carried a raw pointer into a ring the
-    // publisher owned by value, and a Python binding's non-deterministic
-    // destruction order makes that the default outcome rather than an edge case.
     BulkPublisher::SlotHandle handle;
 
     {
@@ -289,8 +284,6 @@ TEST_CASE("A slot handle outlives the publisher that issued it", "[m2][slice]")
         CHECK(publisher.retained() == 1);
     }
 
-    // The publisher is gone. The registration, the ring and the free list the
-    // slot goes back to are not, because this handle still holds a share.
     REQUIRE(handle);
     CHECK(handle.capacity() >= k_frame_bytes);
 
@@ -302,8 +295,6 @@ TEST_CASE("A slot handle outlives the publisher that issued it", "[m2][slice]")
     }
     CHECK(intact);
 
-    // And releasing it is safe with nothing else referencing the storage: the
-    // slot goes back to a free list that is destroyed immediately afterwards.
     handle.reset();
     CHECK_FALSE(handle);
 }
@@ -378,18 +369,12 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
 TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
           "[m2][slice]")
 {
-    // The ergonomic claim: an event loop that already owns the waiting -- epoll,
-    // select, asyncio's add_reader -- needs nothing from this layer but a
-    // descriptor and one empty poll. If this works, `async for` is a pure-Python
-    // addition with no further C++.
     BulkPublisher publisher(publisher_config());
     Subscriber subscriber(subscriber_config());
     open_session(publisher, subscriber);
 
     REQUIRE(subscriber.delivery->fd() >= 0);
 
-    // Nothing queued, so an armed wait must time out rather than fire. The
-    // empty poll is what arms; there is no separate step to forget.
     REQUIRE(drain(*subscriber.delivery, 0ms, [](FrameView) {}, 1) == 0);
     {
         pollfd pfd{};
@@ -398,7 +383,6 @@ TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
         CHECK(::poll(&pfd, 1, 40) == 0);
     }
 
-    // Look, then block -- exactly the two steps fd() documents.
     REQUIRE(drain(*subscriber.delivery, 0ms, [](FrameView) {}, 1) == 0);
 
     std::thread producer([&] {
@@ -419,7 +403,6 @@ TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
     const auto waited = std::chrono::steady_clock::now() - started;
     producer.join();
 
-    // Woken by the frame, not by the timeout.
     REQUIRE(ready == 1);
     CHECK((pfd.revents & POLLIN) != 0);
     CHECK(waited < 3s);
@@ -436,11 +419,6 @@ TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
 TEST_CASE("An unarmed descriptor is never signalled, which is what makes it free",
           "[m2][slice]")
 {
-    // The other half of the contract: a consumer that is keeping up never arms,
-    // so the engine never writes, so the fast path costs no syscall at all. A
-    // test
-    // that only checked "the fd fires" would pass just as well against an
-    // engine that wrote on every frame.
     BulkPublisher publisher(publisher_config());
     Subscriber subscriber(subscriber_config());
     open_session(publisher, subscriber);
@@ -457,14 +435,11 @@ TEST_CASE("An unarmed descriptor is never signalled, which is what makes it free
 
     REQUIRE(eventually([&] { return subscriber.engine.counters().frames_received >= 4; }));
 
-    // Four frames queued and nobody armed: the descriptor stays quiet.
     pollfd pfd{};
     pfd.fd = subscriber.delivery->fd();
     pfd.events = POLLIN;
     CHECK(::poll(&pfd, 1, 60) == 0);
 
-    // And the frames are still there -- the descriptor is a notification
-    // sidecar, never the queue itself.
     std::size_t drained = 0;
     REQUIRE(eventually([&] {
         drained += drain(*subscriber.delivery, 20ms, [](FrameView view) { view.reset(); });
@@ -475,10 +450,6 @@ TEST_CASE("An unarmed descriptor is never signalled, which is what makes it free
 TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
           "[m2][slice]")
 {
-    // Draining unconditionally means one call can hold queue_depth credits at
-    // once. A consumer that wants exactly one frame -- a read(), an iterator
-    // step -- needs to be able to say so, or it needs a delivery path of its
-    // own, which is how a binding ends up with two.
     BulkPublisher publisher(publisher_config());
     Subscriber subscriber(subscriber_config());
     open_session(publisher, subscriber);
@@ -497,8 +468,6 @@ TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
     REQUIRE(eventually(
         [&] { return subscriber.engine.counters().frames_received >= k_published; }));
 
-    // One at a time, and the frame is released before the next call so the
-    // credit accounting is about the budget rather than about retention.
     for(int i = 0; i < k_published; ++i)
     {
         std::size_t seen = 0;
@@ -511,11 +480,8 @@ TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
               static_cast<std::uint64_t>(i) + 1);
     }
 
-    // Nothing left, and asking for one more does not invent a frame.
     CHECK(drain(*subscriber.delivery, 10ms, [](FrameView) {}, 1) == 0);
 
-    // The default is still drain-everything, which is what every existing
-    // caller relies on.
     for(int i = 0; i < k_published; ++i)
     {
         auto lease = publisher.try_acquire();
@@ -540,9 +506,6 @@ TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
 
 TEST_CASE("A publisher refuses to send an array it did not declare", "[m2][slice]")
 {
-    // The producer half of 6.2. A device is far better placed to notice that it
-    // is publishing something it never declared than a consumer is to discover
-    // it after the bytes are on the wire and tear down a session over it.
     PublisherConfig config = publisher_config();
     config.frame_metadata.element_type = ElementType::UInt8;
     config.frame_metadata.element_size = 1;
@@ -553,7 +516,6 @@ TEST_CASE("A publisher refuses to send an array it did not declare", "[m2][slice
     Subscriber subscriber(subscriber_config());
     open_session(publisher, subscriber);
 
-    // What it declared, accepted.
     {
         auto lease = publisher.try_acquire();
         REQUIRE(lease);
@@ -562,8 +524,6 @@ TEST_CASE("A publisher refuses to send an array it did not declare", "[m2][slice
               PublishResult::Accepted);
     }
 
-    // The same bytes described as a different array: refused, and the lease is
-    // consumed rather than left engaged, exactly as any other BadMetadata.
     {
         auto lease = publisher.try_acquire();
         REQUIRE(lease);
@@ -580,8 +540,6 @@ TEST_CASE("A publisher refuses to send an array it did not declare", "[m2][slice
 
     CHECK(publisher.counters().dropped_bad_metadata == 1);
 
-    // The session is untouched: refusing one frame is not a reason to break a
-    // stream, which is exactly why catching it here beats catching it there.
     CHECK(subscriber.engine.state() == SubscriberState::Active);
     CHECK(publisher.session_count() == 1);
 }
@@ -589,16 +547,6 @@ TEST_CASE("A publisher refuses to send an array it did not declare", "[m2][slice
 TEST_CASE("A frame that contradicts the granted geometry retires the session",
           "[m2][slice]")
 {
-    // The consumer half, and it needs a non-conforming peer to provoke -- which
-    // is the point. With the producer check in place, a publisher built from
-    // this library cannot contradict its own grant, so this defends against one
-    // that was not: a different implementation, an older version, a header that
-    // decodes cleanly and lies.
-    //
-    // Built by forging the OpenReply. tests/ucx already carries real protocol
-    // bytes by hand, so a peer that grants one thing and sends another is a
-    // decode, an edit and a re-encode -- no test hook in the library, and
-    // nothing the library could do to stop a peer behaving this way.
     PublisherConfig config = publisher_config();
     config.frame_metadata.element_type = ElementType::UInt8;
     config.frame_metadata.element_size = 1;
@@ -615,8 +563,6 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
     REQUIRE(Protocol::decode(honest.data(), honest.size(), reply, &envelope) == Status::Ok);
     REQUIRE(reply.status == Status::Ok);
 
-    // Same payload size, different array: the grant now says UInt16 over half
-    // as many elements, which is not what the publisher will send.
     reply.geometry.element_type = ElementType::UInt16;
     reply.geometry.element_size = 2;
     reply.geometry.rank = 1;
@@ -630,8 +576,6 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
 
     REQUIRE(subscriber.session.granted_geometry().element_type == ElementType::UInt16);
 
-    // The publisher sends what it actually declared, which now contradicts what
-    // this subscriber believes it was granted.
     {
         auto lease = publisher.try_acquire();
         REQUIRE(lease);
@@ -645,8 +589,6 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
         return subscriber.engine.state() == SubscriberState::Failed;
     }));
 
-    // Counted as its own thing, not as a malformed header: it decoded, and the
-    // problem is that it disagreed.
     CHECK(subscriber.engine.counters().frames_dropped_geometry_mismatch == 1);
     CHECK(subscriber.engine.counters().frames_dropped_bad_header == 0);
     CHECK(subscriber.delivery->stats().taken == 0);

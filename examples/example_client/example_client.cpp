@@ -124,9 +124,6 @@ int main(int argc, char *argv[])
                 std::cout << std::endl;
             };
 
-        // If the device's commands carry a prefix, pass the names here:
-        //
-        //     TangoBulk::CommandNames::with_prefix("Xyz")
         auto subscription = TangoBulk::subscribe(proxy, config, std::move(callbacks));
 
         auto last = std::chrono::steady_clock::now();
@@ -156,8 +153,6 @@ int main(int argc, char *argv[])
 
         const TangoBulk::SubscriberCounters counters = subscription->counters();
 
-        // Sends BulkClose, joins the threads and releases the ring. Destroying
-        // it is closing it; there is no second way to say so.
         subscription.reset();
         std::cout << "received=" << counters.frames_received
                   << " delivered=" << counters.frames_delivered

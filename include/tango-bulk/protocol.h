@@ -130,7 +130,6 @@ const char *to_string(CoordType type) noexcept;
 /// Unknown bits MUST be ignored rather than rejected: that is what lets a minor
 /// version add a capability without breaking an older server.
 inline constexpr std::uint32_t k_caps_credit_coalescing = 1u << 0;
-// 1u << 1 was geometry rearm, cut with geometry epochs. Reserved, not reused.
 inline constexpr std::uint32_t k_caps_probe = 1u << 2;
 inline constexpr std::uint32_t k_caps_all = k_caps_credit_coalescing | k_caps_probe;
 
@@ -208,14 +207,6 @@ struct GeometryBlock
     friend bool operator==(const GeometryBlock &a, const GeometryBlock &b) noexcept;
     friend bool operator!=(const GeometryBlock &a, const GeometryBlock &b) noexcept;
 
-    /// Whether two grants describe the same array: element type, element size,
-    /// rank, shape and strides.
-    ///
-    /// Deliberately narrower than operator==, which also compares the epoch and
-    /// the sizing terms. A reopened session may legitimately be granted a
-    /// smaller ring or a new generation without any consumer's layout becoming
-    /// wrong; a different shape or element type is exactly the case where it
-    /// does.
     friend bool describes_same_array(const GeometryBlock &a, const GeometryBlock &b) noexcept;
 };
 
@@ -393,10 +384,6 @@ enum class DataType : std::uint16_t
     Credit = 2,
     Probe = 3,
     ProbeAck = 4,
-    // 5 and 6 were Geometry and GeometryAck. RFC 3 and 6.2 cut geometry epochs:
-    // a session contract is fixed at Open and changing it is close-and-reopen.
-    // Reserved rather than reused, so an old peer's message is unknown here
-    // rather than something else.
 };
 
 const char *to_string(DataType type) noexcept;

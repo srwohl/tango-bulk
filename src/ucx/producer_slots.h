@@ -19,14 +19,6 @@
 namespace TangoBulk::detail
 {
 
-/// Everything an unpublished SlotHandle must keep alive: the registered ring,
-/// the context needed to unmap it, and the free list a released slot goes back
-/// to.
-///
-/// Owned by `shared_ptr` and shared with every outstanding handle, so a handle
-/// that outlives its publisher keeps its storage mapped and has somewhere safe
-/// to return the slot (ADR 0003). The publisher used to hold the ring by value
-/// and the handle a raw pointer into it, which made that a use-after-free.
 class ProducerSlots
 {
   public:
@@ -46,7 +38,6 @@ class ProducerSlots
         }
     }
 
-    /// Take a slot, or fail. Never blocks and never allocates.
     bool try_acquire(std::uint32_t &index) noexcept
     {
         if(!free_slots_.try_pop(index))
@@ -58,20 +49,11 @@ class ProducerSlots
         return true;
     }
 
-    /// Return a slot to the free list.
-    ///
-    /// Three callers, and the rule is about when each may do it rather than
-    /// about doing anything different: an unpublished handle being destroyed, a
-    /// publish() that dropped the frame, and the engine dropping the last
-    /// session reference.
     void release(std::size_t index) noexcept
     {
         auto value = static_cast<std::uint32_t>(index);
         const bool pushed = free_slots_.try_push(std::move(value));
 
-        // The free list is exactly ring_depth deep and a slot is in it or held,
-        // never both. A failure here means a double release, which would go on
-        // to corrupt a frame in flight.
         (void) pushed;
         assert(pushed);
         retained_.fetch_sub(1, std::memory_order_relaxed);
@@ -97,8 +79,6 @@ class ProducerSlots
     RegisteredRing ring_;
     BoundedQueue<std::uint32_t> free_slots_;
 
-    /// Slots not in the free list. The free list already knows this, but it
-    /// cannot say so without popping, and the counter is read by an observer.
     std::atomic<std::uint64_t> retained_{0};
 };
 

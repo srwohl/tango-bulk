@@ -159,16 +159,12 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config,
             status, std::string("invalid SubscriberConfig: ") + to_string(status), "subscriber"});
     }
 
-    // Checked here rather than at the first push, which happens inside
-    // `ucp_worker_progress` where there is nothing useful to do about it.
     if(!delivery_)
     {
         throw BulkException(BulkError{
             Status::Internal, "a subscriber transport needs a delivery queue", "subscriber"});
     }
 
-    // `delivery_mode` is not inspected: this class receives into the queue it
-    // was given, and who takes frames out is the subscription's business.
 
     context_ = std::make_shared<UcxContext>(config_.ucx_tls);
     worker_ = std::make_unique<UcxWorker>(*context_);
@@ -209,8 +205,6 @@ SubscriberEngine::~SubscriberEngine()
 {
     running_.store(false, std::memory_order_release);
 
-    // The delivery queue is deliberately NOT stopped here: it belongs to the
-    // subscription, which a reconnect outlives. Its owner stops it.
 
     if(engine_.joinable())
     {
@@ -333,9 +327,6 @@ void SubscriberEngine::engine_loop()
             worked = true;
         }
 
-        // Out of the callback and into the loop, the same way credit and
-        // probe-acks are routed: a write() belongs nowhere near the inside of
-        // ucp_worker_progress.
 
         if(worked)
         {
@@ -708,19 +699,6 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         return UCS_OK;
     }
 
-    // The session contract, enforced.
-    //
-    // 6.2 makes the grant the contract: the array description is settled at
-    // Open and changing a term of it means closing and reopening. A frame that
-    // decodes cleanly and describes a *different* array is therefore not a
-    // malformed message, it is the publisher contradicting what it granted --
-    // and it is the one thing that would make `granted_geometry()` a hint
-    // rather than a guarantee, forcing every consumer to re-check the shape of
-    // every frame.
-    //
-    // Only checked when the grant is typed. A rank-0 `Byte` grant is the opaque
-    // tier -- bytes, length and ordering, with the per-frame hint free to say
-    // more -- so there is no contract to contradict.
     if(const Protocol::GeometryBlock &granted = granted_; granted.rank > 0)
     {
         if(frame.element_type != granted.element_type ||
@@ -730,11 +708,6 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
             dropped_geometry_mismatch_.fetch_add(1, std::memory_order_relaxed);
             tracker_.release(frame.sequence);
 
-            // Retired rather than dropped. A publisher that has started sending
-            // a different array will keep doing it, so discarding frames one at
-            // a time would spend the whole session on a contract that no longer
-            // holds -- and would do it silently. Closing and reopening is what
-            // 6.2 says a changed term means, and BoundedRetry does exactly that.
             fail(Status::GeometryMismatch,
                  "a frame described a different array from the one this session "
                  "granted; the publisher changed a contract term without reopening");
@@ -912,8 +885,6 @@ void SubscriberEngine::on_rndv_complete(void *request,
 
 void SubscriberEngine::fail(Status status, const char *reason) noexcept
 {
-    // First reason wins. A failing transport tends to fail again on the way
-    // down, and the second reason is usually a consequence of the first.
     const char *expected = nullptr;
     if(failure_reason_.compare_exchange_strong(expected, reason, std::memory_order_acq_rel))
     {
@@ -931,8 +902,6 @@ BulkError SubscriberEngine::last_error() const noexcept
         return BulkError{};
     }
 
-    // Allocates, and may only do so because this runs on the control thread --
-    // never on the engine, which is why fail() takes a literal.
     return BulkError{failure_status_.load(std::memory_order_acquire), reason, "transport"};
 }
 
@@ -949,9 +918,6 @@ void SubscriberEngine::commit(std::size_t slot_index) noexcept
     arena_->note_view_issued();
     FrameView view = ReceiveSlotLease::make_view(std::move(lease), slot.data, &slot.fields);
 
-    // Drop policy, high-water gauge, credit return and the consumer wakeup are
-    // all the queue's. The wakeup writes a descriptor only when a consumer is
-    // armed, so the common case makes no syscall inside worker progress.
     delivery_->push(std::move(view));
 }
 
@@ -969,8 +935,6 @@ const std::byte *SubscriberEngine::slot_address(std::size_t index) const noexcep
 
 SubscriberCounters SubscriberEngine::counters() const noexcept
 {
-    // The delivery counters are absent: they belong to the subscription's
-    // queue, which outlives this transport.
     SubscriberCounters out;
     out.frames_received = frames_received_.load(std::memory_order_relaxed);
     out.frames_dropped_stale_epoch = dropped_stale_epoch_.load(std::memory_order_relaxed);
@@ -991,7 +955,6 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
 std::unique_ptr<SubscriberTransport> make_subscriber_transport(
     SubscriberConfig config, std::shared_ptr<DeliveryQueue> delivery)
 {
-    // Declared in `tango-bulk/unstable/subscriber_transport.h` and defined here, which is the
     // point of the seam: `BulkSubscriber` constructs a transport without naming
     // the concrete type, and therefore without compiling against `ucp/*`.
     return std::make_unique<SubscriberEngine>(std::move(config), std::move(delivery));

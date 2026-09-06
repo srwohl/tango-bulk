@@ -23,12 +23,6 @@
 /// This is Vyukov's bounded MPMC queue.  Each cell carries a sequence counter
 /// that says whose turn it is, so a producer and a consumer never contend on the
 /// same word, and a failed push or pop is a load and a compare rather than a
-/// lock.
-///
-/// MPMC is not surplus to requirements. `DeliveryQueue::push`'s `DropOldest`
-/// branch pops from the producer's thread, so the producer is a second consumer
-/// whenever the queue is full, and ADR 0008 permits competing SPMC readers on
-/// the pull side.
 namespace TangoBulk::detail
 {
 

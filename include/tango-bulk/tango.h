@@ -63,20 +63,8 @@ void install_bulk_commands(Tango::DeviceClass &device_class,
 void attach_publisher(Tango::DeviceImpl &device, BulkPublisher &publisher);
 void detach_publisher(Tango::DeviceImpl &device) noexcept;
 
-/// Open a Subscription that carries its coordination over Tango commands.
 ///
-/// `proxy` is BORROWED and MUST outlive the returned Subscription. It is called
-/// only from the control thread, never from the engine or dispatch thread, and
-/// never concurrently.
 ///
-/// `names` is here rather than in SubscriberConfig because SubscriberConfig is
-/// declared in <tango-bulk/subscriber.h>, which the UCX layer compiles against
-/// and which therefore cannot name a Tango-only concept. Passing it at open is
-/// also what removes the setter-before-start ordering it used to have: the
-/// names that opened a session are the names that renew and close it.
-///
-/// Throws BulkException if the configuration is invalid, or if the first open
-/// fails under a policy that reports rather than retries.
 std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
                                         SubscriberConfig config,
                                         SubscriptionCallbacks callbacks,
