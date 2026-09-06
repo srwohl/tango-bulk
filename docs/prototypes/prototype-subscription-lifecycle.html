@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prototype — Subscription lifecycle</title>
+  <style>
+    :root { font: 16px/1.5 system-ui, sans-serif; color: #172033; background: #f5f7fb; }
+    body { max-width: 1100px; margin: 0 auto; padding: 32px 20px 60px; }
+    h1, h2, h3 { line-height: 1.2; } h1 { margin: 8px 0; }
+    .prototype { color: #7c3aed; font-size: .78rem; font-weight: 800; letter-spacing: .12em; }
+    .question, section { background: white; border: 1px solid #dbe2ef; border-radius: 14px; padding: 20px; margin-top: 20px; }
+    .question { border-left: 5px solid #7c3aed; }
+    .state { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-top: 14px; }
+    .value { background: #f2f4f8; border-radius: 9px; padding: 11px 13px; }
+    .value b { display: block; font-size: .75rem; color: #68758b; text-transform: uppercase; letter-spacing: .05em; }
+    button { border: 1px solid #c5cee0; background: #fff; border-radius: 8px; padding: 9px 12px; margin: 4px; cursor: pointer; color: #172033; }
+    button:hover { border-color: #7c3aed; background: #faf7ff; }
+    .tabs button.active, .next { color: white; border-color: #7c3aed; background: #7c3aed; }
+    .buttons { margin: 10px -4px; }
+    .scenario-copy { color: #536176; max-width: 780px; }
+    pre { white-space: pre-wrap; background: #111827; color: #dbeafe; border-radius: 9px; padding: 14px; min-height: 80px; }
+    .result-ok { color: #047857; font-weight: 700; } .result-no { color: #b42318; font-weight: 700; }
+    .small { color: #68758b; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <span class="prototype">THROWAWAY LOGIC PROTOTYPE</span>
+  <h1>Can one Subscription own the whole subscriber lifecycle?</h1>
+  <p>This demo lets you drive establishment, Probe, delivery, reconnect, interruption, and close without assembling SessionClient, DeliveryQueue, or SubscriberEngine yourself.</p>
+  <div class="question"><b>Question being tested:</b> does a single Subscription state model make the awkward lifecycle cases obvious, while Transport and Coordination remain replaceable adapters?</div>
+
+  <section>
+    <h2>Current state</h2>
+    <div id="state" class="state"></div>
+    <p id="result"></p>
+    <pre id="log"></pre>
+  </section>
+
+  <section>
+    <h2>Free play</h2>
+    <p class="small">Every action is available. Try actions out of order to see which transitions are rejected.</p>
+    <div id="free-play" class="buttons"></div>
+    <button onclick="resetDemo()">Reset</button>
+  </section>
+
+  <section>
+    <h2>Guided walkthroughs</h2>
+    <div id="tabs" class="tabs buttons"></div>
+    <div id="scenario-copy" class="scenario-copy"></div>
+    <div id="scenario-steps" class="buttons"></div>
+  </section>
+
+  <script>
+    const Lifecycle = (() => {
+      const initial = () => ({
+        subscription: "Idle", session: "None", transport: "None", frames: 0,
+        terminal: "None", deadline: "Not running", lastResult: "Ready", events: []
+      });
+      const reject = (s, reason) => ({...s, lastResult: "Rejected: " + reason, events: [...s.events, "Rejected — " + reason]});
+      const reduce = (s, action) => {
+        let n = {...s, events: [...s.events]};
+        switch (action.type) {
+          case "start":
+            return s.subscription === "Idle" ? {...n, subscription: "Establishing", session: "Opening", transport: "None", deadline: "Running", lastResult: "Opening", events: [...n.events, "Subscription started"]} : reject(s, "a Subscription can start only from Idle");
+          case "grant":
+            return s.subscription === "Establishing" ? {...n, session: "Granted", transport: "Activating", lastResult: "Grant accepted", events: [...n.events, "Grant accepted; Transport activation begins"]} : reject(s, "Open must be in progress");
+          case "probe":
+            return s.subscription === "Establishing" && s.session === "Granted" ? {...n, subscription: "Active", transport: "Attached", deadline: "Not running", lastResult: "Active", events: [...n.events, "Probe answered; Subscription active"]} : reject(s, "Probe requires a granted Session");
+          case "frame":
+            return s.subscription === "Active" && s.transport === "Attached" ? {...n, frames: s.frames + 1, lastResult: "Frame delivered", events: [...n.events, "Frame delivered"]} : reject(s, "frames require an active Transport");
+          case "transport_lost":
+            return s.subscription === "Active" ? {...n, subscription: "Reconnecting", session: "Lost", transport: "Retired", deadline: "Running", lastResult: "Transient failure", events: [...n.events, "Transport retired; reconnect begins"]} : reject(s, "only an active Subscription can reconnect");
+          case "new_transport":
+            return s.subscription === "Reconnecting" ? {...n, session: "Granted", transport: "Activating", lastResult: "Fresh Transport attached", events: [...n.events, "Fresh Transport attached"]} : reject(s, "reconnect is not in progress");
+          case "reconnect_probe":
+            return s.subscription === "Reconnecting" && s.transport === "Activating" ? {...n, subscription: "Active", transport: "Attached", deadline: "Not running", lastResult: "Reconnected", events: [...n.events, "Probe answered on fresh Transport"]} : reject(s, "fresh Transport must be active before Probe");
+          case "interrupt":
+            return s.subscription !== "Closed" && s.subscription !== "Interrupted" ? {...n, subscription: "Interrupted", transport: "Stopped", terminal: "Interrupted (local, sticky)", deadline: "Not running", lastResult: "Interrupted locally", events: [...n.events, "Interrupted locally; no Close sent"]} : reject(s, "already interrupted or closed");
+          case "close":
+            return s.subscription !== "Closed" ? {...n, subscription: "Closed", session: "Closed", transport: "Stopped", terminal: "Closed", deadline: "Not running", lastResult: "Closed", events: [...n.events, "Subscription closed"]} : reject(s, "already closed");
+          case "deadline":
+            return s.subscription === "Establishing" || s.subscription === "Reconnecting" ? {...n, subscription: "Failed", session: "None", transport: "Stopped", terminal: "Establishment deadline", deadline: "Expired", lastResult: "Failed by deadline", events: [...n.events, "Absolute establishment deadline expired"]} : reject(s, "no establishment deadline is active");
+          default:
+            return reject(s, "unknown action");
+        }
+      };
+      return {initial, reduce};
+    })();
+
+    const actions = [
+      ["start", "Start Subscription"], ["grant", "Accept Grant"], ["probe", "Answer Probe"],
+      ["frame", "Deliver frame"], ["transport_lost", "Lose Transport"], ["new_transport", "Attach fresh Transport"],
+      ["reconnect_probe", "Answer reconnect Probe"], ["interrupt", "Interrupt locally"], ["close", "Close"], ["deadline", "Expire deadline"]
+    ];
+    const scenarios = {
+      happy: {title: "Happy path", copy: "Watch the lifecycle become active only after Open has produced a Grant and Probe has completed.", steps: [["start","Start"],["grant","Accept Grant"],["probe","Answer Probe"],["frame","Deliver frame"]]},
+      reconnect: {title: "Fresh Transport after loss", copy: "A transient Transport loss retires the old Transport, then a fresh one must pass Probe before delivery resumes.", steps: [["start","Start"],["grant","Accept Grant"],["probe","Answer Probe"],["transport_lost","Lose Transport"],["new_transport","Attach fresh Transport"],["reconnect_probe","Answer Probe"],["frame","Deliver frame"]]},
+      interrupt: {title: "Interrupt is not Close", copy: "Interrupt locally and then try to reopen. The model keeps interruption sticky and performs no Coordination.", steps: [["start","Start"],["grant","Accept Grant"],["interrupt","Interrupt"],["start","Try to restart"]]},
+      deadline: {title: "Deadline before Probe", copy: "Let establishment expire after a Grant but before Probe. The Subscription fails rather than becoming active.", steps: [["start","Start"],["grant","Accept Grant"],["deadline","Expire deadline"],["probe","Try Probe"]]}
+    };
+    let state = Lifecycle.initial(), scenarioName = "happy", scenarioIndex = 0;
+    function run(type) { state = Lifecycle.reduce(state, {type}); render(); }
+    function resetDemo() { state = Lifecycle.initial(); scenarioIndex = 0; render(); }
+    function render() {
+      const fields = [["Subscription",state.subscription],["Session",state.session],["Transport",state.transport],["Frames delivered",state.frames],["Terminal outcome",state.terminal],["Deadline",state.deadline]];
+      document.querySelector("#state").innerHTML = fields.map(x => "<div class=\"value\"><b>" + x[0] + "</b>" + x[1] + "</div>").join("");
+      const ok = !state.lastResult.startsWith("Rejected");
+      document.querySelector("#result").innerHTML = "<span class=\"" + (ok ? "result-ok" : "result-no") + "\">" + state.lastResult + "</span>";
+      document.querySelector("#log").textContent = state.events.length ? state.events.join("\n") : "No actions yet.";
+      document.querySelector("#free-play").innerHTML = actions.map(a => "<button onclick=\"run('" + a[0] + "')\">" + a[1] + "</button>").join("");
+      renderScenario();
+    }
+    function chooseScenario(name) { scenarioName = name; scenarioIndex = 0; state = Lifecycle.initial(); render(); }
+    function renderScenario() {
+      document.querySelector("#tabs").innerHTML = Object.entries(scenarios).map(([key, s]) => "<button class=\"" + (key === scenarioName ? "active" : "") + "\" onclick=\"chooseScenario('" + key + "')\">" + s.title + "</button>").join("");
+      const s = scenarios[scenarioName];
+      document.querySelector("#scenario-copy").innerHTML = "<p>" + s.copy + "</p><p class=\"small\">Step " + Math.min(scenarioIndex + 1, s.steps.length) + " of " + s.steps.length + ".</p>";
+      document.querySelector("#scenario-steps").innerHTML = s.steps.map((step, i) => "<button class=\"" + (i === scenarioIndex ? "next" : "") + "\" onclick=\"scenarioStep(" + i + ")\">" + step[1] + "</button>").join("");
+    }
+    function scenarioStep(i) {
+      const s = scenarios[scenarioName];
+      if (i !== scenarioIndex) return;
+      run(s.steps[i][0]);
+      scenarioIndex = Math.min(scenarioIndex + 1, s.steps.length);
+      renderScenario();
+    }
+    render();
+  </script>
+</body>
+</html>

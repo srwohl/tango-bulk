@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prototype — Receive planning</title>
+  <style>
+    :root { font: 16px/1.5 system-ui, sans-serif; color: #172033; background: #f5f7fb; }
+    body { max-width: 1100px; margin: 0 auto; padding: 32px 20px 60px; }
+    h1, h2, h3 { line-height: 1.2; } h1 { margin: 8px 0; }
+    .prototype { color: #0369a1; font-size: .78rem; font-weight: 800; letter-spacing: .12em; }
+    .question, section { background: white; border: 1px solid #dbe2ef; border-radius: 14px; padding: 20px; margin-top: 20px; }
+    .question { border-left: 5px solid #0369a1; }
+    .state { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin-top: 14px; }
+    .value { background: #f2f4f8; border-radius: 9px; padding: 11px 13px; }
+    .value b { display: block; font-size: .75rem; color: #68758b; text-transform: uppercase; letter-spacing: .05em; }
+    button { border: 1px solid #c5cee0; background: #fff; border-radius: 8px; padding: 9px 12px; margin: 4px; cursor: pointer; color: #172033; }
+    button:hover { border-color: #0369a1; background: #f0f9ff; }
+    .tabs button.active, .next { color: white; border-color: #0369a1; background: #0369a1; }
+    .buttons { margin: 10px -4px; } .scenario-copy { color: #536176; max-width: 780px; }
+    pre { white-space: pre-wrap; background: #111827; color: #dbeafe; border-radius: 9px; padding: 14px; min-height: 80px; }
+    .result-ok { color: #047857; font-weight: 700; } .result-no { color: #b42318; font-weight: 700; }
+    .small { color: #68758b; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <span class="prototype">THROWAWAY LOGIC PROTOTYPE</span>
+  <h1>Can one receive plan own sizing and Pinned memory?</h1>
+  <p>This demo lets you prepare receive storage, accept a lower Grant, reject an oversized Grant, and retain Borrowed frames across reconnect.</p>
+  <div class="question"><b>Question being tested:</b> can callers provide intent or one complete upper plan while one module owns sizing, reservation, Grant validation, and retained-storage accounting?</div>
+  <section>
+    <h2>Current state</h2>
+    <div id="state" class="state"></div><p id="result"></p><pre id="log"></pre>
+  </section>
+  <section>
+    <h2>Free play</h2>
+    <p class="small">The numbers are deliberately small: frame bytes × ring depth is the planned registered capacity.</p>
+    <div id="free-play" class="buttons"></div><button onclick="resetDemo()">Reset</button>
+  </section>
+  <section>
+    <h2>Guided walkthroughs</h2>
+    <div id="tabs" class="tabs buttons"></div><div id="scenario-copy" class="scenario-copy"></div><div id="scenario-steps" class="buttons"></div>
+  </section>
+  <script>
+    const Planner = (() => {
+      const initial = () => ({
+        phase: "Unprepared", budget: 100, ledger: 0, frameBytes: 20, depth: 5, credit: 3,
+        planned: 0, reserved: 0, grant: "None", actual: "None", retained: 0, lastResult: "Ready", events: []
+      });
+      const reject = (s, reason) => ({...s, lastResult: "Rejected: " + reason, events: [...s.events, "Rejected — " + reason]});
+      const reduce = (s, action) => {
+        const n = {...s, events: [...s.events]};
+        if (action.type === "prepare") {
+          const bytes = s.frameBytes * s.depth;
+          return bytes > s.budget ? reject(s, "planned registered bytes exceed Pinned budget") : {...n, phase: "Prepared", planned: bytes, reserved: bytes, ledger: s.ledger + bytes, lastResult: "Storage prepared", events: [...n.events, "Prepared " + bytes + " registered bytes"]};
+        }
+        if (action.type === "prepare_large") {
+          const bytes = 30 * 4;
+          return bytes > s.budget ? reject({...s, frameBytes: 30, depth: 4}, "planned registered bytes exceed Pinned budget") : {...n, frameBytes: 30, depth: 4, planned: bytes, reserved: bytes, ledger: s.ledger + bytes, phase: "Prepared", lastResult: "Storage prepared", events: [...n.events, "Prepared large plan"]};
+        }
+        if (action.type === "grant_lower") {
+          return s.phase === "Prepared" ? {...n, phase: "Active", grant: "40 bytes / depth 4 / credit 2", actual: "40 bytes / depth 4 / credit 2", credit: 2, lastResult: "Lower Grant accepted", events: [...n.events, "Publisher Grant clamped downward"]} : reject(s, "prepare storage before accepting a Grant");
+        }
+        if (action.type === "grant_large") {
+          return s.phase === "Prepared" ? reject(s, "Grant exceeds prepared upper plan") : reject(s, "prepare storage before accepting a Grant");
+        }
+        if (action.type === "retain") {
+          return s.phase === "Active" ? {...n, retained: s.retained + 1, lastResult: "Borrowed frame retained", events: [...n.events, "Borrowed frame retains one receive slot"]} : reject(s, "retain requires an active plan");
+        }
+        if (action.type === "release") {
+          return s.retained > 0 ? {...n, retained: s.retained - 1, lastResult: "Borrowed frame released", events: [...n.events, "Receive slot can be reused"]} : reject(s, "no Borrowed frame is retained");
+        }
+        if (action.type === "reconnect") {
+          return s.phase === "Active" && s.retained > 0 ? reject(s, "reconnect needs another receive region while a Borrowed frame is retained") : s.phase === "Active" ? {...n, phase: "Prepared", lastResult: "Prepared storage reused", events: [...n.events, "Reconnect reused available storage"]} : reject(s, "reconnect requires an active plan");
+        }
+        if (action.type === "release_plan") {
+          return s.reserved > 0 ? {...n, ledger: s.ledger - s.reserved, reserved: 0, phase: "Released", lastResult: "Reservation released", events: [...n.events, "Pinned reservation released"]} : reject(s, "no reservation is held");
+        }
+        return reject(s, "unknown action");
+      };
+      return {initial, reduce};
+    })();
+    const actions = [["prepare","Prepare standard plan"],["prepare_large","Prepare oversized plan"],["grant_lower","Accept lower Grant"],["grant_large","Try oversized Grant"],["retain","Retain Borrowed frame"],["release","Release Borrowed frame"],["reconnect","Reconnect"],["release_plan","Release reservation"]];
+    const scenarios = {
+      safe: {title:"Prepare and clamp", copy:"Prepare a plan within budget, then accept a lower Grant without recalculating storage in the caller.", steps:[["prepare","Prepare"],["grant_lower","Accept lower Grant"]]},
+      reject: {title:"Oversized Grant", copy:"A Grant larger than prepared storage is rejected rather than silently accepted.", steps:[["prepare","Prepare"],["grant_large","Try oversized Grant"]]},
+      retained: {title:"Retained frame on reconnect", copy:"A retained Borrowed frame keeps its receive storage charged, so reconnect cannot reuse it unsafely.", steps:[["prepare","Prepare"],["grant_lower","Activate"],["retain","Retain frame"],["reconnect","Reconnect"]]},
+      release: {title:"Release restores budget", copy:"After the last Borrowed view is released, the reservation can be released.", steps:[["prepare","Prepare"],["grant_lower","Activate"],["retain","Retain frame"],["release","Release frame"],["release_plan","Release reservation"]]}
+    };
+    let state = Planner.initial(), scenarioName = "safe", scenarioIndex = 0;
+    function run(type) { state = Planner.reduce(state, {type}); render(); } function resetDemo(){state=Planner.initial();scenarioIndex=0;render();}
+    function render(){const f=[["Phase",state.phase],["Pinned budget",state.budget+" bytes"],["Ledger used",state.ledger+" bytes"],["Planned bytes",state.planned],["Reserved bytes",state.reserved],["Grant",state.grant],["Actual plan",state.actual],["Retained Borrowed frames",state.retained],["Frame × depth",state.frameBytes+" × "+state.depth],["Credit",state.credit]];document.querySelector("#state").innerHTML=f.map(x=>"<div class=\"value\"><b>"+x[0]+"</b>"+x[1]+"</div>").join("");const ok=!state.lastResult.startsWith("Rejected");document.querySelector("#result").innerHTML="<span class=\""+(ok?"result-ok":"result-no")+"\">"+state.lastResult+"</span>";document.querySelector("#log").textContent=state.events.length?state.events.join("\n"):"No actions yet.";document.querySelector("#free-play").innerHTML=actions.map(a=>"<button onclick=\"run('"+a[0]+"')\">"+a[1]+"</button>").join("");renderScenario();}
+    function chooseScenario(k){scenarioName=k;scenarioIndex=0;state=Planner.initial();render();}
+    function renderScenario(){document.querySelector("#tabs").innerHTML=Object.entries(scenarios).map(([k,s])=>"<button class=\""+(k===scenarioName?"active":"")+"\" onclick=\"chooseScenario('"+k+"')\">"+s.title+"</button>").join("");const s=scenarios[scenarioName];document.querySelector("#scenario-copy").innerHTML="<p>"+s.copy+"</p><p class=\"small\">Step "+Math.min(scenarioIndex+1,s.steps.length)+" of "+s.steps.length+".</p>";document.querySelector("#scenario-steps").innerHTML=s.steps.map((x,i)=>"<button class=\""+(i===scenarioIndex?"next":"")+"\" onclick=\"scenarioStep("+i+")\">"+x[1]+"</button>").join("");}
+    function scenarioStep(i){const s=scenarios[scenarioName];if(i!==scenarioIndex)return;run(s.steps[i][0]);scenarioIndex=Math.min(scenarioIndex+1,s.steps.length);renderScenario();} render();
+  </script>
+</body>
+</html>

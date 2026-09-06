@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prototype — BulkQuery removal</title>
+  <style>
+    :root { font: 16px/1.5 system-ui, sans-serif; color: #172033; background: #f5f7fb; }
+    body { max-width: 1100px; margin: 0 auto; padding: 32px 20px 60px; }
+    h1, h2, h3 { line-height: 1.2; } h1 { margin: 8px 0; }
+    .prototype { color: #be123c; font-size: .78rem; font-weight: 800; letter-spacing: .12em; }
+    .question, section { background: white; border: 1px solid #dbe2ef; border-radius: 14px; padding: 20px; margin-top: 20px; }
+    .question { border-left: 5px solid #be123c; }
+    .state { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin-top: 14px; }
+    .value { background: #f2f4f8; border-radius: 9px; padding: 11px 13px; }
+    .value b { display: block; font-size: .75rem; color: #68758b; text-transform: uppercase; letter-spacing: .05em; }
+    button { border: 1px solid #c5cee0; background: #fff; border-radius: 8px; padding: 9px 12px; margin: 4px; cursor: pointer; color: #172033; }
+    button:hover { border-color: #be123c; background: #fff1f2; }
+    .tabs button.active, .next { color: white; border-color: #be123c; background: #be123c; }
+    .buttons { margin: 10px -4px; } .scenario-copy { color: #536176; max-width: 780px; }
+    pre { white-space: pre-wrap; background: #111827; color: #dbeafe; border-radius: 9px; padding: 14px; min-height: 80px; }
+    .result-ok { color: #047857; font-weight: 700; } .result-no { color: #b42318; font-weight: 700; }
+    .small { color: #68758b; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <span class="prototype">THROWAWAY LOGIC PROTOTYPE</span>
+  <h1>Can BulkQuery disappear without losing useful observation?</h1>
+  <p>This demo separates subscriber establishment from Publisher observation and lets you compare the old query-first path with discovery plus Open.</p>
+  <div class="question"><b>Question being tested:</b> can Subscription own client Geometry and ReceivePlan while owner-built Publisher observation serves operators, leaving BulkQuery removable?</div>
+  <section><h2>Current state</h2><div id="state" class="state"></div><p id="result"></p><pre id="log"></pre></section>
+  <section><h2>Free play</h2><p class="small">Try opening with no discovery, with stale discovery, and after retiring the compatibility query.</p><div id="free-play" class="buttons"></div><button onclick="resetDemo()">Reset</button></section>
+  <section><h2>Guided walkthroughs</h2><div id="tabs" class="tabs buttons"></div><div id="scenario-copy" class="scenario-copy"></div><div id="scenario-steps" class="buttons"></div></section>
+  <script>
+    const Observation = (() => {
+      const initial=()=>({query:"Available",discovery:"None",subscription:"Not open",clientGeometry:"None",receivePlan:"None",publisherSnapshot:"Not read",correlation:0,lastResult:"Ready",events:[]});
+      const reject=(s,r)=>({...s,lastResult:"Rejected: "+r,events:[...s.events,"Rejected — "+r]});
+      const reduce=(s,a)=>{
+        const n={...s,events:[...s.events]};
+        if(a.type==="query") return s.query==="Removed"?reject(s,"BulkQuery has been retired"):({...n,query:"Used",clientGeometry:"Query geometry",receivePlan:"Caller reconstructed sizing",correlation:s.correlation+1,lastResult:"Query returned duplicate state",events:[...n.events,"BulkQuery returned Publisher projection"]});
+        if(a.type==="discover") return {...n,discovery:"Safe upper bound",lastResult:"Safe discovery available",events:[...n.events,"Discovery supplied a safe pre-Open upper bound"]};
+        if(a.type==="stale") return {...n,discovery:"Stale upper bound",lastResult:"Stale discovery available",events:[...n.events,"Discovery is conservative and stale"]};
+        if(a.type==="open") {
+          if(s.subscription==="Open") return reject(s,"Subscription is already open");
+          if(s.discovery==="None" && s.query==="Available") return reject(s,"no safe pre-Open sizing information");
+          return {...n,subscription:"Open",clientGeometry:"OpenReply Geometry",receivePlan:"OpenReply actual ReceivePlan",correlation:s.correlation+1,lastResult:"Subscription established",events:[...n.events,"OpenReply became authoritative; query was not needed"]};
+        }
+        if(a.type==="operator") return {...n,publisherSnapshot:"Owner-built snapshot copied",lastResult:"Operator observation read",events:[...n.events,"Operator read Publisher snapshot without subscriber establishment"]};
+        if(a.type==="retire") return {...n,query:"Removed",lastResult:"BulkQuery retired",events:[...n.events,"Query command and client result marked for deletion"]};
+        if(a.type==="wrong") return reject(s,"reply correlation did not match request");
+        return reject(s,"unknown action");
+      };
+      return {initial,reduce};
+    })();
+    const actions=[["query","Use BulkQuery"],["discover","Read safe discovery"],["stale","Read stale discovery"],["open","Open Subscription"],["operator","Read Publisher snapshot"],["retire","Retire BulkQuery"],["wrong","Simulate correlation mismatch"]];
+    const scenarios={
+      old:{title:"Old query-first path",copy:"The old path creates a second client state model and makes the caller reconstruct receive sizing.",steps:[["query","Query"],["open","Open after query"]]},
+      safe:{title:"Discovery plus Open",copy:"Safe discovery supplies pre-Open information, while OpenReply remains authoritative for the actual Grant and ReceivePlan.",steps:[["discover","Discover"],["open","Open"]]},
+      stale:{title:"Stale discovery",copy:"A conservative discovery value is allowed, but the actual OpenReply still becomes the Subscription’s truth.",steps:[["stale","Discover stale value"],["open","Open"]]},
+      operator:{title:"Operator observation stays separate",copy:"Publisher observation can be read independently; it does not participate in subscriber admission or receive sizing.",steps:[["retire","Retire Query"],["operator","Read snapshot"]]}
+    };
+    let state=Observation.initial(),scenarioName="old",scenarioIndex=0;
+    function run(t){state=Observation.reduce(state,{type:t});render();} function resetDemo(){state=Observation.initial();scenarioIndex=0;render();}
+    function render(){const f=[["Query",state.query],["Discovery",state.discovery],["Subscription",state.subscription],["Client Geometry",state.clientGeometry],["Receive plan",state.receivePlan],["Publisher snapshot",state.publisherSnapshot],["Next correlation",state.correlation+1]];document.querySelector("#state").innerHTML=f.map(x=>"<div class=\"value\"><b>"+x[0]+"</b>"+x[1]+"</div>").join("");const ok=!state.lastResult.startsWith("Rejected");document.querySelector("#result").innerHTML="<span class=\""+(ok?"result-ok":"result-no")+"\">"+state.lastResult+"</span>";document.querySelector("#log").textContent=state.events.length?state.events.join("\n"):"No actions yet.";document.querySelector("#free-play").innerHTML=actions.map(x=>"<button onclick=\"run('"+x[0]+"')\">"+x[1]+"</button>").join("");renderScenario();}
+    function chooseScenario(k){scenarioName=k;scenarioIndex=0;state=Observation.initial();render();}
+    function renderScenario(){document.querySelector("#tabs").innerHTML=Object.entries(scenarios).map(([k,s])=>"<button class=\""+(k===scenarioName?"active":"")+"\" onclick=\"chooseScenario('"+k+"')\">"+s.title+"</button>").join("");const s=scenarios[scenarioName];document.querySelector("#scenario-copy").innerHTML="<p>"+s.copy+"</p><p class=\"small\">Step "+Math.min(scenarioIndex+1,s.steps.length)+" of "+s.steps.length+".</p>";document.querySelector("#scenario-steps").innerHTML=s.steps.map((x,i)=>"<button class=\""+(i===scenarioIndex?"next":"")+"\" onclick=\"scenarioStep("+i+")\">"+x[1]+"</button>").join("");}
+    function scenarioStep(i){const s=scenarios[scenarioName];if(i!==scenarioIndex)return;run(s.steps[i][0]);scenarioIndex=Math.min(scenarioIndex+1,s.steps.length);renderScenario();} render();
+  </script>
+</body>
+</html>
