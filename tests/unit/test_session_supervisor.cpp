@@ -868,4 +868,85 @@ TEST_CASE("frames the retired session left behind are discarded, not delivered l
     CHECK(seen.sequences.front() == 2);
 }
 
+// -- the coordination plane, on the wire -------------------------------------
+//
+// The fake channel answers with encoded protocol messages and the fake
+// transport adopts them through the same SessionClient the engine uses, so
+// these reach the encoder, the envelope, the decoder and the grant validation.
+// None of that was reachable from a unit test while the channel answered one
+// byte and the transport consulted a flag.
+
+TEST_CASE("a refusal sent as an Error message is adopted like any other",
+          "[core][supervisor]")
+{
+    // A client MUST accept `Error` in place of any expected reply. It is a
+    // different path through the decoder than a reply carrying a non-Ok status,
+    // and until the channel spoke protocol there was no way to take it.
+    Script script;
+    script.refuse_with_error_message = true;
+    script.open_results = {Status::NotAuthorized};
+
+    SubscriberConfig config = supervisor_config();
+    config.reconnect_policy = ReconnectPolicy::FailFast;
+
+    try
+    {
+        detail::SessionSupervisor::open(
+            config, fake_channel(script), fake_factory(script), noop_callbacks());
+        FAIL("the open should have been refused");
+    }
+    catch(const BulkException &e)
+    {
+        CHECK(e.error().status == Status::NotAuthorized);
+    }
+
+    // Refused, and nothing left behind: no session, and the Close that would
+    // follow a successful open never went out.
+    CHECK(script.opens.load() == 1);
+    CHECK(script.closes.load() == 0);
+}
+
+TEST_CASE("a reply that does not decode is a refusal, not a crash",
+          "[core][supervisor]")
+{
+    // A peer that is not this library, an older version, or a transport that
+    // truncated. The bytes have to be treated as data rather than trusted, and
+    // the only way to test that from here is to send bad ones.
+    Script script;
+    script.garble_replies = 1;
+
+    SubscriberConfig config = supervisor_config();
+    config.reconnect_policy = ReconnectPolicy::FailFast;
+
+    try
+    {
+        detail::SessionSupervisor::open(
+            config, fake_channel(script), fake_factory(script), noop_callbacks());
+        FAIL("an undecodable reply should have been refused");
+    }
+    catch(const BulkException &e)
+    {
+        CHECK(e.error().status == Status::MalformedMessage);
+    }
+}
+
+TEST_CASE("the lease terms the publisher granted are what the renew timer uses",
+          "[core][supervisor]")
+{
+    // 3.7 lets the server set the terms and requires the client to adopt them.
+    // They now travel as encoded fields rather than as a constant compiled into
+    // the fake, so this asserts the adoption rather than the constant.
+    Script script;
+    script.renew_interval_ms = 15;
+    script.lease_ttl_ms = 150;
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+
+    // Several renewals inside a window that only the granted 15 ms interval
+    // fits into; the 1 s fallback for an unstated interval would manage one.
+    REQUIRE(eventually([&script] { return script.renews.load() >= 3; },
+                       std::chrono::milliseconds{800}));
+}
+
 } // namespace

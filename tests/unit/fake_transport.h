@@ -6,6 +6,7 @@
 #define TANGO_BULK_TESTS_UNIT_FAKE_TRANSPORT_H
 
 #include <core/delivery_queue.h>
+#include <core/session_client.h>
 
 #include <tango-bulk/unstable/session_supervisor.h>
 
@@ -79,6 +80,26 @@ struct Script
     /// does. Counted down; zero means "answer normally".
     int channel_throws{0};
 
+    /// Send a refusal as an `Error` message rather than as a reply carrying a
+    /// non-Ok status.
+    ///
+    /// Both are legal -- a client must accept `Error` in place of any expected
+    /// reply -- and they take different paths through the decoder, so which one
+    /// a test provokes is a thing to choose rather than to inherit.
+    bool refuse_with_error_message{false};
+
+    /// Return bytes that decode as nothing, as a peer that is not this library
+    /// -- or a truncating transport -- would. Counted down.
+    int garble_replies{0};
+
+    /// What the grant says. The identifiers and lease terms a real publisher
+    /// would mint, fixed here so a test can assert on them.
+    Protocol::SessionId session_id{{std::byte{0xA1}, std::byte{0xB2}, std::byte{0xC3}}};
+    Protocol::StreamId stream_id{0x5EED};
+    std::uint32_t lease_ttl_ms{200};
+    std::uint32_t renew_interval_ms{20};
+    std::vector<std::byte> server_address{std::byte{9}, std::byte{8}, std::byte{7}};
+
     std::atomic<int> transports_built{0};
     std::atomic<int> opens{0};
     std::atomic<int> renews{0};
@@ -92,30 +113,6 @@ struct Script
     std::set<std::thread::id> channel_threads;
     std::atomic<int> channel_inside{0};
     std::atomic<int> channel_max_concurrent{0};
-
-    Status next_open()
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        if(open_results.empty())
-        {
-            return Status::Ok;
-        }
-        const Status status = open_results.front();
-        open_results.pop_front();
-        return status;
-    }
-
-    Status next_renew()
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        if(renew_results.empty())
-        {
-            return Status::Ok;
-        }
-        const Status status = renew_results.front();
-        renew_results.pop_front();
-        return status;
-    }
 
     /// Queue one renewal outcome on a supervisor that is already running.
     ///
@@ -135,16 +132,120 @@ struct Script
         return probe_arrives;
     }
 
-    /// True from the second grant onward, once reshape_after_first is set.
-    bool reshaped()
+    int grants_made{0};
+
+    // -- the coordination plane, answered on the wire ------------------------
+
+    /// The `OpenReply` the publisher sends, encoded.
+    ///
+    /// Real protocol bytes rather than a sentinel, so that everything between
+    /// the request and the adopted grant -- the encoder, the envelope, the
+    /// decoder, the geometry validation, the downward-clamp check -- is on the
+    /// path a unit test exercises. None of it was, while this returned one byte
+    /// and the transport consulted a flag.
+    std::vector<std::byte> open_reply(std::uint64_t correlation_id)
     {
         std::lock_guard<std::mutex> lock(mutex);
-        const bool answer = reshape_after_first && grants_made > 0;
-        ++grants_made;
-        return answer;
+
+        if(garble_replies > 0)
+        {
+            --garble_replies;
+            return {std::byte{0xDE}, std::byte{0xAD}};
+        }
+
+        const Status status = next_status(open_results);
+        if(status != Status::Ok && refuse_with_error_message)
+        {
+            Protocol::ErrorMessage error;
+            error.status = status;
+            error.message = "the fake refused the open";
+            return Protocol::encode(error, correlation_id);
+        }
+
+        Protocol::OpenReply reply;
+        reply.status = status;
+        reply.session_id = session_id;
+        reply.stream_id = stream_id;
+        reply.lease_ttl_ms = lease_ttl_ms;
+        reply.renew_interval_ms = renew_interval_ms;
+        reply.geometry = grant_locked();
+        reply.server_ucx_address = server_address;
+        return Protocol::encode(reply, correlation_id);
     }
 
-    int grants_made{0};
+    std::vector<std::byte> renew_reply(std::uint64_t correlation_id)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        const Status status = next_status(renew_results);
+        if(status != Status::Ok && refuse_with_error_message)
+        {
+            Protocol::ErrorMessage error;
+            error.status = status;
+            error.message = "the fake refused the renewal";
+            return Protocol::encode(error, correlation_id);
+        }
+
+        Protocol::RenewReply reply;
+        reply.session_id = session_id;
+        reply.status = status;
+
+        // 3.7 lets the server change either term at any renewal. Repeating the
+        // current ones is what an unchanged lease looks like on the wire, and
+        // sending zeros instead would silently reset the client's renew timer
+        // to its fallback.
+        reply.lease_ttl_ms = lease_ttl_ms;
+        reply.renew_interval_ms = renew_interval_ms;
+        reply.geometry = last_grant;
+        return Protocol::encode(reply, correlation_id);
+    }
+
+    std::vector<std::byte> close_reply(std::uint64_t correlation_id)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        Protocol::CloseReply reply;
+        reply.session_id = session_id;
+        reply.status = Status::Ok;
+        return Protocol::encode(reply, correlation_id);
+    }
+
+    /// The grant, reshaped from the second one onward if asked.
+    Protocol::GeometryBlock grant_locked()
+    {
+        const bool reshaped = reshape_after_first && grants_made > 0;
+        ++grants_made;
+
+        Protocol::GeometryBlock granted;
+        granted.generation = 1;
+        granted.element_type = ElementType::UInt16;
+        granted.element_size = 2;
+        granted.rank = 2;
+        granted.max_frame_bytes = 64u << 10;
+        granted.ring_depth = 4;
+        granted.credit_window = 2;
+        granted.shape = reshaped ? std::array<std::uint64_t, k_max_rank>{4, 16, 0, 0}
+                                 : std::array<std::uint64_t, k_max_rank>{8, 8, 0, 0};
+        granted.strides = reshaped ? std::array<std::uint64_t, k_max_rank>{32, 2, 0, 0}
+                                   : std::array<std::uint64_t, k_max_rank>{16, 2, 0, 0};
+
+        last_grant = granted;
+        return granted;
+    }
+
+    /// The grant as it stands, so a renewal can echo the current epoch.
+    Protocol::GeometryBlock last_grant{};
+
+    static Status next_status(std::deque<Status> &scripted)
+    {
+        if(scripted.empty())
+        {
+            return Status::Ok;
+        }
+        const Status status = scripted.front();
+        scripted.pop_front();
+        return status;
+    }
 
     // -- the data path -------------------------------------------------------
 
@@ -226,21 +327,32 @@ class FakeTransport final : public detail::SubscriberTransport
     /// There is no `poll()` here any more, and that is the point: a transport
     /// is given somewhere to put frames rather than asked for them, so nothing
     /// above has to hold it alive across an application callback.
-    FakeTransport(Script &script, std::shared_ptr<detail::DeliveryQueue> delivery) :
-        script_(script)
+    FakeTransport(Script &script,
+                  SubscriberConfig config,
+                  std::shared_ptr<detail::DeliveryQueue> delivery) :
+        script_(script),
+        config_(std::move(config))
     {
         script_.transports_built.fetch_add(1, std::memory_order_relaxed);
         script_.attach(std::move(delivery));
     }
 
-    std::vector<std::byte> make_open_request(std::uint64_t) const override
+    // -- the session contract, through the same module the engine uses --------
+    //
+    // `SessionClient` rather than a hand-written stand-in, deliberately. A fake
+    // that adopts a grant by consulting a flag proves nothing about adopting a
+    // grant; this one runs the real encoder, the real decoder and the real
+    // validation, so the supervisor tests exercise the whole coordination path
+    // and not merely the control loop's shape around it.
+
+    std::vector<std::byte> make_open_request(std::uint64_t correlation_id) const override
     {
-        return {std::byte{1}};
+        return session_.make_open_request(config_, k_client_address, correlation_id);
     }
 
-    Status adopt_open_reply(const std::byte *, std::size_t) override
+    Status adopt_open_reply(const std::byte *data, std::size_t size) override
     {
-        const Status status = script_.next_open();
+        const Status status = session_.adopt_open_reply(data, size, config_);
         if(status != Status::Ok)
         {
             return status;
@@ -250,49 +362,33 @@ class FakeTransport final : public detail::SubscriberTransport
         // This is the knob a real one does not have.
         state_.store(script_.probes() ? SubscriberState::Active : SubscriberState::Probing,
                      std::memory_order_release);
-
-        const bool reshaped = script_.reshaped();
-
-        granted_ = Protocol::GeometryBlock{};
-        granted_.generation = 1;
-        granted_.element_type = ElementType::UInt16;
-        granted_.element_size = 2;
-        granted_.rank = 2;
-        granted_.max_frame_bytes = 64u << 10;
-        granted_.ring_depth = 4;
-        granted_.credit_window = 2;
-        granted_.shape = reshaped ? std::array<std::uint64_t, k_max_rank>{4, 16, 0, 0}
-                                  : std::array<std::uint64_t, k_max_rank>{8, 8, 0, 0};
-        granted_.strides = reshaped ? std::array<std::uint64_t, k_max_rank>{32, 2, 0, 0}
-                                    : std::array<std::uint64_t, k_max_rank>{16, 2, 0, 0};
-
-        generation_ = 1;
         return Status::Ok;
     }
 
-    std::vector<std::byte> make_renew_request(std::uint64_t) override
+    std::vector<std::byte> make_renew_request(std::uint64_t correlation_id) override
     {
-        return {std::byte{3}};
+        return session_.make_renew_request(
+            correlation_id, 0, 0, static_cast<std::uint32_t>(state()));
     }
 
-    Status adopt_renew_reply(const std::byte *, std::size_t) override
+    Status adopt_renew_reply(const std::byte *data, std::size_t size) override
     {
-        return script_.next_renew();
+        return session_.adopt_renew_reply(data, size).status;
     }
 
-    std::vector<std::byte> make_close_request(std::uint64_t) const override
+    std::vector<std::byte> make_close_request(std::uint64_t correlation_id) const override
     {
-        return {std::byte{5}};
+        return session_.make_close_request(correlation_id);
     }
 
     std::uint32_t lease_ttl_ms() const noexcept override
     {
-        return 200;
+        return session_.lease_ttl_ms();
     }
 
     std::uint32_t renew_interval_ms() const noexcept override
     {
-        return 20;
+        return session_.renew_interval_ms();
     }
 
     BulkError last_error() const noexcept override
@@ -303,7 +399,7 @@ class FakeTransport final : public detail::SubscriberTransport
 
     Protocol::GeometryBlock granted_geometry() const noexcept override
     {
-        return granted_;
+        return session_.granted_geometry();
     }
 
     SubscriberState state() const noexcept override
@@ -313,7 +409,7 @@ class FakeTransport final : public detail::SubscriberTransport
 
     std::uint32_t generation() const noexcept override
     {
-        return generation_;
+        return session_.generation();
     }
 
     SubscriberCounters counters() const noexcept override
@@ -330,10 +426,16 @@ class FakeTransport final : public detail::SubscriberTransport
     }
 
   private:
+    /// This client's own UCX address, as far as the coordination plane is
+    /// concerned: an opaque blob that goes out in `Open` and comes back to
+    /// nobody. There is no data path here to give it meaning.
+    static inline const std::vector<std::byte> k_client_address{
+        std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+
     Script &script_;
+    SubscriberConfig config_;
+    detail::SessionClient session_;
     std::atomic<SubscriberState> state_{SubscriberState::Opening};
-    std::uint32_t generation_{0};
-    Protocol::GeometryBlock granted_{};
     std::atomic<bool> failed_{false};
 };
 
@@ -342,11 +444,11 @@ class FakeTransport final : public detail::SubscriberTransport
 inline detail::TransportFactory fake_factory(Script &script,
                                              std::shared_ptr<FakeTransport *> latest = nullptr)
 {
-    return [&script, latest](const SubscriberConfig &,
+    return [&script, latest](const SubscriberConfig &config,
                              std::shared_ptr<detail::DeliveryQueue> delivery)
         -> std::unique_ptr<detail::SubscriberTransport>
     {
-        auto transport = std::make_unique<FakeTransport>(script, std::move(delivery));
+        auto transport = std::make_unique<FakeTransport>(script, config, std::move(delivery));
         if(latest)
         {
             *latest = transport.get();
@@ -358,7 +460,7 @@ inline detail::TransportFactory fake_factory(Script &script,
 inline detail::CoordinationChannel fake_channel(Script &script)
 {
     return [&script](Protocol::CoordType kind,
-                     const std::vector<std::byte> &) -> std::vector<std::byte>
+                     const std::vector<std::byte> &request) -> std::vector<std::byte>
     {
         const int inside = script.channel_inside.fetch_add(1, std::memory_order_acq_rel) + 1;
         int observed = script.channel_max_concurrent.load(std::memory_order_relaxed);
@@ -390,22 +492,37 @@ inline detail::CoordinationChannel fake_channel(Script &script)
         // Wide enough that an overlapping caller would be caught.
         std::this_thread::sleep_for(std::chrono::microseconds{200});
 
+        // The request is decoded rather than ignored, and the reply is encoded
+        // rather than invented. A device carries opaque bytes and answers with
+        // opaque bytes; a channel that answered `{0}` to anything could not tell
+        // a correlated reply from an uncorrelated one, and never had to produce
+        // a grant that survived validation.
+        Protocol::Envelope envelope;
+        if(Protocol::decode_envelope(request.data(), request.size(), envelope) != Status::Ok)
+        {
+            throw BulkException(BulkError{
+                Status::MalformedMessage, "the client sent something undecodable", "tango"});
+        }
+
         switch(kind)
         {
         case Protocol::CoordType::Open:
             script.opens.fetch_add(1, std::memory_order_relaxed);
-            break;
+            return script.open_reply(envelope.correlation_id);
         case Protocol::CoordType::Renew:
             script.renews.fetch_add(1, std::memory_order_relaxed);
-            break;
+            return script.renew_reply(envelope.correlation_id);
         case Protocol::CoordType::Close:
             script.closes.fetch_add(1, std::memory_order_relaxed);
-            break;
+            return script.close_reply(envelope.correlation_id);
         default:
             break;
         }
 
-        return {std::byte{0}};
+        Protocol::ErrorMessage unexpected;
+        unexpected.status = Status::Internal;
+        unexpected.message = "the fake was asked for a message it does not serve";
+        return Protocol::encode(unexpected, envelope.correlation_id);
     };
 }
 
