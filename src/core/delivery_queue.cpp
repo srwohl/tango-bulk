@@ -69,6 +69,24 @@ bool DeliveryQueue::push(FrameView frame) noexcept
     return false;
 }
 
+std::size_t DeliveryQueue::discard() noexcept
+{
+    std::size_t dropped = 0;
+
+    FrameView frame;
+    while(queue_.try_pop(frame))
+    {
+        // Destroying the view returns its credit to whichever session delivered
+        // it, which is the right destination even when that session is retiring:
+        // the arena outlives the transport precisely so this stays valid.
+        frame.reset();
+        ++dropped;
+    }
+
+    discarded_.fetch_add(dropped, std::memory_order_relaxed);
+    return dropped;
+}
+
 void DeliveryQueue::notify() noexcept
 {
     if(wakeup_fd_ < 0 || queue_.empty())

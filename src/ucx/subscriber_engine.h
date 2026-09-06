@@ -127,7 +127,13 @@ class ReceiveArena : public CreditSink
 class SubscriberEngine final : public SubscriberTransport
 {
   public:
-    explicit SubscriberEngine(SubscriberConfig config);
+    /// `delivery` is the subscription's queue and is required.
+    ///
+    /// Not created here, which is the ownership this change is about: the queue
+    /// outlives this transport, a reconnect builds a new engine over the same
+    /// one, and nothing above has to ask a transport for its frames. Throws
+    /// `BulkException` if it is null.
+    SubscriberEngine(SubscriberConfig config, std::shared_ptr<DeliveryQueue> delivery);
     ~SubscriberEngine() override;
 
     /// Encoded `Open`, to be carried to the publisher by whatever the caller
@@ -171,19 +177,6 @@ class SubscriberEngine final : public SubscriberTransport
     {
         return session_.renew_interval_ms();
     }
-
-    /// Invokes `cb` on the CALLING thread and returns how many frames it
-    /// dispatched.  Which thread that is belongs to the layer above: a test
-    /// calls this directly, and `BulkSubscriber` calls it from its dispatch
-    /// thread.  Either way it is never the engine thread (5.2).
-    int fd() const noexcept override
-    {
-        return delivery_.fd();
-    }
-
-    std::size_t poll(std::chrono::milliseconds timeout,
-                     const FrameCallback &cb,
-                     std::size_t max_frames = 0) override;
 
     Protocol::GeometryBlock granted_geometry() const noexcept override
     {
@@ -305,14 +298,21 @@ class SubscriberEngine final : public SubscriberTransport
 
     ReleaseTracker tracker_;
 
-    /// The frames this transport has received and not yet handed over, its
-    /// queue policy, and the descriptor a waiting consumer is woken on.
+    /// Where received frames go. The subscription's, not this engine's.
     ///
-    /// A member for now, which CONTEXT.md says is the wrong owner: the local
-    /// delivery queue belongs to a Subscription, and a reconnect throws this
-    /// transport away. Extracting it is what makes that move possible; section
-    /// 4.2 is what makes it.
-    DeliveryQueue delivery_;
+    /// Pushed to from `commit()` inside `ucp_worker_progress`, and woken from
+    /// the engine loop -- the same split credit and probe acks use. Never read
+    /// from here: a transport does not consume its own frames, and after this
+    /// engine retires the queue and everything still in it belong to whoever
+    /// outlived it.
+    std::shared_ptr<DeliveryQueue> delivery_;
+
+    /// `delivery_->taken()` as it stood when this session was granted.
+    ///
+    /// The renew request reports how many frames *this session* delivered, and
+    /// the queue counts every session the subscription has had. Written before
+    /// the engine thread exists, read on the control thread afterwards.
+    std::uint64_t delivered_at_open_{0};
 
     std::vector<Pending> pending_; ///< engine thread only; indexed by slot
 

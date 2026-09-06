@@ -66,8 +66,17 @@ using CoordinationChannel =
 /// Called once per session, so once more on every reconnect. A retired
 /// transport is never reused: a failed UCX endpoint is not a usable data path
 /// again, which is why this is a factory and not an instance.
-using TransportFactory =
-    std::function<std::unique_ptr<SubscriberTransport>(const SubscriberConfig &)>;
+///
+/// The second argument is the subscription's delivery queue, and it is the
+/// *same* queue every time. That is the ownership this signature exists to
+/// state: frames belong to the subscription, which outlives the sessions that
+/// fill it, so a transport is handed somewhere to put them rather than asked
+/// for them afterwards. A supervisor that had to ask would have to hold the
+/// transport alive for the length of the ask -- across the application's
+/// callback -- which is what stopped a reconnect from proceeding while an
+/// application was in a slow `poll()`.
+using TransportFactory = std::function<std::unique_ptr<SubscriberTransport>(
+    const SubscriberConfig &, std::shared_ptr<DeliveryQueue>)>;
 
 /// Where delivered frames and state changes go.
 ///
@@ -128,6 +137,21 @@ class SessionSupervisor
     std::size_t poll(std::chrono::milliseconds timeout, std::size_t max_frames = 0);
 
     SubscriberState state() const noexcept;
+
+    /// A descriptor that becomes readable when `poll()` can deliver a frame, or
+    /// -1 if one could not be created.
+    ///
+    /// For a caller that owns its event loop -- `epoll`, `select`,
+    /// `loop.add_reader()`. It belongs to the subscription, not to a session,
+    /// so **it survives a reconnect**: an event loop registers it once and
+    /// keeps it, where a per-transport descriptor would have to be swapped
+    /// underneath a running loop every time a session was replaced.
+    ///
+    /// Pair it with `poll()`. Any poll that comes up empty leaves this consumer
+    /// armed, so there is no separate arm step to get wrong, and none to forget
+    /// (ADR 0005). Registering it and never polling produces something that
+    /// fires once and then never again.
+    int fd() const noexcept;
 
     /// The geometry of the session that is live now.
     ///

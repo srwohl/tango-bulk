@@ -4,6 +4,8 @@
 
 #include <tango-bulk/unstable/session_supervisor.h>
 
+#include <core/delivery_queue.h>
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -35,6 +37,14 @@
 /// delivery, because delivery does not run on the thread that makes it. It can
 /// only, eventually, expire the lease -- which is exactly the failure mode 7.4
 /// asks for.
+///
+/// And the converse, which was *not* true until the delivery queue moved here:
+/// a stuck application cannot stall coordination either. Delivery used to reach
+/// the transport through a borrow held for the whole of `poll()` and the whole
+/// of the user callback, so retirement waited on arbitrary application code --
+/// in `Manual` mode, on whatever timeout the application passed. Frames now go
+/// into a queue this object owns, the transport pushes and never lends itself
+/// out, and replacing a transport waits for nobody (section 4.2).
 namespace TangoBulk::detail
 {
 namespace
@@ -52,11 +62,16 @@ constexpr auto k_control_quantum = 100ms;
 /// How long a dispatch-thread poll blocks before looking at the run flag.
 constexpr auto k_dispatch_quantum = 20ms;
 
+/// Fold a retiring transport's per-session totals into the subscription's.
+///
+/// Delivery counts are deliberately absent. `frames_delivered`,
+/// `frames_dropped_queue_full` and the two queue gauges belong to the delivery
+/// queue, which spans every session rather than one -- so they are read from it
+/// once in `counters()`, and summing a transport's copy would count the same
+/// frame again for every session the subscription outlived.
 void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexcept
 {
     total.frames_received += part.frames_received;
-    total.frames_delivered += part.frames_delivered;
-    total.frames_dropped_queue_full += part.frames_dropped_queue_full;
     total.frames_dropped_stale_epoch += part.frames_dropped_stale_epoch;
     total.frames_dropped_bad_header += part.frames_dropped_bad_header;
     total.frames_dropped_oversize += part.frames_dropped_oversize;
@@ -73,9 +88,6 @@ void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexc
     // Gauges, not counters: they describe the transport that is live now, so
     // the newest value wins rather than the sum.
     total.views_outstanding = part.views_outstanding;
-    total.delivery_queue_depth = part.delivery_queue_depth;
-    total.delivery_queue_high_water =
-        std::max(total.delivery_queue_high_water, part.delivery_queue_high_water);
     total.pinned_bytes = part.pinned_bytes;
 }
 
@@ -192,7 +204,9 @@ struct SessionSupervisor::Impl
         channel(std::move(coordination)),
         factory(std::move(transport_factory)),
         frame_callback(std::move(cbs.on_frame)),
-        state_callback(std::move(cbs.on_state))
+        state_callback(std::move(cbs.on_state)),
+        delivery(std::make_shared<DeliveryQueue>(config.delivery_queue_depth,
+                                                 config.drop_policy))
     {
     }
 
@@ -209,7 +223,7 @@ struct SessionSupervisor::Impl
 
         try
         {
-            fresh = factory(config);
+            fresh = factory(config, delivery);
         }
         catch(const BulkException &e)
         {
@@ -276,7 +290,15 @@ struct SessionSupervisor::Impl
 
             // Not adopted: this transport is closed rather than published, so
             // no frame from it can reach a callback expecting the old shape.
+            //
+            // Destroyed *first*, then the queue is emptied. `adopt_open_reply`
+            // starts the engine before this check runs, so a frame of the new
+            // shape may already be queued; discarding before the producer has
+            // stopped would leave the next one behind it. Section 4.2 wants the
+            // check to precede the start, which is a change to the seam rather
+            // than to this ordering.
             fresh.reset();
+            delivery->discard();
             return false;
         }
 
@@ -674,7 +696,23 @@ struct SessionSupervisor::Impl
         }
 
         wake.notify_all();
-        // `previous` dies here, on the control thread, outside the lock.
+
+        // `previous` dies here, on the control thread, outside the lock, and
+        // that is what stops it producing. Only then is it safe to empty the
+        // queue: the frames left in it were granted under a contract that has
+        // ended, and the next session may describe a different array entirely.
+        //
+        // The ordering holds because a transport is always retired before the
+        // next one is built -- `control_loop` closes the session before it
+        // reconnects -- so there is never a live producer on the other side of
+        // this call.
+        const bool retired_one = previous != nullptr;
+        previous.reset();
+
+        if(retired_one)
+        {
+            delivery->discard();
+        }
     }
 
     // -- delivery -----------------------------------------------------------
@@ -726,25 +764,50 @@ struct SessionSupervisor::Impl
         return delivered;
     }
 
+    /// Hand queued frames to the application, on the CALLING thread.
+    ///
+    /// No borrow. This is the whole point of the move: the queue is this
+    /// object's, so delivery never touches the transport, and a callback that
+    /// takes thirty seconds delays nothing but its own caller. It used to hold
+    /// the transport for the length of the call, which is why an application
+    /// polling with a long timeout could stop a reconnect for that long -- and
+    /// under a Python binding it held the GIL while doing it.
     std::size_t deliver_frames(std::chrono::milliseconds timeout,
                                std::size_t max_frames = 0) noexcept
     {
-        const Ref live = borrow();
-        if(!live)
-        {
-            std::this_thread::sleep_for(std::min(timeout, k_dispatch_quantum));
-            return 0;
-        }
-
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
         std::size_t delivered = 0;
-        try
+
+        while(max_frames == 0 || delivered < max_frames)
         {
-            delivered = live->poll(timeout, frame_callback, max_frames);
-        }
-        catch(...)
-        {
-            // Same reasoning as above: a user callback that throws is contained
-            // here rather than unwinding through the transport.
+            FrameView view;
+
+            // Only the first frame waits; the rest of a burst is taken without
+            // blocking again. Both forms leave this consumer armed when they
+            // come up empty, so a caller watching fd() needs no protocol.
+            const bool got =
+                delivered == 0 ? delivery->take(view, deadline) : delivery->try_take(view);
+
+            if(!got)
+            {
+                break;
+            }
+
+            ++delivered;
+
+            try
+            {
+                frame_callback(std::move(view));
+            }
+            catch(...)
+            {
+                // A user callback that throws must not take the dispatch thread
+                // with it; there is nobody above it to catch anything. Contained
+                // per frame rather than per call, so one bad frame does not
+                // discard the rest of the burst.
+            }
+
+            view.reset();
         }
 
         return delivered;
@@ -780,6 +843,12 @@ struct SessionSupervisor::Impl
         running.store(false, std::memory_order_release);
         wake.notify_all();
 
+        // Sticky, so a consumer blocked in `take()` comes back now and stays
+        // back, rather than waking, finding nothing and blocking again for the
+        // rest of its timeout. Queued frames are still claimable until the
+        // queue itself goes; what happens to them is settled below.
+        delivery->stop();
+
         if(control.joinable())
         {
             control.join();
@@ -814,6 +883,17 @@ struct SessionSupervisor::Impl
 
     FrameCallback frame_callback;
     StateCallback state_callback;
+
+    /// Where frames go, for the life of the subscription rather than the life
+    /// of a session.
+    ///
+    /// Created before the first transport and outliving the last, which is what
+    /// makes `fd()` stable across a reconnect and what lets delivery run
+    /// without touching the transport at all. Shared with whichever transport
+    /// is current; `shared_ptr` because a transport that could not be quiesced
+    /// is quarantined rather than destroyed, and nothing else would prove it
+    /// has stopped pushing.
+    std::shared_ptr<DeliveryQueue> delivery;
 
     std::atomic<SubscriberState> state{SubscriberState::Closed};
     std::atomic<bool> running{false};
@@ -945,6 +1025,11 @@ SubscriberState SessionSupervisor::state() const noexcept
     return impl_->state.load(std::memory_order_acquire);
 }
 
+int SessionSupervisor::fd() const noexcept
+{
+    return impl_->delivery->fd();
+}
+
 Protocol::GeometryBlock SessionSupervisor::granted_geometry() const noexcept
 {
     const Impl::Ref live = impl_->borrow();
@@ -971,6 +1056,15 @@ SubscriberCounters SessionSupervisor::counters() const noexcept
 
     total.reconnects = impl_->reconnects.load(std::memory_order_relaxed);
     total.geometry_changes += impl_->geometry_changes.load(std::memory_order_relaxed);
+
+    // Read once from the owner rather than accumulated per session. These four
+    // describe the subscription's queue, which spans every session it has had,
+    // so there is nothing to fold in and nothing that resets on a reconnect.
+    total.frames_delivered = impl_->delivery->taken();
+    total.frames_dropped_queue_full = impl_->delivery->dropped();
+    total.delivery_queue_depth = impl_->delivery->size();
+    total.delivery_queue_high_water = impl_->delivery->high_water();
+
     return total;
 }
 

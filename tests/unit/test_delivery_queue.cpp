@@ -178,6 +178,48 @@ TEST_CASE("frames still queued when the queue dies return their credit",
     CHECK(abandoned.use_count() == 1);
 }
 
+TEST_CASE("discard() empties the queue and returns every credit", "[core][delivery]")
+{
+    // What a subscription does when the session that filled the queue is gone.
+    // The frames are valid bytes from a contract that no longer holds.
+    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+
+    const auto first = storage(1);
+    const auto second = storage(2);
+    CHECK(queue.push(frame_over(first, 1)));
+    CHECK(queue.push(frame_over(second, 2)));
+
+    CHECK(queue.discard() == 2);
+    CHECK(queue.size() == 0);
+    CHECK(first.use_count() == 1);
+    CHECK(second.use_count() == 1);
+
+    // Counted as its own thing. A frame let go because its session ended is not
+    // a frame the queue had no room for, and one counter cannot mean both.
+    CHECK(queue.discarded() == 2);
+    CHECK(queue.dropped() == 0);
+    CHECK(queue.taken() == 0);
+
+    FrameView none;
+    CHECK_FALSE(queue.try_take(none));
+    CHECK(queue.discard() == 0);
+}
+
+TEST_CASE("discard() leaves a frame already handed over alone", "[core][delivery]")
+{
+    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+
+    const auto taken = storage(3);
+    CHECK(queue.push(frame_over(taken, 3)));
+
+    FrameView held;
+    REQUIRE(queue.try_take(held));
+
+    CHECK(queue.discard() == 0);
+    REQUIRE(static_cast<bool>(held));
+    CHECK(*reinterpret_cast<const std::uint16_t *>(held.data()) == 3);
+}
+
 // -- waiting and waking ------------------------------------------------------
 
 TEST_CASE("take() waits out its deadline when nothing arrives", "[core][delivery]")

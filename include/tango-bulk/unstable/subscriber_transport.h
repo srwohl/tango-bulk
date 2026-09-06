@@ -37,6 +37,16 @@
 namespace TangoBulk::detail
 {
 
+/// The subscription's delivery queue, defined in `src/core/delivery_queue.h`.
+///
+/// Forward-declared rather than included, because that header is internal and
+/// this one is installed. A `shared_ptr` parameter needs no complete type, and
+/// a transport implementation -- which does, since it pushes -- is compiled
+/// inside this project. An out-of-tree transport therefore cannot be written
+/// against the installed headers alone; section 4.10 rank 8 is where that seam
+/// stops being installed at all.
+class DeliveryQueue;
+
 class SubscriberTransport
 {
   public:
@@ -68,50 +78,6 @@ class SubscriberTransport
     /// values, so the renew timer reads these rather than the configuration.
     virtual std::uint32_t lease_ttl_ms() const noexcept = 0;
     virtual std::uint32_t renew_interval_ms() const noexcept = 0;
-
-    /// A descriptor that becomes readable when a frame arrives, or -1 if this
-    /// transport has none.
-    ///
-    /// **It is only signalled while armed**, and that is not an implementation
-    /// detail to be discovered: the engine writes the descriptor only on the
-    /// arm-to-disarmed transition, which is exactly what makes a consumer that
-    /// is keeping up cost zero syscalls. Adding an unarmed descriptor to an
-    /// event loop produces something that never fires.
-    ///
-    /// The protocol, and both steps are load-bearing:
-    ///
-    ///     if (transport.poll(0ms, cb, 1) == 0)  // 1. look, and arm if empty
-    ///     {
-    ///         ::poll(&pfd, 1, timeout);         // 2. now it is safe to block
-    ///     }
-    ///
-    /// Step 1 is what closes the lost-wakeup race, and it is one step rather
-    /// than three because the arm and the re-check belong to the delivery
-    /// queue, not to its caller: any poll that comes up empty leaves this
-    /// consumer armed. A caller that armed by hand could get the order wrong;
-    /// one that cannot reach the flag cannot (ADR 0005).
-    ///
-    /// `poll()` with a timeout does the waiting too; this is for a caller that
-    /// owns its own event loop -- `epoll`, `select`, `loop.add_reader()` -- and
-    /// needs the waiting to happen somewhere else.
-    virtual int fd() const noexcept = 0;
-
-    /// Invoke `cb` on the CALLING thread for each frame available within
-    /// `timeout`; returns how many it dispatched.  Never the engine thread --
-    /// that is 5.2's guarantee, and it is structural: the engine holds no
-    /// `std::function` at all.
-    ///
-    /// `max_frames` of 0 means "everything queued", which is what this did
-    /// before the parameter existed and remains the default.
-    ///
-    /// It is the parameter that lets one frame be taken at a time. Draining
-    /// unconditionally means a single call can withhold up to `queue_depth`
-    /// credits at once, and it is why a consumer that wants exactly one frame
-    /// -- a `read()`, a `try_read()`, an iterator step -- could not be built on
-    /// top of this without a second delivery path of its own.
-    virtual std::size_t poll(std::chrono::milliseconds timeout,
-                             const FrameCallback &cb,
-                             std::size_t max_frames = 0) = 0;
 
     /// The geometry this session was granted: element type, rank, shape,
     /// strides, maximum frame size, ring depth and credit window.
@@ -151,9 +117,16 @@ class SubscriberTransport
 /// type, which would require the UCX headers.  A factory returning a base
 /// pointer does not.
 ///
-/// Throws `BulkException` if the configuration is invalid or the transport
-/// cannot be brought up.
-std::unique_ptr<SubscriberTransport> make_subscriber_transport(SubscriberConfig config);
+/// `delivery` is where received frames go, and it belongs to the subscription
+/// rather than to this transport: it is created once, before the first session,
+/// and outlives every transport a reconnect builds. Required, not optional --
+/// a transport with nowhere to put frames is a stream that silently goes
+/// nowhere, and construction is the cheapest moment to say so.
+///
+/// Throws `BulkException` if the configuration is invalid, the queue is null,
+/// or the transport cannot be brought up.
+std::unique_ptr<SubscriberTransport> make_subscriber_transport(
+    SubscriberConfig config, std::shared_ptr<DeliveryQueue> delivery);
 
 } // namespace TangoBulk::detail
 

@@ -87,6 +87,23 @@ class DeliveryQueue
     /// leaving the consumer armed, exactly as `try_take()` does.
     bool take(FrameView &out, std::chrono::steady_clock::time_point deadline) noexcept;
 
+    /// Drop everything queued, returning each frame's credit.  Returns how
+    /// many went.
+    ///
+    /// What a subscription does when the session that filled the queue is gone.
+    /// The frames are valid bytes from a contract that no longer holds, and the
+    /// next session may have been granted a different array entirely -- so
+    /// handing them to an application that has moved on is worse than losing
+    /// them (section 4.2). Frames already handed over are untouched: they are
+    /// not here any more.
+    ///
+    /// Counted by `discarded()` and deliberately not by `dropped()`: a frame
+    /// let go because its session ended is not a frame the queue had no room
+    /// for, and `SubscriberCounters::frames_dropped_queue_full` would be a lie
+    /// if it covered both. It has no field of its own there yet; section 4.7 is
+    /// where the counter scopes get named.
+    std::size_t discard() noexcept;
+
     /// A descriptor that becomes readable when a frame can be claimed, or -1
     /// if one could not be created.
     ///
@@ -145,6 +162,12 @@ class DeliveryQueue
         return dropped_.load(std::memory_order_relaxed);
     }
 
+    /// Frames let go because the session that queued them retired.
+    std::uint64_t discarded() const noexcept
+    {
+        return discarded_.load(std::memory_order_relaxed);
+    }
+
     std::uint64_t high_water() const noexcept
     {
         return high_water_.load(std::memory_order_relaxed);
@@ -193,6 +216,7 @@ class DeliveryQueue
 
     std::atomic<std::uint64_t> taken_{0};
     std::atomic<std::uint64_t> dropped_{0};
+    std::atomic<std::uint64_t> discarded_{0};
     std::atomic<std::uint64_t> high_water_{0};
 };
 

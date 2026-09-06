@@ -6,8 +6,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <poll.h>
+
 #include <algorithm>
 #include <mutex>
+#include <set>
+#include <thread>
 #include <vector>
 
 /// The control loop's failure paths, which nothing could reach before.
@@ -85,7 +89,8 @@ TEST_CASE("a transport factory that returns nothing is refused, not dereferenced
         detail::SessionSupervisor::open(
             config,
             fake_channel(script),
-            [](const SubscriberConfig &) { return std::unique_ptr<detail::SubscriberTransport>{}; },
+            [](const SubscriberConfig &, std::shared_ptr<detail::DeliveryQueue>)
+            { return std::unique_ptr<detail::SubscriberTransport>{}; },
             noop_callbacks()),
         BulkException);
 }
@@ -484,6 +489,12 @@ struct Delivered
     std::vector<std::uint16_t> first_elements;
     std::vector<std::size_t> sizes;
 
+    /// Which threads the callback ran on. Delivery must not happen on a
+    /// coordination thread (ADR 0008), so where it happened is asserted rather
+    /// than assumed -- and it is recorded here, in the callback, because that is
+    /// now the only place a frame is handed over.
+    std::set<std::thread::id> threads;
+
     void record(const FrameView &frame)
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -491,12 +502,25 @@ struct Delivered
         sizes.push_back(frame.size());
         first_elements.push_back(
             frame.data() != nullptr ? *reinterpret_cast<const std::uint16_t *>(frame.data()) : 0);
+        threads.insert(std::this_thread::get_id());
     }
 
     std::size_t count()
     {
         std::lock_guard<std::mutex> lock(mutex);
         return sequences.size();
+    }
+
+    std::size_t thread_count()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return threads.size();
+    }
+
+    bool on(std::thread::id id)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return threads.count(id) != 0;
     }
 };
 
@@ -574,8 +598,8 @@ TEST_CASE("a dispatch thread delivers without the application asking",
     // which is what makes a sequential callback contract (ADR 0008) true here
     // rather than merely intended.
     CHECK(seen.sequences == std::vector<std::uint64_t>{1, 2, 3, 4});
-    CHECK(script.frame_thread_count() == 1);
-    CHECK_FALSE(script.delivered_on(std::this_thread::get_id()));
+    CHECK(seen.thread_count() == 1);
+    CHECK_FALSE(seen.on(std::this_thread::get_id()));
 }
 
 TEST_CASE("poll() delivers no more frames than it was asked for", "[core][supervisor]")
@@ -609,19 +633,24 @@ TEST_CASE("frames are delivered on the polling thread, never on a coordination t
           "[core][supervisor]")
 {
     Script script;
+    Delivered seen;
+
     script.receive(1);
     script.receive(2);
 
+    detail::SessionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
+
     auto supervisor = detail::SessionSupervisor::open(
-        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
     CHECK(supervisor->poll(std::chrono::milliseconds{200}) == 2);
 
     // Manual delivery: the caller's thread, and no other. The control thread
     // renews on its own schedule throughout, and it must not be a place user
     // code runs.
-    CHECK(script.frame_thread_count() == 1);
-    CHECK(script.delivered_on(std::this_thread::get_id()));
+    CHECK(seen.thread_count() == 1);
+    CHECK(seen.on(std::this_thread::get_id()));
 }
 
 TEST_CASE("a frame the application kept outlives the session that delivered it",
@@ -684,6 +713,159 @@ TEST_CASE("a frame delivered before a reconnect survives the session that replac
     // And the replacement session delivers, so the reconnect really happened.
     script.receive(12);
     CHECK(eventually([&] { return supervisor->poll(std::chrono::milliseconds{50}) == 1; }));
+}
+
+// -- the transport is no longer in the delivery path -------------------------
+//
+// The queue belongs to the subscription now, so consuming a frame never
+// borrows the transport. These four cases are what that buys, and each of them
+// failed -- or could not be written at all -- before the move.
+
+/// Whether a descriptor is readable right now.
+bool readable(int fd)
+{
+    pollfd descriptor{};
+    descriptor.fd = fd;
+    descriptor.events = POLLIN;
+    return ::poll(&descriptor, 1, 0) > 0;
+}
+
+TEST_CASE("a consumer blocked in poll() does not delay replacing the transport",
+          "[core][supervisor]")
+{
+    // The worst interaction in the subscriber, and the reason section 4.2
+    // exists. Delivery used to hold a borrow on the transport for the whole of
+    // poll(), and retirement waited for every borrow to come back -- so an
+    // application asking for frames with a long timeout stopped the control
+    // thread from reconnecting for exactly that long. Under a Python binding it
+    // held the GIL while doing it.
+    Script script;
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+
+    REQUIRE(eventually([&script] { return script.transports_built.load() == 1; }));
+
+    // The application asks for frames, and there are none. It will be in there
+    // for two seconds.
+    std::atomic<bool> still_polling{true};
+    std::thread consumer([&] {
+        supervisor->poll(std::chrono::seconds{2});
+        still_polling.store(false);
+    });
+
+    // Long enough that the consumer is genuinely blocked rather than starting.
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+    const auto started = std::chrono::steady_clock::now();
+    script.refuse_next_renew(Status::SessionExpired);
+
+    const bool replaced = eventually([&script] { return script.transports_built.load() >= 2; },
+                                     std::chrono::milliseconds{1'000});
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    CHECK(replaced);
+    CHECK(elapsed < std::chrono::milliseconds{1'000});
+
+    // And it happened while the application was still inside poll(). That is
+    // the assertion the old borrow could not have passed.
+    CHECK(still_polling.load());
+
+    // Let the consumer go rather than waiting out its timeout.
+    script.receive(1);
+    consumer.join();
+}
+
+TEST_CASE("the readiness descriptor survives a reconnect", "[core][supervisor]")
+{
+    // Section 4.2: the descriptor belongs to the subscription, so an event loop
+    // registers it once. A per-transport descriptor would have to be swapped
+    // underneath a running loop every time a session was replaced -- which is
+    // not something asyncio's add_reader lets you do quietly.
+    Script script;
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+
+    const int before = supervisor->fd();
+    REQUIRE(before >= 0);
+
+    script.refuse_next_renew(Status::SessionExpired);
+    REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
+
+    CHECK(supervisor->fd() == before);
+
+    // Still the live one, not a stale number: the replacement session's frames
+    // arrive through it.
+    Delivered seen;
+    script.receive(9);
+    REQUIRE(eventually([&] { return supervisor->poll(std::chrono::milliseconds{50}) == 1; }));
+}
+
+TEST_CASE("an empty poll arms the descriptor, and a frame makes it readable",
+          "[core][supervisor]")
+{
+    // The whole asyncio story in one case: register fd(), poll when it fires,
+    // and never touch an arm/drain protocol. Section 4.1 removed those two
+    // primitives from the seam precisely because this is all a caller needs.
+    Script script;
+    Delivered seen;
+
+    detail::SessionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    REQUIRE(supervisor->fd() >= 0);
+
+    // Nothing queued: the poll comes up empty and arms on the way out.
+    CHECK(supervisor->poll(std::chrono::milliseconds{0}) == 0);
+    CHECK_FALSE(readable(supervisor->fd()));
+
+    script.receive(4);
+
+    CHECK(readable(supervisor->fd()));
+    CHECK(supervisor->poll(std::chrono::milliseconds{0}) == 1);
+    REQUIRE(seen.count() == 1);
+    CHECK(seen.sequences.front() == 4);
+}
+
+TEST_CASE("frames the retired session left behind are discarded, not delivered later",
+          "[core][supervisor]")
+{
+    // Section 4.2: stop the old producer and discard its queued frames before
+    // starting the next. The queue outlives the session now, so without this a
+    // frame granted under the old contract would be handed to an application
+    // that has since been told about a new one -- and a reopened session is
+    // allowed to change everything except the array's description.
+    Script script;
+    Delivered seen;
+
+    detail::SessionCallbacks callbacks = noop_callbacks();
+    callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
+
+    auto supervisor = detail::SessionSupervisor::open(
+        supervisor_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+
+    // Queued and deliberately not taken.
+    script.receive(1);
+    REQUIRE(eventually([&supervisor] {
+        return supervisor->counters().delivery_queue_depth == 1;
+    }));
+
+    script.refuse_next_renew(Status::SessionExpired);
+    REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
+
+    // Gone with the session that queued it.
+    CHECK(supervisor->poll(std::chrono::milliseconds{50}) == 0);
+    CHECK(seen.count() == 0);
+
+    // And the replacement session delivers normally.
+    script.receive(2);
+    REQUIRE(eventually([&] { return supervisor->poll(std::chrono::milliseconds{50}) == 1; }));
+    REQUIRE(seen.count() == 1);
+    CHECK(seen.sequences.front() == 2);
 }
 
 } // namespace

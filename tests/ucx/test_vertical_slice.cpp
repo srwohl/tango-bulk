@@ -35,7 +35,7 @@ TEST_CASE("A published frame arrives intact with its metadata", "[m2][slice]")
 
     REQUIRE(slice.publish(bytes, 0x5A) == PublishResult::Accepted);
 
-    const std::vector<FrameView> views = collect(slice.subscriber, 1);
+    const std::vector<FrameView> views = collect(*slice.delivery, 1);
     REQUIRE(views.size() == 1);
 
     const FrameView &view = views.front();
@@ -65,7 +65,7 @@ TEST_CASE("The delivered payload lives in the registered receive ring", "[m2][sl
 
     REQUIRE(slice.publish(k_frame_bytes, 0x11) == PublishResult::Accepted);
 
-    const std::vector<FrameView> views = collect(slice.subscriber, 1);
+    const std::vector<FrameView> views = collect(*slice.delivery, 1);
     REQUIRE(views.size() == 1);
     const FrameView &view = views.front();
 
@@ -96,7 +96,7 @@ TEST_CASE("Slots recycle: sequence s lands in slot s % ring_depth", "[m2][slice]
         const auto seed = static_cast<unsigned>(n);
         REQUIRE(slice.publish(bytes, seed) == PublishResult::Accepted);
 
-        std::vector<FrameView> views = collect(slice.subscriber, 1);
+        std::vector<FrameView> views = collect(*slice.delivery, 1);
         REQUIRE(views.size() == 1);
 
         const FrameView &view = views.front();
@@ -135,7 +135,7 @@ TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring
     for(unsigned seed = 0; seed < 4; ++seed)
         REQUIRE(slice.publish(4096, seed) == PublishResult::Accepted);
 
-    std::vector<FrameView> first = collect(slice.subscriber, 2);
+    std::vector<FrameView> first = collect(*slice.delivery, 2);
     REQUIRE(first.size() == 2);
     CHECK(first[0].sequence() == 0);
     CHECK(first[1].sequence() == 1);
@@ -148,7 +148,7 @@ TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring
     REQUIRE(slice.publish(4096, 4) == PublishResult::Accepted);
     REQUIRE(slice.publish(4096, 5) == PublishResult::Accepted);
 
-    std::vector<FrameView> second = collect(slice.subscriber, 2);
+    std::vector<FrameView> second = collect(*slice.delivery, 2);
     REQUIRE(second.size() == 2);
     CHECK(second[0].sequence() == 2);
     CHECK(second[1].sequence() == 3);
@@ -166,7 +166,7 @@ TEST_CASE("A retained view withholds exactly one credit", "[m2][slice]")
         REQUIRE(slice.publish(bytes, n) == PublishResult::Accepted);
     }
 
-    std::vector<FrameView> held = collect(slice.subscriber, k_credit_window);
+    std::vector<FrameView> held = collect(*slice.delivery, k_credit_window);
     REQUIRE(held.size() == k_credit_window);
     CHECK(slice.subscriber.counters().views_outstanding == k_credit_window);
 
@@ -203,7 +203,7 @@ TEST_CASE("Out-of-order release advances the ack only across the contiguous pref
         REQUIRE(slice.publish(bytes, n) == PublishResult::Accepted);
     }
 
-    std::vector<FrameView> held = collect(slice.subscriber, k_credit_window);
+    std::vector<FrameView> held = collect(*slice.delivery, k_credit_window);
     REQUIRE(held.size() == k_credit_window);
     REQUIRE(held[0].sequence() == 0);
     REQUIRE(held[1].sequence() == 1);
@@ -346,23 +346,24 @@ TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
     // descriptor and one empty poll. If this works, `async for` is a pure-Python
     // addition with no further C++.
     BulkPublisher publisher(publisher_config());
-    detail::SubscriberEngine subscriber(subscriber_config());
+    const auto subscriber_delivery = queue_for(subscriber_config());
+    detail::SubscriberEngine subscriber(subscriber_config(), subscriber_delivery);
     open_session(publisher, subscriber);
 
-    REQUIRE(subscriber.fd() >= 0);
+    REQUIRE(subscriber_delivery->fd() >= 0);
 
     // Nothing queued, so an armed wait must time out rather than fire. The
     // empty poll is what arms; there is no separate step to forget.
-    REQUIRE(subscriber.poll(0ms, [](FrameView) {}, 1) == 0);
+    REQUIRE(drain(*subscriber_delivery, 0ms, [](FrameView) {}, 1) == 0);
     {
         pollfd pfd{};
-        pfd.fd = subscriber.fd();
+        pfd.fd = subscriber_delivery->fd();
         pfd.events = POLLIN;
         CHECK(::poll(&pfd, 1, 40) == 0);
     }
 
     // Look, then block -- exactly the two steps fd() documents.
-    REQUIRE(subscriber.poll(0ms, [](FrameView) {}, 1) == 0);
+    REQUIRE(drain(*subscriber_delivery, 0ms, [](FrameView) {}, 1) == 0);
 
     std::thread producer([&] {
         std::this_thread::sleep_for(60ms);
@@ -374,7 +375,7 @@ TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
     });
 
     pollfd pfd{};
-    pfd.fd = subscriber.fd();
+    pfd.fd = subscriber_delivery->fd();
     pfd.events = POLLIN;
 
     const auto started = std::chrono::steady_clock::now();
@@ -389,7 +390,7 @@ TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
 
     FrameView got;
     REQUIRE(eventually([&] {
-        subscriber.poll(10ms, [&](FrameView view) { got = std::move(view); }, 1);
+        drain(*subscriber_delivery, 10ms, [&](FrameView view) { got = std::move(view); }, 1);
         return static_cast<bool>(got);
     }));
     CHECK(payload_matches(got, 9));
@@ -405,7 +406,8 @@ TEST_CASE("An unarmed descriptor is never signalled, which is what makes it free
     // that only checked "the fd fires" would pass just as well against an
     // engine that wrote on every frame.
     BulkPublisher publisher(publisher_config());
-    detail::SubscriberEngine subscriber(subscriber_config());
+    const auto subscriber_delivery = queue_for(subscriber_config());
+    detail::SubscriberEngine subscriber(subscriber_config(), subscriber_delivery);
     open_session(publisher, subscriber);
 
     for(int i = 0; i < 4; ++i)
@@ -422,7 +424,7 @@ TEST_CASE("An unarmed descriptor is never signalled, which is what makes it free
 
     // Four frames queued and nobody armed: the descriptor stays quiet.
     pollfd pfd{};
-    pfd.fd = subscriber.fd();
+    pfd.fd = subscriber_delivery->fd();
     pfd.events = POLLIN;
     CHECK(::poll(&pfd, 1, 60) == 0);
 
@@ -430,7 +432,7 @@ TEST_CASE("An unarmed descriptor is never signalled, which is what makes it free
     // sidecar, never the queue itself.
     std::size_t drained = 0;
     REQUIRE(eventually([&] {
-        drained += subscriber.poll(20ms, [](FrameView view) { view.reset(); });
+        drained += drain(*subscriber_delivery, 20ms, [](FrameView view) { view.reset(); });
         return drained == 4;
     }));
 }
@@ -443,7 +445,8 @@ TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
     // step -- needs to be able to say so, or it needs a delivery path of its
     // own, which is how a binding ends up with two.
     BulkPublisher publisher(publisher_config());
-    detail::SubscriberEngine subscriber(subscriber_config());
+    const auto subscriber_delivery = queue_for(subscriber_config());
+    detail::SubscriberEngine subscriber(subscriber_config(), subscriber_delivery);
     open_session(publisher, subscriber);
 
     constexpr int k_published = 4;
@@ -466,16 +469,16 @@ TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
     {
         std::size_t seen = 0;
         const std::size_t dispatched =
-            subscriber.poll(50ms, [&](FrameView view) { ++seen; view.reset(); }, 1);
+            drain(*subscriber_delivery, 50ms, [&](FrameView view) { ++seen; view.reset(); }, 1);
 
         CHECK(dispatched == 1);
         CHECK(seen == 1);
-        CHECK(subscriber.counters().frames_delivered ==
+        CHECK(subscriber_delivery->taken() ==
               static_cast<std::uint64_t>(i) + 1);
     }
 
     // Nothing left, and asking for one more does not invent a frame.
-    CHECK(subscriber.poll(10ms, [](FrameView) {}, 1) == 0);
+    CHECK(drain(*subscriber_delivery, 10ms, [](FrameView) {}, 1) == 0);
 
     // The default is still drain-everything, which is what every existing
     // caller relies on.
@@ -496,7 +499,7 @@ TEST_CASE("poll() takes at most max_frames, and withholds only their credit",
 
     std::size_t drained = 0;
     REQUIRE(eventually([&] {
-        drained += subscriber.poll(50ms, [](FrameView view) { view.reset(); });
+        drained += drain(*subscriber_delivery, 50ms, [](FrameView view) { view.reset(); });
         return drained == k_published;
     }));
 }
@@ -513,7 +516,8 @@ TEST_CASE("A publisher refuses to send an array it did not declare", "[m2][slice
     config.frame_metadata.shape[0] = k_frame_bytes;
 
     BulkPublisher publisher(config);
-    detail::SubscriberEngine subscriber(subscriber_config());
+    const auto subscriber_delivery = queue_for(subscriber_config());
+    detail::SubscriberEngine subscriber(subscriber_config(), subscriber_delivery);
     open_session(publisher, subscriber);
 
     // What it declared, accepted.
@@ -569,7 +573,8 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
     config.frame_metadata.shape[0] = k_frame_bytes;
 
     BulkPublisher publisher(config);
-    detail::SubscriberEngine subscriber(subscriber_config());
+    const auto subscriber_delivery = queue_for(subscriber_config());
+    detail::SubscriberEngine subscriber(subscriber_config(), subscriber_delivery);
 
     const std::vector<std::byte> honest = exchange_open(publisher, subscriber);
 
@@ -604,7 +609,7 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
     }
 
     REQUIRE(eventually([&] {
-        subscriber.poll(10ms, [](FrameView) {});
+        drain(*subscriber_delivery, 10ms, [](FrameView) {});
         return subscriber.state() == SubscriberState::Failed;
     }));
 
@@ -612,7 +617,7 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
     // problem is that it disagreed.
     CHECK(subscriber.counters().frames_dropped_geometry_mismatch == 1);
     CHECK(subscriber.counters().frames_dropped_bad_header == 0);
-    CHECK(subscriber.counters().frames_delivered == 0);
+    CHECK(subscriber_delivery->taken() == 0);
 
     const BulkError why = subscriber.last_error();
     CHECK(why.status == Status::GeometryMismatch);
@@ -637,7 +642,7 @@ TEST_CASE("Views outlive the subscriber that delivered them", "[m2][slice]")
             REQUIRE(slice.publish(bytes, n) == PublishResult::Accepted);
         }
 
-        held = collect(slice.subscriber, 2);
+        held = collect(*slice.delivery, 2);
         REQUIRE(held.size() == 2);
     }
 
