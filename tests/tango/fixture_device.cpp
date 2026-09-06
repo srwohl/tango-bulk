@@ -74,10 +74,6 @@ class BulkTestDevice : public TANGO_BASE_CLASS
         config.credit_window = k_credit_window;
         config.publish_queue_depth = 8;
 
-        // Declare the array this stream carries, rather than leaving it to be
-        // defaulted to an opaque byte stream. Without this the grant says
-        // "rank 0, Byte" while every frame says "rank 1, UInt8" -- the two
-        // disagreeing, which is precisely what the subscriber now refuses.
         config.frame_metadata.element_type = ElementType::UInt8;
         config.frame_metadata.element_size = 1;
         config.frame_metadata.rank = 1;

@@ -27,8 +27,6 @@ DeliveryQueue::~DeliveryQueue()
         ::close(wakeup_fd_);
     }
 
-    // Frames still queued die here, each returning its credit. The interlock is
-    // the FrameView, not this queue.
 }
 
 bool DeliveryQueue::push(FrameView frame) noexcept
@@ -50,18 +48,14 @@ bool DeliveryQueue::push(FrameView frame) noexcept
             FrameView oldest;
             if(queue_.try_pop(oldest))
             {
-                // Destroying the head returns its credit, which is the room.
                 oldest.reset();
                 queued = queue_.try_push(std::move(frame));
             }
         }
 
-        // Whatever was not queued goes out of scope here and returns its credit.
         dropped_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Only on the armed-to-disarmed transition, so a consumer that is keeping up
-    // costs no syscall.
     if(wakeup_fd_ >= 0 && !queue_.empty() &&
        consumer_waiting_.exchange(false, std::memory_order_acq_rel))
     {
@@ -90,8 +84,6 @@ std::size_t DeliveryQueue::discard() noexcept
 
 void DeliveryQueue::stop() noexcept
 {
-    // The flag before the descriptor: a consumer woken by the write must be able
-    // to see why.
     stopped_.store(true, std::memory_order_release);
 
     if(wakeup_fd_ < 0)
@@ -99,8 +91,6 @@ void DeliveryQueue::stop() noexcept
         return;
     }
 
-    // Unconditional, unlike the wakeup in push(): every waiter has to come back,
-    // armed or not.
     consumer_waiting_.store(false, std::memory_order_release);
 
     const std::uint64_t one = 1;
@@ -115,8 +105,6 @@ void DeliveryQueue::drain() noexcept
         return;
     }
 
-    // A notification, not a count: the queue is the truth about how many frames
-    // there are, so one read clears however many writes.
     std::uint64_t drained = 0;
     const ssize_t got = ::read(wakeup_fd_, &drained, sizeof(drained));
     static_cast<void>(got); // EAGAIN: nothing pending
@@ -139,8 +127,6 @@ bool DeliveryQueue::await(std::chrono::steady_clock::time_point deadline) noexce
         return true;
     }
 
-    // Arm before re-checking. The other order loses wakeups: the producer can
-    // push and find the flag clear between the check and the block.
     arm();
 
     if(!queue_.empty())
@@ -162,8 +148,6 @@ bool DeliveryQueue::await(std::chrono::steady_clock::time_point deadline) noexce
         drain();
     }
 
-    // ready == 0 is the timeout, ready < 0 is EINTR. Both mean look again; the
-    // caller's deadline decides whether to keep waiting.
     return true;
 }
 
@@ -175,8 +159,6 @@ bool DeliveryQueue::try_take(FrameView &out) noexcept
         return true;
     }
 
-    // Arm and re-check before reporting empty, so a caller watching fd() cannot
-    // wait for a descriptor nobody is going to write.
     arm();
 
     if(queue_.try_pop(out))
@@ -193,14 +175,11 @@ bool DeliveryQueue::take(FrameView &out, std::chrono::steady_clock::time_point d
 {
     for(;;)
     {
-        // Through try_take() so that every empty call leaves the consumer armed,
-        // a zero-timeout take() included.
         if(try_take(out))
         {
             return true;
         }
 
-        // After the take, so a stopped queue still hands over what it holds.
         if(stopped_.load(std::memory_order_acquire) || !await(deadline))
         {
             return false;

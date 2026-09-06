@@ -64,9 +64,6 @@ struct PublisherConfig
 
 namespace detail
 {
-/// The producer ring, its registration and its free list, defined in
-/// `src/ucx/producer_slots.h`. Forward-declared because that header is internal
-/// and this one is installed: a `shared_ptr` member needs no complete type here.
 class ProducerSlots;
 } // namespace detail
 
@@ -93,12 +90,6 @@ class BulkPublisher
     BulkPublisher(const BulkPublisher &) = delete;
     BulkPublisher &operator=(const BulkPublisher &) = delete;
 
-    /// An application's exclusive hold on one publisher slot before publication.
-    ///
-    /// It shares ownership of the ring rather than pointing at its publisher, so
-    /// a handle outliving the publisher keeps its storage valid instead of
-    /// dangling (ADR 0003). The share is taken by copying a refcount during
-    /// acquisition, which allocates nothing.
     class SlotHandle
     {
       public:
@@ -125,14 +116,11 @@ class BulkPublisher
         std::uint32_t index_{0};
     };
 
-    /// Non-blocking by design: an acquisition thread MUST be able to drop rather
-    /// than wait while slots are retained by a slow or dead consumer.
     SlotHandle try_acquire() noexcept;
 
     std::size_t slot_bytes() const noexcept; ///< usable payload capacity per slot
     std::size_t retained() const noexcept;   ///< slots currently held or in flight
 
-    /// Consumes the handle on Accepted; leaves it engaged in the caller's hands
     /// on QueueFull and WouldBlock.  Never blocks, never throws, never allocates.
     PublishResult publish(SlotHandle &&handle, const FrameMetadata &meta) noexcept;
 

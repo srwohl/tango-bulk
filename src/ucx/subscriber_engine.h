@@ -32,7 +32,6 @@
 /// seeing `tango/*`; docs/EXTRACTION.md deviation 2 resolves the pair by putting
 /// the transport engine in this layer and `BulkSubscriber` in the Tango layer,
 /// meeting at an interface.  This is that engine, and the interface it meets is
-/// `detail::SubscriberTransport` in `tango-bulk/unstable/subscriber_transport.h`.
 ///
 /// M4 built the other half: `BulkSubscriber` in `src/tango/proxy_client.cpp` is
 /// a shell over this class, reached through that interface and constructed
@@ -126,22 +125,14 @@ class ReceiveArena : public CreditSink
 class SubscriberEngine final : public SubscriberTransport
 {
   public:
-    /// `delivery` is the subscription's queue: it outlives this transport, and
-    /// a reconnect builds a new engine over the same one. Throws
-    /// `BulkException` if it is null.
     SubscriberEngine(SubscriberConfig config, std::shared_ptr<DeliveryQueue> delivery);
     ~SubscriberEngine() override;
 
-    /// Valid from construction: the ring is armed before `Open` goes out.
     const std::vector<std::byte> &local_address() const noexcept override
     {
         return worker_->address();
     }
 
-    /// Create the endpoint from the publisher's address, then start the engine
-    /// thread. In that order: 5.1 gives the worker to one thread, and starting
-    /// the loop first would race `ucp_ep_create` against
-    /// `ucp_worker_progress` on a UCS_THREAD_MODE_SINGLE worker.
     Status activate(Protocol::StreamId stream_id,
                     const Protocol::GeometryBlock &granted,
                     const std::vector<std::byte> &server_address) override;
@@ -239,13 +230,6 @@ class SubscriberEngine final : public SubscriberTransport
 
     void commit(std::size_t slot_index) noexcept;
 
-    /// Retire the session, and say why.
-    ///
-    /// `reason` MUST be a string literal or otherwise outlive the engine: this
-    /// is called from inside `ucp_worker_progress`, where allocating would be a
-    /// far worse bug than the one being reported. Only the first reason is
-    /// kept -- what failed first is what an operator needs; everything after it
-    /// is likely to be a consequence.
     void fail(Status status, const char *reason) noexcept;
 
     SubscriberConfig config_;
@@ -256,8 +240,6 @@ class SubscriberEngine final : public SubscriberTransport
 
     ReleaseTracker tracker_;
 
-    /// Where received frames go. The subscription's, not this engine's: pushed
-    /// to from `commit()`, never read from here.
     std::shared_ptr<DeliveryQueue> delivery_;
 
     std::vector<Pending> pending_; ///< engine thread only; indexed by slot
@@ -290,20 +272,11 @@ class SubscriberEngine final : public SubscriberTransport
     std::atomic<bool> quiesced_{false};
     std::atomic<SubscriberState> state_{SubscriberState::Closed};
 
-    /// Set by `fail()`, read by `last_error()` on the control thread. A raw
-    /// pointer to a literal rather than a string, so the AM callback can set it
-    /// without allocating.
     std::atomic<const char *> failure_reason_{nullptr};
     std::atomic<Status> failure_status_{Status::Ok};
 
     ucp_ep_h endpoint_{nullptr};
 
-    /// The part of the session contract the data path reads. The identifiers
-    /// `Renew` and `Close` quote, and the lease terms, stay with the
-    /// subscription.
-    ///
-    /// Written by `activate()`; the engine thread does not exist until
-    /// `activate()` starts it, which is what publishes those writes.
     Protocol::StreamId stream_id_{0};
     Protocol::GeometryBlock granted_{};
 

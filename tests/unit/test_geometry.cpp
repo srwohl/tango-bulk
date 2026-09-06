@@ -221,8 +221,6 @@ TEST_CASE("shape and stride products are overflow-checked", "[core][geometry]")
 
 TEST_CASE("the reachable span is bounded, not the per-axis extent", "[core][geometry]")
 {
-    // The defect this rule replaced: checking shape[i] * strides[i] <= limit for
-    // each axis independently is a different bound, and a strictly weaker one.
     SECTION("a geometry whose last element ends past the payload is refused")
     {
         FrameMetadata meta;
@@ -233,13 +231,8 @@ TEST_CASE("the reachable span is bounded, not the per-axis extent", "[core][geom
         meta.strides = {4, 4, 0, 0};
         meta.payload_bytes = 8;
 
-        // Every per-axis product is 2 * 4 == 8, and elements * element_size is
-        // also 8, so the old rule accepted this. The highest-indexed element
-        // begins at (2-1)*4 + (2-1)*4 == 8 and ends at 10: an export built from
-        // this description reads two bytes past the payload.
         CHECK(meta.validate(8) == Status::GeometryMismatch);
 
-        // One more byte of payload and the same description is sound.
         meta.payload_bytes = 10;
         CHECK(meta.validate(10) == Status::Ok);
     }
@@ -260,9 +253,6 @@ TEST_CASE("the reachable span is bounded, not the per-axis extent", "[core][geom
 
     SECTION("trailing row padding is not required to fit")
     {
-        // A padded layout: 640 pixels in a 700-pixel pitch. The old rule needed
-        // room for shape[0] * pitch -- including the padding after the LAST row,
-        // which nothing ever reads. The span ends at the last element.
         FrameMetadata meta;
         meta.element_type = ElementType::UInt16;
         meta.element_size = 2;
@@ -279,8 +269,6 @@ TEST_CASE("the reachable span is bounded, not the per-axis extent", "[core][geom
 
     SECTION("an empty axis reaches nothing and does not wrap")
     {
-        // shape[i] - 1 would underflow to ~0 on a zero extent, so the empty case
-        // is answered before the span is computed.
         GeometryBlock g = valid();
         g.shape = {0, 1024, 0, 0};
         g.strides = {2048, 2, 0, 0};
@@ -293,8 +281,6 @@ TEST_CASE("the reachable span is bounded, not the per-axis extent", "[core][geom
         g.rank = 2;
         g.shape = {2, 2, 0, 0};
 
-        // (shape - 1) * stride does not overflow on either axis, but their sum
-        // does. A rule that checked each axis alone would never see it.
         g.strides = {1ull << 63, 1ull << 63, 0, 0};
         CHECK(g.validate() == Status::GeometryMismatch);
     }

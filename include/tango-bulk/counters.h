@@ -58,13 +58,6 @@ struct SubscriberCounters
     std::uint64_t frames_dropped_oversize{0};
     std::uint64_t frames_dropped_duplicate_seq{0};
 
-    /// Frames whose header contradicted the geometry the session granted.
-    ///
-    /// Distinct from `frames_dropped_bad_header`, which counts a header that
-    /// would not decode or named the wrong stream. This one decoded perfectly
-    /// and described a different array from the one that was agreed -- a broken
-    /// promise rather than a malformed message, and the reason the session is
-    /// retired rather than the frame merely discarded.
     std::uint64_t frames_dropped_geometry_mismatch{0};
     std::uint64_t credits_returned{0};
     std::uint64_t credit_messages_sent{0};

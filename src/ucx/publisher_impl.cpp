@@ -132,7 +132,6 @@ void await_request(ucp_worker_h worker, void *request) noexcept
 } // namespace
 
 // ---------------------------------------------------------------------------
-// BulkPublisher::SlotHandle
 // ---------------------------------------------------------------------------
 
 BulkPublisher::SlotHandle::SlotHandle() noexcept = default;
@@ -171,9 +170,6 @@ BulkPublisher::SlotHandle::~SlotHandle()
 
 void BulkPublisher::SlotHandle::reset() noexcept
 {
-    // 5.4: a handle destroyed without being published returns its slot
-    // immediately. Publishing moves the storage reference out, so by then there
-    // is nothing left to return.
     if(slots_)
     {
         slots_->release(index_);
@@ -207,7 +203,6 @@ std::size_t BulkPublisher::SlotHandle::index() const noexcept
 
 MemoryKind BulkPublisher::SlotHandle::memory_kind() const noexcept
 {
-    // Host only in the MVP. Cuda/Rocm are in the protocol so the field does not
     // have to be retrofitted later (spec section 10), not because they work.
     return MemoryKind::Host;
 }
@@ -1223,8 +1218,6 @@ struct BulkPublisher::Impl
     /// By pointer so ~Impl can destroy it before any other member.
     std::unique_ptr<UcxWorker> worker;
 
-    /// The registered ring and its free list, shared with every outstanding
-    /// SlotHandle so one can outlive this publisher (ADR 0003).
     std::shared_ptr<ProducerSlots> slots;
 
     BoundedQueue<PublishItem> publish_queue;
@@ -1316,15 +1309,10 @@ BulkPublisher::SlotHandle BulkPublisher::try_acquire() noexcept
     std::uint32_t index = 0;
     if(!impl_->slots->try_acquire(index))
     {
-        // 5.3: never blocks. An acquisition thread must be able to drop rather
-        // than wait while slots are retained by a slow or dead consumer -- a
-        // detector does not stop producing because a client stopped reading.
         impl_->counters.acquire_failed.fetch_add(1, std::memory_order_relaxed);
         return handle;
     }
 
-    // A refcount increment, not an allocation: the storage was mapped at
-    // construction and this handle only takes a share of it.
     handle.slots_ = impl_->slots;
     handle.index_ = index;
     handle.data_ = impl_->slots->ring().slot(index);
@@ -1345,7 +1333,6 @@ std::size_t BulkPublisher::retained() const noexcept
 
 PublishResult BulkPublisher::publish(SlotHandle &&lease, const FrameMetadata &meta) noexcept
 {
-    // Every early return below either consumes the handle deliberately or leaves
     // it with the caller; 5.4 spells out which is which, and QueueFull is the
     // only one that gives it back.
     if(!lease)
@@ -1368,16 +1355,6 @@ PublishResult BulkPublisher::publish(SlotHandle &&lease, const FrameMetadata &me
         return PublishResult::BadMetadata;
     }
 
-    // 6.2: the geometry a session was granted is the contract, and this
-    // publisher granted it from `config.frame_metadata`. A frame describing a
-    // different array would contradict every session currently open, so it is
-    // refused here rather than sent -- the subscriber would have to retire its
-    // session over it, and a device is far better placed to notice that it is
-    // publishing something it never declared.
-    //
-    // Only when the declaration is typed. A rank-0 Byte declaration is the
-    // opaque tier -- bytes, length and ordering -- where a per-frame hint is
-    // free to say more than the contract does.
     if(impl_->config.frame_metadata.rank > 0 &&
        !describes_same_array(resolved, impl_->config.frame_metadata))
     {
@@ -1443,8 +1420,6 @@ PublishResult BulkPublisher::publish(SlotHandle &&lease, const FrameMetadata &me
         return PublishResult::QueueFull;
     }
 
-    // Past this point the publisher owns the slot. Dropping the handle's share
-    // of the storage *without* releasing the slot is what transfers it.
     impl_->admitted.fetch_add(1, std::memory_order_release);
     lease.slots_.reset();
     lease.reset();
@@ -1486,10 +1461,6 @@ PublisherCounters BulkPublisher::counters() const noexcept
     out.dropped_credit_stalled = c.dropped_credit_stalled.load(std::memory_order_relaxed);
     out.dropped_bad_metadata = c.dropped_bad_metadata.load(std::memory_order_relaxed);
     out.acquire_failed = c.acquire_failed.load(std::memory_order_relaxed);
-    // Read from the free list's own accounting rather than mirrored into a
-    // counter on every acquire and release. It was stored three ways at once --
-    // here, in the slot storage, and implicitly in the free list's depth -- and
-    // the mirror is what went stale when the release path stopped updating it.
     out.leases_retained = impl_->slots->retained();
     out.credits_outstanding = c.credits_outstanding.load(std::memory_order_relaxed);
     out.publish_queue_depth = c.publish_queue_depth.load(std::memory_order_relaxed);

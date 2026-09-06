@@ -82,19 +82,6 @@ class SessionClient
         return stream_id_;
     }
 
-    /// The granted geometry, whole.
-    ///
-    /// Kept rather than copied out of, which is the difference between this and
-    /// what came before. `adopt_open_reply` used to store four scalars from the
-    /// block and drop element type, rank, shape and strides on the floor -- so
-    /// nothing above this class could describe the array it was receiving, the
-    /// per-frame header could not be checked against what was granted, and two
-    /// grants could not be compared even though `operator==` was written and
-    /// tested for exactly that.
-    ///
-    /// Written once per session, in `adopt_open_reply`, before the engine thread
-    /// exists. A reconnect builds a whole new transport rather than mutating
-    /// this one, so there is no in-place update to race with.
     const Protocol::GeometryBlock &granted_geometry() const noexcept
     {
         return granted_;
@@ -133,9 +120,6 @@ class SessionClient
     Protocol::StreamId stream_id_{0};
     std::vector<std::byte> server_address_;
 
-    /// All-zero until a grant is adopted, which is why generation() reports 0
-    /// for a session that has not opened -- the same answer it gave when these
-    /// were four separate members.
     Protocol::GeometryBlock granted_{};
 
     std::uint32_t lease_ttl_ms_{0};

@@ -14,27 +14,12 @@
 #include <thread>
 #include <vector>
 
-/// The delivery queue, its queue policy and its readiness descriptor, with no
-/// NIC and no session.
-///
-/// All of this used to live inside `SubscriberEngine`, where reaching it needed
-/// a UCX loopback and a real publisher -- so the drop policy, the high-water
-/// gauge and the whole lost-wakeup protocol were only ever exercised
-/// incidentally, by tests aimed at something else. They are the parts most
-/// worth testing directly: a dropped frame that fails to return its credit
-/// stalls a stream, and a lost wakeup hangs a consumer, and neither shows up as
-/// a crash.
 namespace
 {
 
 using namespace TangoBulk;
 using namespace std::chrono_literals;
 
-/// A frame over storage the test holds, so its lifetime can be observed.
-///
-/// `payload.use_count()` is the assertion that matters for credit: a frame the
-/// queue dropped or handed over has released the storage exactly when the last
-/// view of it went away.
 FrameView frame_over(const std::shared_ptr<std::vector<std::uint16_t>> &payload,
                      std::uint64_t sequence)
 {
@@ -56,7 +41,6 @@ std::shared_ptr<std::vector<std::uint16_t>> storage(std::uint16_t fill)
     return std::make_shared<std::vector<std::uint16_t>>(8, fill);
 }
 
-/// Whether the descriptor is readable right now.
 bool readable(int fd)
 {
     pollfd descriptor{};
@@ -65,7 +49,6 @@ bool readable(int fd)
     return ::poll(&descriptor, 1, 0) > 0;
 }
 
-// -- the queue ---------------------------------------------------------------
 
 TEST_CASE("a pushed frame comes back out in order", "[core][delivery]")
 {
@@ -99,7 +82,6 @@ TEST_CASE("capacity is rounded up to a power of two, and reported", "[core][deli
     CHECK(queue.stats().capacity == 8);
 }
 
-// -- the queue policy --------------------------------------------------------
 
 TEST_CASE("DropNewest refuses the arriving frame and keeps the queued ones",
           "[core][delivery]")
@@ -112,8 +94,6 @@ TEST_CASE("DropNewest refuses the arriving frame and keeps the queued ones",
     const auto rejected = storage(3);
     CHECK_FALSE(queue.push(frame_over(rejected, 3)));
 
-    // Refused, and released on the spot. Holding a rejected frame would be a
-    // withheld credit that nothing is ever going to return.
     CHECK(rejected.use_count() == 1);
     CHECK(queue.stats().dropped == 1);
 
@@ -132,7 +112,6 @@ TEST_CASE("DropOldest evicts the head to make room for the arriving frame",
     CHECK(queue.push(frame_over(storage(2), 2)));
     CHECK(queue.push(frame_over(storage(3), 3)));
 
-    // The evicted frame's credit went back when it was dropped, not later.
     CHECK(evicted.use_count() == 1);
     CHECK(queue.stats().dropped == 1);
 
@@ -145,8 +124,6 @@ TEST_CASE("DropOldest evicts the head to make room for the arriving frame",
 
 TEST_CASE("a frame the caller kept outlives the queue", "[core][delivery]")
 {
-    // ADR 0003, at the smallest scale it is expressible: the queue is not what
-    // keeps a delivered frame's storage alive, the view is.
     const auto payload = storage(9);
     FrameView kept;
 
@@ -180,8 +157,6 @@ TEST_CASE("frames still queued when the queue dies return their credit",
 
 TEST_CASE("discard() empties the queue and returns every credit", "[core][delivery]")
 {
-    // What a subscription does when the session that filled the queue is gone.
-    // The frames are valid bytes from a contract that no longer holds.
     detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
 
     const auto first = storage(1);
@@ -194,8 +169,6 @@ TEST_CASE("discard() empties the queue and returns every credit", "[core][delive
     CHECK(first.use_count() == 1);
     CHECK(second.use_count() == 1);
 
-    // Counted as its own thing. A frame let go because its session ended is not
-    // a frame the queue had no room for, and one counter cannot mean both.
     CHECK(queue.stats().discarded == 2);
     CHECK(queue.stats().dropped == 0);
     CHECK(queue.stats().taken == 0);
@@ -220,7 +193,6 @@ TEST_CASE("discard() leaves a frame already handed over alone", "[core][delivery
     CHECK(*reinterpret_cast<const std::uint16_t *>(held.data()) == 3);
 }
 
-// -- waiting and waking ------------------------------------------------------
 
 TEST_CASE("take() waits out its deadline when nothing arrives", "[core][delivery]")
 {
@@ -254,16 +226,12 @@ TEST_CASE("take() returns as soon as a producer pushes and notifies",
     REQUIRE(got);
     CHECK(frame.sequence() == 7);
 
-    // Woken, not timed out. The descriptor is the whole reason this is
-    // milliseconds rather than seconds.
     CHECK(elapsed < 2s);
 }
 
 TEST_CASE("stop() breaks a blocked take() out with nothing queued",
           "[core][delivery]")
 {
-    // The terminal wakeup: close, interruption and teardown all have to reach a
-    // consumer that is asleep, and none of them has a frame to hand it.
     detail::DeliveryQueue queue(2, DropPolicy::DropNewest);
 
     std::thread stopper([&queue] {
@@ -285,9 +253,6 @@ TEST_CASE("stop() breaks a blocked take() out with nothing queued",
 TEST_CASE("a stopped queue hands over what it already holds, then stops waiting",
           "[core][delivery]")
 {
-    // Section 7.10: interruption is a mark-and-wake, not a drain. What happens
-    // to the remainder is the owner's decision, so the queue must not throw it
-    // away on the way out -- and must not block for more either.
     detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
 
     CHECK(queue.push(frame_over(storage(1), 1)));
@@ -303,20 +268,14 @@ TEST_CASE("a stopped queue hands over what it already holds, then stops waiting"
     CHECK(frame.sequence() == 2);
     CHECK_FALSE(queue.take(frame, started + 5s));
 
-    // None of the three waited: the first two had a frame, the third was
-    // stopped. A five-second deadline would have made a non-sticky stop obvious.
     CHECK(std::chrono::steady_clock::now() - started < 2s);
 
-    // Sticky. A second consumer arriving later must not block either.
     CHECK_FALSE(queue.take(frame, std::chrono::steady_clock::now() + 5s));
 }
 
-// -- readiness ---------------------------------------------------------------
 
 TEST_CASE("notify() with nobody armed makes no signal at all", "[core][delivery]")
 {
-    // The property that makes a descriptor affordable on the frame path: a
-    // consumer that is keeping up never arms, so the producer never writes.
     detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
     REQUIRE(queue.fd() >= 0);
 
@@ -328,9 +287,6 @@ TEST_CASE("notify() with nobody armed makes no signal at all", "[core][delivery]
 TEST_CASE("an empty try_take() arms, so the next notify() is seen",
           "[core][delivery]")
 {
-    // The contract for a caller that owns its event loop. Without the arm
-    // inside try_take(), such a caller looks, finds nothing, waits on a
-    // descriptor nobody will write, and hangs with a frame queued behind it.
     detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
     REQUIRE(queue.fd() >= 0);
 
@@ -348,10 +304,6 @@ TEST_CASE("an empty try_take() arms, so the next notify() is seen",
 TEST_CASE("a frame that arrives between the look and the wait is not lost",
           "[core][delivery]")
 {
-    // The lost-wakeup race, provoked deliberately: the frame is pushed after
-    // the consumer has decided the queue is empty. The arm inside try_take() is
-    // what makes the following take() return it immediately rather than sleep
-    // for the full deadline.
     detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
 
     FrameView frame;
@@ -371,10 +323,6 @@ TEST_CASE("many frames survive a producer and a consumer running at once",
     detail::DeliveryQueue queue(64, DropPolicy::DropNewest);
     constexpr std::uint64_t k_frames = 2'000;
 
-    // The producer waits for room rather than retrying a refused push: with one
-    // producer, room observed is room still there, and a refused push is a
-    // *dropped frame* under the queue policy rather than backpressure. Nothing
-    // in the queue's contract offers a producer a way to try again.
     std::atomic<bool> refused{false};
 
     std::thread producer([&queue, &refused] {
@@ -407,8 +355,6 @@ TEST_CASE("many frames survive a producer and a consumer running at once",
 
     producer.join();
 
-    // Every frame, exactly once, in order. DropNewest never fires because the
-    // producer waits for room rather than overrunning it.
     CHECK_FALSE(refused.load());
     CHECK(expected == k_frames + 1);
     CHECK(queue.stats().taken == k_frames);

@@ -226,11 +226,6 @@ TEST_CASE("An unrenewed session expires on schedule with no frames in flight", "
     CHECK(late.server_state == SessionState::Closed);
 
     // The client learns from the reply that this session is over for good.
-    //
-    // Asserted on the subscription's session contract rather than on the
-    // transport's state. The transport does not see renew replies any more --
-    // the lease is not its to keep -- so "no resurrection" is a fact about the
-    // session, and `session_lost` is where it is said.
     const std::vector<std::byte> encoded = Protocol::encode(late, 7);
     const detail::SessionClient::RenewOutcome outcome =
         subscriber.session.adopt_renew_reply(encoded.data(), encoded.size());

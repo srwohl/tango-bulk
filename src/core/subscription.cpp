@@ -15,29 +15,6 @@
 #include <thread>
 #include <utility>
 
-/// `Subscription`: everything `BulkSubscriber` used to do that was not
-/// Tango.
-///
-/// This code came out of `src/tango/proxy_client.cpp` with two substitutions and
-/// no change of behaviour: a `Tango::DeviceProxy &` became a
-/// `CoordinationChannel`, and a direct call to `make_subscriber_transport()`
-/// became a `TransportFactory`. Everything else -- the control loop, the renew
-/// schedule, the reconnect policy, the transport slot, the transition queue --
-/// is what it was, and the existing Tango adapter tests are what says so.
-///
-/// Three threads, and which one may touch what is the whole design (5.1):
-///
-///   * **control** -- the only thread that calls the coordination channel.
-///     Opens, renews, closes, reconnects. Never touches the transport's data
-///     path and never invokes a user callback.
-///   * **dispatch** -- the only thread that invokes `FrameCallback` and
-///     `StateCallback`. Never calls the channel.
-///   * **engine** -- inside the transport, invisible from here.
-///
-/// The two consequences: a stuck coordination call cannot stall delivery, and a
-/// stuck application cannot stall coordination. Neither runs on the other's
-/// thread, and delivery goes through a queue this object owns rather than
-/// through the transport, so replacing a transport waits for nobody.
 namespace TangoBulk
 {
 namespace
@@ -45,21 +22,10 @@ namespace
 
 using namespace std::chrono_literals;
 
-/// The longest the control thread sleeps without looking around.
-///
-/// A renew interval is seconds; a transport failure should be noticed sooner
-/// than that, so the wait is chopped into quanta and the renewal is scheduled
-/// against a deadline rather than against the sleep.
 constexpr auto k_control_quantum = 100ms;
 
-/// How long a dispatch-thread poll blocks before looking at the run flag.
 constexpr auto k_dispatch_quantum = 20ms;
 
-/// Fold a retiring transport's per-session totals into the subscription's.
-///
-/// Delivery and renewal counts are absent: they belong to the subscription,
-/// which spans every session, so `counters()` reads them once from their owner.
-/// Summing a transport's copy would count the same frame per session.
 void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexcept
 {
     total.frames_received += part.frames_received;
@@ -74,15 +40,12 @@ void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexc
     total.geometry_changes += part.geometry_changes;
     total.transport_errors += part.transport_errors;
 
-    // Gauges, not counters: they describe the transport that is live now, so
-    // the newest value wins rather than the sum.
     total.views_outstanding = part.views_outstanding;
     total.pinned_bytes = part.pinned_bytes;
 }
 
 } // namespace
 
-// ---------------------------------------------------------------------------
 
 std::chrono::milliseconds backoff_delay(std::uint32_t attempt,
                                         std::uint32_t backoff_ms,
@@ -98,7 +61,6 @@ std::chrono::milliseconds backoff_delay(std::uint32_t attempt,
     return std::chrono::milliseconds(delay);
 }
 
-// ---------------------------------------------------------------------------
 
 struct Subscription::Impl
 {
@@ -122,13 +84,7 @@ struct Subscription::Impl
     {
     }
 
-    // -- coordination, control thread only ----------------------------------
 
-    /// Open a session, from `make_open_request` through to `Active`.
-    ///
-    /// Every failure path leaves no transport behind: a half-open subscriber
-    /// with a registered ring and no session is exactly the resource leak the
-    /// lease exists to prevent on the other side.
     bool open_subscription(BulkError &error) noexcept
     {
         std::unique_ptr<detail::SubscriberTransport> fresh;
@@ -155,9 +111,6 @@ struct Subscription::Impl
             return false;
         }
 
-        // A candidate, not the live session: a grant about to be refused must
-        // not become the answer granted_geometry() gives, and must not start a
-        // transport. The check below sits between the two.
         detail::SessionClient candidate;
 
         try
@@ -179,10 +132,6 @@ struct Subscription::Impl
         }
         catch(const BulkException &e)
         {
-            // 7.4: a channel failure is a recovery hint, never cleanup
-            // authority.  It says this client should reconnect; it says nothing
-            // about what the publisher should release, which only the lease
-            // decides.
             error = e.error();
             return false;
         }
@@ -192,10 +141,6 @@ struct Subscription::Impl
             return false;
         }
 
-        // A reopened session may be granted a different array than the one the
-        // application laid its buffers out for. Adopting it silently is how a
-        // client ends up interpreting 1024x1024 frames as 2048x2048; the epoch
-        // and the sizing terms are allowed to move, the description is not.
         if(retired_geometry.generation != 0 &&
            !describes_same_array(retired_geometry, candidate.granted_geometry()))
         {
@@ -206,20 +151,15 @@ struct Subscription::Impl
                               "with the new contract in hand",
                               "subscriber"};
 
-            // An unactivated transport has no endpoint and no progress thread,
-            // so it cannot have queued anything. Refusing costs a destructor.
             fresh.reset();
             return false;
         }
 
         {
-            // The grant is settled. Under the lock because granted_geometry()
-            // reads it from an application thread.
             std::lock_guard<std::mutex> lock(observation);
             session = candidate;
         }
 
-        // Renew reports this session's progress, not the subscription's.
         delivered_at_open = delivery->stats().taken;
 
         if(const Status status = fresh->activate(session.stream_id(),
@@ -239,14 +179,6 @@ struct Subscription::Impl
         publish_transport(std::move(fresh));
         transition(SubscriberState::Probing, BulkError{});
 
-        // 4.1: `Probing` until the publisher's `Probe` is answered.  Waiting for
-        // it here rather than reporting `Active` optimistically is what makes
-        // the state mean "frames can flow", which is the only reading that is
-        // useful to an application.
-        //
-        // Budgeted by probe_timeout_ms, not by the channel's own timeout: this
-        // waits for a UCX round trip the publisher initiates, which is a
-        // different question from how long one coordination call may take.
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(config.probe_timeout_ms);
 
@@ -289,12 +221,6 @@ struct Subscription::Impl
         return false;
     }
 
-    /// Best-effort `Close`, then drop the transport.
-    ///
-    /// Best-effort because 3.8 makes `Close` idempotent and the lease is the
-    /// backstop: a close that cannot be delivered costs the publisher one lease
-    /// TTL, not a leaked ring.  Sending it anyway is what turns the common case
-    /// -- an orderly client shutdown -- into an immediate release.
     void close_session() noexcept
     {
         {
@@ -308,7 +234,6 @@ struct Subscription::Impl
                 }
                 catch(const std::exception &)
                 {
-                    // The device is gone or unreachable.  The lease covers it.
                 }
             }
         }
@@ -316,10 +241,6 @@ struct Subscription::Impl
         publish_transport(nullptr);
     }
 
-    /// Renew on schedule until something ends the session.
-    ///
-    /// Returns true if teardown ended it, false if it was lost -- which is the
-    /// difference between "we are done" and "reconnect if the policy allows".
     bool run_session(BulkError &error) noexcept
     {
         auto next_renew = std::chrono::steady_clock::now() +
@@ -353,9 +274,6 @@ struct Subscription::Impl
 
             if(observed == SubscriberState::Failed)
             {
-                // Say what happened rather than that something did. Which
-                // condition retired the session decides whether reconnecting
-                // can help, and that is the application's to know.
                 error = reported.status != Status::Ok
                             ? reported
                             : BulkError{Status::TransportFailure,
@@ -379,10 +297,6 @@ struct Subscription::Impl
 
             if(status == Status::RenewTooFrequent)
             {
-                // 3.7: the lease is not shortened as a penalty, so the session is
-                // healthy and the only correct response is to renew less often.
-                // Backing off by one full interval is the smallest change that
-                // cannot loop.
                 next_renew = std::chrono::steady_clock::now() +
                              std::chrono::milliseconds(current_renew_interval());
                 continue;
@@ -405,7 +319,6 @@ struct Subscription::Impl
             return Status::Internal;
         }
 
-        // The only thing the renewal needs from the transport.
         {
             const SubscriberCounters sampled = transport->counters();
             credits_returned = sampled.credits_returned;
@@ -445,7 +358,6 @@ struct Subscription::Impl
             status = Status::TransportFailure;
         }
 
-        // Anything that is not a granted renewal, a channel that threw included.
         if(status != Status::Ok)
         {
             renewals_failed.fetch_add(1, std::memory_order_relaxed);
@@ -456,15 +368,10 @@ struct Subscription::Impl
 
     std::uint32_t current_renew_interval() noexcept
     {
-        // 3.7 lets the server change the interval at any renewal and requires
-        // the client to adopt the new value, so it is read from the adopted
-        // lease rather than from the configuration. Control thread, which is
-        // also the only writer -- no borrow, and nothing to borrow it from.
         const std::uint32_t granted = session.renew_interval_ms();
         return granted == 0 ? 1'000u : granted;
     }
 
-    // -- control thread -----------------------------------------------------
 
     void control_loop() noexcept
     {
@@ -498,20 +405,13 @@ struct Subscription::Impl
             attempt = 0;
         }
 
-        // Whatever ended the loop, the session does not outlive it.
         close_session();
     }
 
-    /// Reopen under the configured policy.  Returns false if the subscription is
-    /// finished -- `Failed`, or torn down while backing off.
     bool reconnect(std::uint32_t &attempt, BulkError error) noexcept
     {
         if(config.reconnect_policy != ReconnectPolicy::BoundedRetry)
         {
-            // 4.1: FailFast makes any transition to `Reconnecting` a `Failed`,
-            // and Manual enters `Failed` and waits for the application to open a
-            // new subscription.  They differ in what the application does next,
-            // not in what happens here.
             transition(SubscriberState::Failed, error);
             return false;
         }
@@ -545,18 +445,6 @@ struct Subscription::Impl
 
             if(error.status == Status::GeometryMismatch)
             {
-                // The reopened session describes a different array. Retrying
-                // cannot help -- neither side changes between attempts, so the
-                // next grant is the same different array -- and BoundedRetry
-                // would spend every remaining attempt and a backoff apiece
-                // discovering that.
-                //
-                // This is also where a frame-level contradiction ends up. That
-                // retires its session and reconnects once, which is right: the
-                // publisher may have genuinely reopened with a new contract,
-                // and reopening is how the client finds out what it now is.
-                // Then this stops, and says so in the more accurate of the two
-                // messages.
                 transition(SubscriberState::Failed, error);
                 return false;
             }
@@ -565,7 +453,6 @@ struct Subscription::Impl
         return false;
     }
 
-    /// Wait out `backoff_delay()`.  Returns false if teardown arrived during it.
     bool backoff(std::uint32_t attempt) noexcept
     {
         const auto delay =
@@ -576,17 +463,11 @@ struct Subscription::Impl
         return running.load(std::memory_order_acquire);
     }
 
-    // -- the transport slot -------------------------------------------------
 
-    /// Retire the current transport and install `next`. Control thread, like
-    /// every other use of `transport`.
     void publish_transport(std::unique_ptr<detail::SubscriberTransport> next) noexcept
     {
         if(transport)
         {
-            // Fold in the retiring totals so a reconnect does not reset what an
-            // operator is watching, and keep the geometry so the next grant can
-            // be compared against it.
             std::lock_guard<std::mutex> lock(observation);
 
             accumulate(retired, transport->counters());
@@ -603,13 +484,10 @@ struct Subscription::Impl
 
         const bool retired_one = transport != nullptr;
 
-        // Destroyed before the replacement goes in: that is what stops the old
-        // producer pushing.
         transport = nullptr;
 
         if(retired_one)
         {
-            // Its queued frames were granted under a contract that has ended.
             delivery->discard();
         }
 
@@ -617,9 +495,6 @@ struct Subscription::Impl
         publish_observation();
     }
 
-    /// Copy the transport's counters for readers on other threads. Control
-    /// thread. They lag by up to one control quantum (ADR 0004); reading them
-    /// live would mean keeping the transport alive to read.
     void publish_observation() noexcept
     {
         SubscriberCounters sampled;
@@ -632,13 +507,7 @@ struct Subscription::Impl
         live = sampled;
     }
 
-    // -- delivery -----------------------------------------------------------
 
-    /// The longest run of undelivered state changes kept.
-    ///
-    /// Bounded because in `Manual` delivery nothing drains this until the
-    /// application polls, and a reconnecting subscriber produces two entries per
-    /// attempt. The oldest goes: the newest says where the subscription is.
     static constexpr std::size_t k_max_transitions = 64;
 
     void transition(SubscriberState next, BulkError error) noexcept
@@ -657,7 +526,6 @@ struct Subscription::Impl
         wake.notify_all();
     }
 
-    /// Deliver queued state transitions on the calling thread.
     std::size_t drain_transitions() noexcept
     {
         std::size_t delivered = 0;
@@ -683,8 +551,6 @@ struct Subscription::Impl
                 }
                 catch(...)
                 {
-                    // A throwing user callback must not take the dispatch thread
-                    // with it; there is nobody above it to catch anything.
                 }
             }
             ++delivered;
@@ -693,10 +559,6 @@ struct Subscription::Impl
         return delivered;
     }
 
-    /// Hand queued frames to the application, on the CALLING thread.
-    ///
-    /// Touches no transport, so a slow callback delays nothing but its own
-    /// caller.
     std::size_t deliver_frames(std::chrono::milliseconds timeout,
                                std::size_t max_frames = 0) noexcept
     {
@@ -707,8 +569,6 @@ struct Subscription::Impl
         {
             FrameView view;
 
-            // Only the first frame waits; the rest of a burst is taken without
-            // blocking again.
             const bool got =
                 delivered == 0 ? delivery->take(view, deadline) : delivery->try_take(view);
 
@@ -725,8 +585,6 @@ struct Subscription::Impl
             }
             catch(...)
             {
-                // A throwing callback must not take the dispatch thread with it,
-                // and must not cost the rest of the burst.
             }
 
             view.reset();
@@ -751,21 +609,11 @@ struct Subscription::Impl
         return correlation.fetch_add(1, std::memory_order_relaxed) + 1;
     }
 
-    /// Stop everything.  Idempotent, and safe to call on a subscription whose
-    /// first open never succeeded.
-    ///
-    /// `announce_closed` is false on exactly one path: a first open that failed
-    /// under a policy that reports rather than retries.  There the caller is
-    /// about to receive an exception and the last state it should observe is
-    /// `Failed`; following that with `Closed` would overwrite the diagnosis
-    /// with the fact that the failed thing is also no longer running, which the
-    /// caller can see for itself from the throw.
     void shutdown(bool announce_closed) noexcept
     {
         running.store(false, std::memory_order_release);
         wake.notify_all();
 
-        // Sticky: a consumer blocked in take() comes back and stays back.
         delivery->stop();
 
         if(control.joinable())
@@ -777,8 +625,6 @@ struct Subscription::Impl
             dispatch.join();
         }
 
-        // The control thread closes the session on its way out; this covers the
-        // case where there never was one.
         close_session();
 
         if(announce_closed)
@@ -786,15 +632,9 @@ struct Subscription::Impl
             transition(SubscriberState::Closed, BulkError{});
         }
 
-        // Both delivery threads are joined, so the final transitions are
-        // delivered on the caller's thread.  That is a deliberate choice: a
-        // state callback that never reports `Closed` is worse than one that
-        // reports it from teardown, and the guarantee 5.2 actually makes is
-        // about the *engine* thread, which this is not.
         drain_transitions();
     }
 
-    // -----------------------------------------------------------------------
 
     SubscriberConfig config;
     detail::CoordinationChannel channel;
@@ -803,43 +643,25 @@ struct Subscription::Impl
     FrameCallback frame_callback;
     StateCallback state_callback;
 
-    /// Who this session is, what it was granted, what its lease says. Written
-    /// by the control thread under `observation`, read by `granted_geometry()`
-    /// from an application thread.
     detail::SessionClient session;
 
-    /// Frames the queue had handed over when the live session was granted, so
-    /// `Renew` can report this session rather than the subscription. Control
-    /// thread only.
     std::uint64_t delivered_at_open{0};
 
-    /// Where frames go, for the life of the subscription. Outliving every
-    /// transport is what makes `fd()` stable across a reconnect. `shared_ptr`
-    /// because a transport that could not be quiesced is quarantined rather
-    /// than destroyed, and may still hold it.
     std::shared_ptr<detail::DeliveryQueue> delivery;
 
     std::atomic<SubscriberState> state{SubscriberState::Closed};
     std::atomic<bool> running{false};
 
-    /// The control thread's timed waits, and nothing else.
     std::mutex mutex;
     std::condition_variable wake;
 
-    /// The live transport. **Control thread only** -- created, replaced and
-    /// destroyed there, and read nowhere else. No lock, because there is no
-    /// second thread to lock against.
     std::unique_ptr<detail::SubscriberTransport> transport;
 
-    /// Guards everything an application thread may read while the control
-    /// thread runs: the session contract above, and these.
     std::mutex observation;
     SubscriberCounters retired{};
     SubscriberCounters live{};
     std::uint32_t last_lease_ttl_ms{0};
 
-    /// What the last session was describing. All-zero until one is retired,
-    /// which is why the comparison is skipped on a first open.
     Protocol::GeometryBlock retired_geometry{};
 
     std::mutex queue_mutex;
@@ -856,7 +678,6 @@ struct Subscription::Impl
     std::atomic<std::uint64_t> renewals_failed{0};
 };
 
-// ---------------------------------------------------------------------------
 
 Subscription::Subscription(std::unique_ptr<Impl> impl) noexcept :
     impl_(std::move(impl))
@@ -888,10 +709,6 @@ std::unique_ptr<Subscription> Subscription::open(SubscriberConfig config,
                                       "subscriber"});
     }
 
-    // 2.4 required both callbacks before start(); making them constructor
-    // arguments moves that from a runtime check to a thing the caller cannot
-    // omit.  The emptiness check remains, because a default-constructed
-    // std::function satisfies the type and delivers nowhere.
     if(!callbacks.on_frame || !callbacks.on_state)
     {
         throw BulkException(BulkError{Status::Internal,
@@ -920,10 +737,6 @@ std::unique_ptr<Subscription> Subscription::open(SubscriberConfig config,
         return std::unique_ptr<Subscription>(new Subscription(std::move(impl)));
     }
 
-    // The first open failed.  Under BoundedRetry that is the control thread's
-    // problem and open() returns; under the other two policies the caller is
-    // right here and gets told, which is what 2.4 means by "throws on open
-    // failure under FailFast".
     if(impl->config.reconnect_policy == ReconnectPolicy::BoundedRetry)
     {
         impl->transition(SubscriberState::Reconnecting, error);
@@ -982,8 +795,6 @@ SubscriberCounters Subscription::counters() const noexcept
     SubscriberCounters total;
 
     {
-        // A published copy, never a live transport: these lag by up to one
-        // control quantum (ADR 0004). The ones below are exact.
         const std::lock_guard<std::mutex> lock(impl_->observation);
         total = impl_->retired;
         accumulate(total, impl_->live);
@@ -992,8 +803,6 @@ SubscriberCounters Subscription::counters() const noexcept
     total.reconnects = impl_->reconnects.load(std::memory_order_relaxed);
     total.geometry_changes += impl_->geometry_changes.load(std::memory_order_relaxed);
 
-    // Read once from their owner: they span every session, so there is nothing
-    // to fold in and nothing that resets on a reconnect.
     total.renewals_sent = impl_->renewals_sent.load(std::memory_order_relaxed);
     total.renewals_failed = impl_->renewals_failed.load(std::memory_order_relaxed);
 
