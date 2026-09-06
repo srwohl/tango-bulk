@@ -566,7 +566,7 @@ int run_subscriber(const Options &options)
 
     // `frames_dropped_queue_full` is the queue's, not the engine's: the queue
     // outlives any one session, so it is the thing that knows.
-    const std::uint64_t dropped_queue_full = delivery->dropped();
+    const std::uint64_t dropped_queue_full = delivery->stats().dropped;
 
     report_rate("subscriber", received > options.warmup ? received - options.warmup : 0,
                 options.size, seconds);

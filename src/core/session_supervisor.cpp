@@ -34,18 +34,10 @@
 ///     `StateCallback`. Never calls the channel.
 ///   * **engine** -- inside the transport, invisible from here.
 ///
-/// The consequence worth stating: a stuck coordination call cannot stall frame
-/// delivery, because delivery does not run on the thread that makes it. It can
-/// only, eventually, expire the lease -- which is exactly the failure mode 7.4
-/// asks for.
-///
-/// And the converse, which was *not* true until the delivery queue moved here:
-/// a stuck application cannot stall coordination either. Delivery used to reach
-/// the transport through a borrow held for the whole of `poll()` and the whole
-/// of the user callback, so retirement waited on arbitrary application code --
-/// in `Manual` mode, on whatever timeout the application passed. Frames now go
-/// into a queue this object owns, the transport pushes and never lends itself
-/// out, and replacing a transport waits for nobody (section 4.2).
+/// The two consequences: a stuck coordination call cannot stall delivery, and a
+/// stuck application cannot stall coordination. Neither runs on the other's
+/// thread, and delivery goes through a queue this object owns rather than
+/// through the transport, so replacing a transport waits for nobody.
 namespace TangoBulk::detail
 {
 namespace
@@ -65,15 +57,9 @@ constexpr auto k_dispatch_quantum = 20ms;
 
 /// Fold a retiring transport's per-session totals into the subscription's.
 ///
-/// Delivery counts are deliberately absent. `frames_delivered`,
-/// `frames_dropped_queue_full` and the two queue gauges belong to the delivery
-/// queue, which spans every session rather than one -- so they are read from it
-/// once in `counters()`, and summing a transport's copy would count the same
-/// frame again for every session the subscription outlived.
-///
-/// So are the renewal counts, for the same reason and a sharper one: a
-/// transport does not renew. The lease is the subscription's to keep, so it is
-/// the subscription that counts the attempts and the refusals.
+/// Delivery and renewal counts are absent: they belong to the subscription,
+/// which spans every session, so `counters()` reads them once from their owner.
+/// Summing a transport's copy would count the same frame per session.
 void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexcept
 {
     total.frames_received += part.frames_received;
@@ -169,11 +155,9 @@ struct SessionSupervisor::Impl
             return false;
         }
 
-        // Adopted into a candidate, not into the live session. A grant this
-        // subscription is about to refuse must not be the answer
-        // `granted_geometry()` gives in the meantime, and the transport must
-        // not be started on it -- which is why the check below sits between the
-        // two.
+        // A candidate, not the live session: a grant about to be refused must
+        // not become the answer granted_geometry() gives, and must not start a
+        // transport. The check below sits between the two.
         SessionClient candidate;
 
         try
@@ -222,10 +206,8 @@ struct SessionSupervisor::Impl
                               "with the new contract in hand",
                               "subscriber"};
 
-            // Nothing to clean up, and that is structural rather than lucky: an
-            // unactivated transport has no endpoint and no progress thread, so
-            // it cannot have put a frame into the delivery queue. Refusing here
-            // costs a destructor.
+            // An unactivated transport has no endpoint and no progress thread,
+            // so it cannot have queued anything. Refusing costs a destructor.
             fresh.reset();
             return false;
         }
@@ -237,9 +219,8 @@ struct SessionSupervisor::Impl
             session = candidate;
         }
 
-        // This session's share of a queue that spans every session: `Renew`
-        // reports the progress of this one.
-        delivered_at_open = delivery->taken();
+        // Renew reports this session's progress, not the subscription's.
+        delivered_at_open = delivery->stats().taken;
 
         if(const Status status = fresh->activate(session.stream_id(),
                                                  session.granted_geometry(),
@@ -368,9 +349,6 @@ struct SessionSupervisor::Impl
             const BulkError reported =
                 observed == SubscriberState::Failed ? transport->last_error() : BulkError{};
 
-            // Diagnostics are refreshed on the same schedule this loop already
-            // runs on, so a reader never has to reach for a transport to see
-            // how the session is doing.
             publish_observation();
 
             if(observed == SubscriberState::Failed)
@@ -427,10 +405,7 @@ struct SessionSupervisor::Impl
             return Status::Internal;
         }
 
-        // The client's own progress report, and the only thing the renewal
-        // needs from the transport. Everything else it says -- who this session
-        // is, how many frames reached the application -- the subscription knows
-        // without asking.
+        // The only thing the renewal needs from the transport.
         {
             const SubscriberCounters sampled = transport->counters();
             credits_returned = sampled.credits_returned;
@@ -443,7 +418,7 @@ struct SessionSupervisor::Impl
         {
             const std::vector<std::byte> request =
                 session.make_renew_request(next_correlation_id(),
-                                           delivery->taken() - delivered_at_open,
+                                           delivery->stats().taken - delivered_at_open,
                                            credits_returned,
                                            client_state);
 
@@ -470,10 +445,7 @@ struct SessionSupervisor::Impl
             status = Status::TransportFailure;
         }
 
-        // Anything that is not a granted renewal, including a channel that
-        // threw before the request arrived anywhere. The old counter lived on
-        // the transport and only ever saw refusals that decoded, so an
-        // unreachable device renewed silently.
+        // Anything that is not a granted renewal, a channel that threw included.
         if(status != Status::Ok)
         {
             renewals_failed.fetch_add(1, std::memory_order_relaxed);
@@ -606,22 +578,15 @@ struct SessionSupervisor::Impl
 
     // -- the transport slot -------------------------------------------------
 
-    /// Retire the current transport and install `next`.
-    ///
-    /// Control thread, like every other use of `transport`, which is what
-    /// replaced the borrow handshake this used to need: a `Ref` class, a borrow
-    /// count, a `swapping` flag and a condvar wait for the count to reach zero.
-    /// All of that existed to stop a transport being destroyed underneath a
-    /// caller, and every caller but one was this thread. The one that was not
-    /// -- `counters()` -- reads a published copy instead.
+    /// Retire the current transport and install `next`. Control thread, like
+    /// every other use of `transport`.
     void publish_transport(std::unique_ptr<SubscriberTransport> next) noexcept
     {
         if(transport)
         {
-            // Fold the retiring transport's totals in, so a reconnect does not
-            // reset the counters an operator is watching, and keep what this
-            // session was describing so the next grant can be compared against
-            // it rather than silently replacing it.
+            // Fold in the retiring totals so a reconnect does not reset what an
+            // operator is watching, and keep the geometry so the next grant can
+            // be compared against it.
             std::lock_guard<std::mutex> lock(observation);
 
             accumulate(retired, transport->counters());
@@ -633,22 +598,18 @@ struct SessionSupervisor::Impl
                 retired_geometry = session.granted_geometry();
             }
 
-            // The session ends with its transport. What it was granted is
-            // remembered above; what it *is* stops being the answer.
             session = SessionClient{};
         }
 
         const bool retired_one = transport != nullptr;
 
-        // Destroyed here, on this thread, before the replacement goes in. That
-        // is what stops the old producer: no engine thread, no endpoint, no
-        // further push into the queue.
+        // Destroyed before the replacement goes in: that is what stops the old
+        // producer pushing.
         transport = nullptr;
 
         if(retired_one)
         {
-            // The frames it left behind were granted under a contract that has
-            // ended, and the next session may describe a different array.
+            // Its queued frames were granted under a contract that has ended.
             delivery->discard();
         }
 
@@ -656,13 +617,9 @@ struct SessionSupervisor::Impl
         publish_observation();
     }
 
-    /// Copy what an application thread is allowed to read.
-    ///
-    /// Control thread. The transport's counters are the only thing here that
-    /// cannot be read directly from another thread without keeping the
-    /// transport alive to read it -- which is the whole cost the borrow was
-    /// paying. ADR 0004 accepts the trade: diagnostics may lag by a control
-    /// quantum, and live authority stays elsewhere.
+    /// Copy the transport's counters for readers on other threads. Control
+    /// thread. They lag by up to one control quantum (ADR 0004); reading them
+    /// live would mean keeping the transport alive to read.
     void publish_observation() noexcept
     {
         SubscriberCounters sampled;
@@ -679,15 +636,9 @@ struct SessionSupervisor::Impl
 
     /// The longest run of undelivered state changes kept.
     ///
-    /// It was unbounded, which is a leak with a schedule: in `Manual` delivery
-    /// nothing drains this until the application polls, and a `BoundedRetry`
-    /// subscriber that cannot reach its publisher produces two transitions per
-    /// attempt for as long as it is left running. An application that stopped
-    /// polling grew it without limit.
-    ///
-    /// Bounded by dropping the *oldest*, because the newest is the one that
-    /// says where the subscription is now, and the terminal one is the one an
-    /// application is waiting for.
+    /// Bounded because in `Manual` delivery nothing drains this until the
+    /// application polls, and a reconnecting subscriber produces two entries per
+    /// attempt. The oldest goes: the newest says where the subscription is.
     static constexpr std::size_t k_max_transitions = 64;
 
     void transition(SubscriberState next, BulkError error) noexcept
@@ -744,12 +695,8 @@ struct SessionSupervisor::Impl
 
     /// Hand queued frames to the application, on the CALLING thread.
     ///
-    /// No borrow. This is the whole point of the move: the queue is this
-    /// object's, so delivery never touches the transport, and a callback that
-    /// takes thirty seconds delays nothing but its own caller. It used to hold
-    /// the transport for the length of the call, which is why an application
-    /// polling with a long timeout could stop a reconnect for that long -- and
-    /// under a Python binding it held the GIL while doing it.
+    /// Touches no transport, so a slow callback delays nothing but its own
+    /// caller.
     std::size_t deliver_frames(std::chrono::milliseconds timeout,
                                std::size_t max_frames = 0) noexcept
     {
@@ -761,8 +708,7 @@ struct SessionSupervisor::Impl
             FrameView view;
 
             // Only the first frame waits; the rest of a burst is taken without
-            // blocking again. Both forms leave this consumer armed when they
-            // come up empty, so a caller watching fd() needs no protocol.
+            // blocking again.
             const bool got =
                 delivered == 0 ? delivery->take(view, deadline) : delivery->try_take(view);
 
@@ -779,10 +725,8 @@ struct SessionSupervisor::Impl
             }
             catch(...)
             {
-                // A user callback that throws must not take the dispatch thread
-                // with it; there is nobody above it to catch anything. Contained
-                // per frame rather than per call, so one bad frame does not
-                // discard the rest of the burst.
+                // A throwing callback must not take the dispatch thread with it,
+                // and must not cost the rest of the burst.
             }
 
             view.reset();
@@ -821,10 +765,7 @@ struct SessionSupervisor::Impl
         running.store(false, std::memory_order_release);
         wake.notify_all();
 
-        // Sticky, so a consumer blocked in `take()` comes back now and stays
-        // back, rather than waking, finding nothing and blocking again for the
-        // rest of its timeout. Queued frames are still claimable until the
-        // queue itself goes; what happens to them is settled below.
+        // Sticky: a consumer blocked in take() comes back and stays back.
         delivery->stop();
 
         if(control.joinable())
@@ -862,41 +803,26 @@ struct SessionSupervisor::Impl
     FrameCallback frame_callback;
     StateCallback state_callback;
 
-    /// The session contract: who this session is, what it was granted, and
-    /// what its lease now says.
-    ///
-    /// The subscription's, not the transport's. It used to live inside the
-    /// engine, which put the grant, the epoch and the two lease terms behind
-    /// three declarations apiece -- on the engine, on the seam, and here --
-    /// for one storage location. Written by the control thread under `mutex`,
-    /// because `granted_geometry()` reads it from an application thread.
+    /// Who this session is, what it was granted, what its lease says. Written
+    /// by the control thread under `observation`, read by `granted_geometry()`
+    /// from an application thread.
     SessionClient session;
 
-    /// `delivery->taken()` when the live session was granted.
-    ///
-    /// The queue counts every session the subscription has had; `Renew` reports
-    /// the progress of the current one. Control thread only.
+    /// Frames the queue had handed over when the live session was granted, so
+    /// `Renew` can report this session rather than the subscription. Control
+    /// thread only.
     std::uint64_t delivered_at_open{0};
 
-    /// Where frames go, for the life of the subscription rather than the life
-    /// of a session.
-    ///
-    /// Created before the first transport and outliving the last, which is what
-    /// makes `fd()` stable across a reconnect and what lets delivery run
-    /// without touching the transport at all. Shared with whichever transport
-    /// is current; `shared_ptr` because a transport that could not be quiesced
-    /// is quarantined rather than destroyed, and nothing else would prove it
-    /// has stopped pushing.
+    /// Where frames go, for the life of the subscription. Outliving every
+    /// transport is what makes `fd()` stable across a reconnect. `shared_ptr`
+    /// because a transport that could not be quiesced is quarantined rather
+    /// than destroyed, and may still hold it.
     std::shared_ptr<DeliveryQueue> delivery;
 
     std::atomic<SubscriberState> state{SubscriberState::Closed};
     std::atomic<bool> running{false};
 
     /// The control thread's timed waits, and nothing else.
-    ///
-    /// It served four unrelated purposes once: this, the borrow handshake, the
-    /// transport swap and a wakeup on every `counters()` call from any thread.
-    /// Three of those are gone with the borrow.
     std::mutex mutex;
     std::condition_variable wake;
 
@@ -905,12 +831,8 @@ struct SessionSupervisor::Impl
     /// second thread to lock against.
     std::unique_ptr<SubscriberTransport> transport;
 
-    /// Everything an application thread may read while the control thread is
-    /// running: the session contract above, and these.
-    ///
-    /// `retired` used to be written under `mutex` and read without it, which
-    /// was a race on twenty non-atomic fields; the borrow protected the
-    /// transport, not the accumulator.
+    /// Guards everything an application thread may read while the control
+    /// thread runs: the session contract above, and these.
     std::mutex observation;
     SubscriberCounters retired{};
     SubscriberCounters live{};
@@ -1060,9 +982,8 @@ SubscriberCounters SessionSupervisor::counters() const noexcept
     SubscriberCounters total;
 
     {
-        // A copy the control thread published, never a live transport. The
-        // transport-owned fields may lag by a control quantum (ADR 0004); the
-        // ones this object owns -- below -- are exact, because it owns them.
+        // A published copy, never a live transport: these lag by up to one
+        // control quantum (ADR 0004). The ones below are exact.
         const std::lock_guard<std::mutex> lock(impl_->observation);
         total = impl_->retired;
         accumulate(total, impl_->live);
@@ -1071,16 +992,16 @@ SubscriberCounters SessionSupervisor::counters() const noexcept
     total.reconnects = impl_->reconnects.load(std::memory_order_relaxed);
     total.geometry_changes += impl_->geometry_changes.load(std::memory_order_relaxed);
 
-    // Read once from the owner rather than accumulated per session. These four
-    // describe the subscription's queue, which spans every session it has had,
-    // so there is nothing to fold in and nothing that resets on a reconnect.
+    // Read once from their owner: they span every session, so there is nothing
+    // to fold in and nothing that resets on a reconnect.
     total.renewals_sent = impl_->renewals_sent.load(std::memory_order_relaxed);
     total.renewals_failed = impl_->renewals_failed.load(std::memory_order_relaxed);
 
-    total.frames_delivered = impl_->delivery->taken();
-    total.frames_dropped_queue_full = impl_->delivery->dropped();
-    total.delivery_queue_depth = impl_->delivery->size();
-    total.delivery_queue_high_water = impl_->delivery->high_water();
+    const DeliveryQueue::Stats queue = impl_->delivery->stats();
+    total.frames_delivered = queue.taken;
+    total.frames_dropped_queue_full = queue.dropped;
+    total.delivery_queue_depth = queue.depth;
+    total.delivery_queue_high_water = queue.high_water;
 
     return total;
 }

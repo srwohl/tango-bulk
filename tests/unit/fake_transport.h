@@ -315,13 +315,11 @@ struct Script
     }
 
   private:
-    /// Push straight into the subscription's queue, exactly as the engine's AM
-    /// callback does, and then wake anyone waiting -- which the engine does from
-    /// its loop rather than from the callback.
+    /// Push straight into the subscription's queue, as the engine's AM callback
+    /// does.
     void deliver_locked(ScriptedFrame &frame)
     {
         delivery->push(FrameView::detached(frame.payload, frame.bytes(), frame.fields));
-        delivery->notify();
     }
 };
 

@@ -126,32 +126,22 @@ class ReceiveArena : public CreditSink
 class SubscriberEngine final : public SubscriberTransport
 {
   public:
-    /// `delivery` is the subscription's queue and is required.
-    ///
-    /// Not created here, which is the ownership this change is about: the queue
-    /// outlives this transport, a reconnect builds a new engine over the same
-    /// one, and nothing above has to ask a transport for its frames. Throws
+    /// `delivery` is the subscription's queue: it outlives this transport, and
+    /// a reconnect builds a new engine over the same one. Throws
     /// `BulkException` if it is null.
     SubscriberEngine(SubscriberConfig config, std::shared_ptr<DeliveryQueue> delivery);
     ~SubscriberEngine() override;
 
-    /// This worker's address. Valid from construction: the ring is allocated,
-    /// registered and armed before `Open` goes out, because the publisher may
-    /// send the first frame the moment it replies.
+    /// Valid from construction: the ring is armed before `Open` goes out.
     const std::vector<std::byte> &local_address() const noexcept override
     {
         return worker_->address();
     }
 
-    /// Adopt a validated grant: create the endpoint from the publisher's
-    /// address, then start the engine thread.
-    ///
-    /// In that order, and only here.  5.1 gives the worker to exactly one
-    /// thread; starting the loop before the endpoint exists would race
-    /// `ucp_ep_create` against `ucp_worker_progress` on a
-    /// UCS_THREAD_MODE_SINGLE worker.  It costs nothing to wait: before the
-    /// session opens there is no endpoint, no credit and no frame, so the loop
-    /// would have had nothing to progress.
+    /// Create the endpoint from the publisher's address, then start the engine
+    /// thread. In that order: 5.1 gives the worker to one thread, and starting
+    /// the loop first would race `ucp_ep_create` against
+    /// `ucp_worker_progress` on a UCS_THREAD_MODE_SINGLE worker.
     Status activate(Protocol::StreamId stream_id,
                     const Protocol::GeometryBlock &granted,
                     const std::vector<std::byte> &server_address) override;
@@ -266,13 +256,8 @@ class SubscriberEngine final : public SubscriberTransport
 
     ReleaseTracker tracker_;
 
-    /// Where received frames go. The subscription's, not this engine's.
-    ///
-    /// Pushed to from `commit()` inside `ucp_worker_progress`, and woken from
-    /// the engine loop -- the same split credit and probe acks use. Never read
-    /// from here: a transport does not consume its own frames, and after this
-    /// engine retires the queue and everything still in it belong to whoever
-    /// outlived it.
+    /// Where received frames go. The subscription's, not this engine's: pushed
+    /// to from `commit()`, never read from here.
     std::shared_ptr<DeliveryQueue> delivery_;
 
     std::vector<Pending> pending_; ///< engine thread only; indexed by slot
@@ -313,18 +298,12 @@ class SubscriberEngine final : public SubscriberTransport
 
     ucp_ep_h endpoint_{nullptr};
 
-    /// The part of the session contract the data path reads: which stream this
-    /// endpoint carries, and the array it was granted.
+    /// The part of the session contract the data path reads. The identifiers
+    /// `Renew` and `Close` quote, and the lease terms, stay with the
+    /// subscription.
     ///
-    /// Not the whole contract. The identifiers `Renew` and `Close` quote, and
-    /// the lease terms a timer reads, belong to the subscription and never come
-    /// down here -- keeping them in both places is what had the grant, the
-    /// epoch and the two lease terms declared three times over for one storage
-    /// location.
-    ///
-    /// Written by `activate()`, and read on the data path afterwards; the
-    /// engine thread does not exist until `activate()` starts it, which is what
-    /// publishes those writes.
+    /// Written by `activate()`; the engine thread does not exist until
+    /// `activate()` starts it, which is what publishes those writes.
     Protocol::StreamId stream_id_{0};
     Protocol::GeometryBlock granted_{};
 

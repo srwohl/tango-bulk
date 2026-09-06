@@ -136,7 +136,7 @@ struct Subscriber
     std::vector<std::byte> make_renew_request(std::uint64_t correlation_id)
     {
         return session.make_renew_request(correlation_id,
-                                          delivery->taken(),
+                                          delivery->stats().taken,
                                           engine.counters().credits_returned,
                                           static_cast<std::uint32_t>(engine.state()));
     }

@@ -159,21 +159,16 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config,
             status, std::string("invalid SubscriberConfig: ") + to_string(status), "subscriber"});
     }
 
-    // Checked here rather than at the first push, because the first push is
-    // inside `ucp_worker_progress` on the engine thread, where there is nothing
-    // useful to do about it.
+    // Checked here rather than at the first push, which happens inside
+    // `ucp_worker_progress` where there is nothing useful to do about it.
     if(!delivery_)
     {
         throw BulkException(BulkError{
             Status::Internal, "a subscriber transport needs a delivery queue", "subscriber"});
     }
 
-    // `delivery_mode` is deliberately not inspected here.  This class receives
-    // into the queue it was given and nothing else; whether a library-owned
-    // thread or the application takes frames out of it is the subscription's
-    // business, one layer up, which is also the layer that owns the
-    // `std::function` 5.2 keeps away from the engine.  A check here could only
-    // refuse a mode this class has no opinion about.
+    // `delivery_mode` is not inspected: this class receives into the queue it
+    // was given, and who takes frames out is the subscription's business.
 
     context_ = std::make_shared<UcxContext>(config_.ucx_tls);
     worker_ = std::make_unique<UcxWorker>(*context_);
@@ -214,11 +209,8 @@ SubscriberEngine::~SubscriberEngine()
 {
     running_.store(false, std::memory_order_release);
 
-    // The delivery queue is deliberately NOT stopped here. It belongs to the
-    // subscription, and a reconnect destroys this engine to build another over
-    // the same queue -- stopping it would end delivery for the subscription on
-    // the first lost session. Whoever owns the queue stops it when the
-    // subscription itself ends.
+    // The delivery queue is deliberately NOT stopped here: it belongs to the
+    // subscription, which a reconnect outlives. Its owner stops it.
 
     if(engine_.joinable())
     {
@@ -344,7 +336,6 @@ void SubscriberEngine::engine_loop()
         // Out of the callback and into the loop, the same way credit and
         // probe-acks are routed: a write() belongs nowhere near the inside of
         // ucp_worker_progress.
-        delivery_->notify();
 
         if(worked)
         {
@@ -958,10 +949,9 @@ void SubscriberEngine::commit(std::size_t slot_index) noexcept
     arena_->note_view_issued();
     FrameView view = ReceiveSlotLease::make_view(std::move(lease), slot.data, &slot.fields);
 
-    // 5.3's drop policy, the high-water gauge and the credit a dropped frame
-    // returns are all the queue's now. Waking a consumer is deliberately not
-    // done here: this runs inside `ucp_worker_progress`, and the loop calls
-    // `notify()` for the same reason it sends credit and probe acks.
+    // Drop policy, high-water gauge, credit return and the consumer wakeup are
+    // all the queue's. The wakeup writes a descriptor only when a consumer is
+    // armed, so the common case makes no syscall inside worker progress.
     delivery_->push(std::move(view));
 }
 
@@ -979,11 +969,8 @@ const std::byte *SubscriberEngine::slot_address(std::size_t index) const noexcep
 
 SubscriberCounters SubscriberEngine::counters() const noexcept
 {
-    // `frames_delivered`, `frames_dropped_queue_full` and the two queue gauges
-    // are absent, and stay absent: they describe the subscription's delivery
-    // queue, which outlives this transport. Reporting the shared totals from
-    // here would have them counted once per session by whoever accumulates
-    // retiring transports.
+    // The delivery counters are absent: they belong to the subscription's
+    // queue, which outlives this transport.
     SubscriberCounters out;
     out.frames_received = frames_received_.load(std::memory_order_relaxed);
     out.frames_dropped_stale_epoch = dropped_stale_epoch_.load(std::memory_order_relaxed);
