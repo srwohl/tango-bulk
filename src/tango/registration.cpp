@@ -35,7 +35,8 @@ namespace
 ///
 /// A `shared_mutex` rather than a `mutex` for one reason that matters:
 /// `detach_publisher()` must not return while a command is still inside
-/// `handle_coordination()` on that publisher, and a reader/writer lock is how
+/// the encoded coordination adapter on that publisher, and a reader/writer
+/// lock is how
 /// that is expressed without also serialising unrelated devices behind one
 /// publisher's slowest call -- `Open` waits on endpoint creation, which is
 /// bounded in seconds, not microseconds.
@@ -64,6 +65,23 @@ std::string lowercase(const std::string &text)
                    out.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return out;
+}
+
+std::vector<std::byte> encode_error_noexcept(Status status,
+                                             const char *message,
+                                             std::uint64_t correlation_id) noexcept
+{
+    try
+    {
+        return Protocol::encode(Protocol::ErrorMessage{status, message}, correlation_id);
+    }
+    catch(...)
+    {
+        // This is the last-resort path for a noexcept Tango adapter. There is
+        // no allocation-free encoded Error representation to return, so an
+        // empty byte array is safer than terminating the device server.
+        return {};
+    }
 }
 
 /// Reject a name that would shadow, or be shadowed by, a command the device
@@ -156,9 +174,9 @@ void detach_publisher(Tango::DeviceImpl &device) noexcept
 {
     Registry &reg = registry();
 
-    // Exclusive: on return, no command is inside handle_coordination() on this
-    // device's publisher, which is what makes it safe for the caller to destroy
-    // it in the next statement of delete_device().
+    // Exclusive: on return, no command is inside the coordination adapter on
+    // this device's publisher, which is what makes it safe for the caller to
+    // destroy it in the next statement of delete_device().
     const std::unique_lock<std::shared_mutex> lock(reg.mutex);
     reg.publishers.erase(&device);
 }
@@ -166,23 +184,10 @@ void detach_publisher(Tango::DeviceImpl &device) noexcept
 namespace detail
 {
 
-BulkPublisher *attached_publisher(Tango::DeviceImpl *device) noexcept
-{
-    if(device == nullptr)
-    {
-        return nullptr;
-    }
-
-    Registry &reg = registry();
-    const std::shared_lock<std::shared_mutex> lock(reg.mutex);
-
-    const auto found = reg.publishers.find(device);
-    return found == reg.publishers.end() ? nullptr : found->second;
-}
-
 std::vector<std::byte> dispatch_coordination(Tango::DeviceImpl *device,
                                              const std::byte *data,
-                                             std::size_t size) noexcept
+                                             std::size_t size,
+                                             std::optional<Protocol::CoordType> expected) noexcept
 {
     Protocol::Envelope envelope;
     const bool decoded = Protocol::decode_envelope(data, size, envelope) == Status::Ok;
@@ -201,13 +206,11 @@ std::vector<std::byte> dispatch_coordination(Tango::DeviceImpl *device,
         // transient state, not a fault, so this is an encoded Error and not a
         // DevFailed.  UnknownStream is the honest code -- this device serves no
         // stream at all right now.
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::UnknownStream,
-                                   "no bulk publisher is attached to this device"},
-            correlation_id);
+        return encode_error_noexcept(
+            Status::UnknownStream, "no bulk publisher is attached to this device", correlation_id);
     }
 
-    return found->second->handle_coordination(data, size);
+    return PublisherAccess::coordination(*found->second, data, size, expected);
 }
 
 } // namespace detail

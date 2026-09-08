@@ -96,8 +96,8 @@ class BulkTestDevice : public TANGO_BASE_CLASS
     {
         // 7.2, line three of three.  Detaching before the publisher is destroyed
         // is not tidiness: detach_publisher() returns only once no command is
-        // still inside handle_coordination(), which is what makes the next
-        // statement safe.
+        // still inside the encoded coordination adapter, which is what makes
+        // the next statement safe.
         if(attached_)
         {
             detach_publisher(*this);

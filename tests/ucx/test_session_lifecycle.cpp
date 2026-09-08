@@ -51,7 +51,7 @@ Protocol::RenewReply renew(BulkPublisher &publisher,
     request.session_id = id;
     const std::vector<std::byte> encoded = Protocol::encode(request, correlation_id);
     const std::vector<std::byte> raw =
-        publisher.handle_coordination(encoded.data(), encoded.size());
+        detail::PublisherAccess::coordination(publisher, encoded.data(), encoded.size());
 
     Protocol::RenewReply reply;
     REQUIRE(Protocol::decode(raw.data(), raw.size(), reply) == Status::Ok);
@@ -66,7 +66,7 @@ Protocol::CloseReply close(BulkPublisher &publisher,
     request.session_id = id;
     const std::vector<std::byte> encoded = Protocol::encode(request, correlation_id);
     const std::vector<std::byte> raw =
-        publisher.handle_coordination(encoded.data(), encoded.size());
+        detail::PublisherAccess::coordination(publisher, encoded.data(), encoded.size());
 
     Protocol::CloseReply reply;
     REQUIRE(Protocol::decode(raw.data(), raw.size(), reply) == Status::Ok);
@@ -81,7 +81,7 @@ Protocol::QueryReply query(BulkPublisher &publisher,
     request.session_id = id;
     const std::vector<std::byte> encoded = Protocol::encode(request, correlation_id);
     const std::vector<std::byte> raw =
-        publisher.handle_coordination(encoded.data(), encoded.size());
+        detail::PublisherAccess::coordination(publisher, encoded.data(), encoded.size());
 
     Protocol::QueryReply reply;
     REQUIRE(Protocol::decode(raw.data(), raw.size(), reply) == Status::Ok);
@@ -113,6 +113,53 @@ std::string counter(const std::string &blob, const std::string &key)
 }
 
 } // namespace
+
+TEST_CASE("publisher snapshot is an owner value and yields a discovery offer",
+          "[observation][stream-offer]")
+{
+    BulkPublisher publisher(publisher_config());
+
+    const PublisherSnapshot snapshot = publisher.snapshot();
+    REQUIRE(snapshot.stream_name == "bulk.slice");
+    REQUIRE(snapshot.accepting);
+    REQUIRE(snapshot.sampled_at_steady_ns != 0);
+    CHECK(snapshot.active_sessions == 0);
+    CHECK(snapshot.geometry.max_frame_bytes == k_frame_bytes);
+    CHECK(snapshot.geometry.ring_depth == k_ring_depth);
+    CHECK(snapshot.counters.sessions_opened == 0);
+
+    const StreamOffer offer = snapshot.stream_offer();
+    CHECK(offer.status == Status::Ok);
+    CHECK(offer.stream_name == "bulk.slice");
+    CHECK(offer.geometry == snapshot.geometry);
+    CHECK(offer.validate() == Status::Ok);
+}
+
+TEST_CASE("encoded coordination preserves correlation on typed publisher failures",
+          "[coordination][adapter]")
+{
+    BulkPublisher publisher(publisher_config());
+
+    Protocol::OpenRequest request;
+    request.stream_name = publisher_config().stream_name;
+    request.requested_max_frame_bytes = k_frame_bytes;
+    request.requested_ring_depth = k_ring_depth;
+    request.requested_credit_window = k_credit_window;
+    request.client_ucx_address = {std::byte{0x01}};
+    request.requested_transport = static_cast<Protocol::Transport>(99);
+
+    constexpr std::uint64_t correlation_id = 0x0102030405060708ull;
+    const std::vector<std::byte> encoded = Protocol::encode(request, correlation_id);
+    const std::vector<std::byte> raw =
+        detail::PublisherAccess::coordination(publisher, encoded.data(), encoded.size());
+
+    Protocol::ErrorMessage error;
+    Protocol::Envelope envelope;
+    REQUIRE(Protocol::decode(raw.data(), raw.size(), error, &envelope) == Status::Ok);
+    CHECK(envelope.correlation_id == correlation_id);
+    CHECK(error.status == Status::MalformedMessage);
+    CHECK(publisher.session_count() == 0);
+}
 
 TEST_CASE("Open grants unpredictable identifiers and the negotiated lease terms", "[m3][session]")
 {
@@ -174,7 +221,7 @@ TEST_CASE("A granted session carries no frame until ProbeAck arms it", "[m3][ses
     REQUIRE(collect(*subscriber.delivery, 1).size() == 1);
 
     const std::vector<std::byte> request = subscriber.make_close_request(2);
-    publisher.handle_coordination(request.data(), request.size());
+    detail::PublisherAccess::coordination(publisher, request.data(), request.size());
 }
 
 TEST_CASE("Renewal keeps a session alive past its lease", "[m3][session]")
@@ -188,7 +235,7 @@ TEST_CASE("Renewal keeps a session alive past its lease", "[m3][session]")
     {
         const std::vector<std::byte> request = slice.subscriber.make_renew_request(++correlation);
         const std::vector<std::byte> reply =
-            slice.publisher.handle_coordination(request.data(), request.size());
+            detail::PublisherAccess::coordination(slice.publisher, request.data(), request.size());
         REQUIRE(slice.subscriber.adopt_renew_reply(reply.data(), reply.size()) == Status::Ok);
         std::this_thread::sleep_for(200ms);
     }
@@ -227,11 +274,10 @@ TEST_CASE("An unrenewed session expires on schedule with no frames in flight", "
 
     // The client learns from the reply that this session is over for good.
     const std::vector<std::byte> encoded = Protocol::encode(late, 7);
-    const detail::SessionClient::RenewOutcome outcome =
-        subscriber.session.adopt_renew_reply(encoded.data(), encoded.size());
+    const Status outcome = subscriber.adopt_renew_reply(encoded.data(), encoded.size());
 
-    CHECK(outcome.status == Status::SessionExpired);
-    CHECK(outcome.session_lost);
+    CHECK(outcome == Status::SessionExpired);
+    CHECK(subscriber.last_renew_lost());
 }
 
 TEST_CASE("A client that vanishes releases its slots on the lease, and the stream recovers",
@@ -285,7 +331,7 @@ TEST_CASE("A client that vanishes releases its slots on the lease, and the strea
     CHECK(delivered.front().sequence() == 0);
 
     const std::vector<std::byte> request = restarted.make_close_request(3);
-    publisher.handle_coordination(request.data(), request.size());
+    detail::PublisherAccess::coordination(publisher, request.data(), request.size());
 
     // The frames the dead client never released are still readable here.
     for(std::size_t n = 0; n < stranded.size(); ++n)
@@ -333,9 +379,9 @@ TEST_CASE("Two sessions coexist and a slot returns only when both have credited 
     CHECK(publisher.counters().frames_credited == 1);
 
     const std::vector<std::byte> close_first = first.make_close_request(11);
-    publisher.handle_coordination(close_first.data(), close_first.size());
+    detail::PublisherAccess::coordination(publisher, close_first.data(), close_first.size());
     const std::vector<std::byte> close_second = second.make_close_request(12);
-    publisher.handle_coordination(close_second.data(), close_second.size());
+    detail::PublisherAccess::coordination(publisher, close_second.data(), close_second.size());
 }
 
 TEST_CASE("Close is idempotent and Renew tells a closed session from an unknown one",
@@ -483,7 +529,7 @@ TEST_CASE("engine_cpu_affinity pins the engine, and the placement report proves 
     CHECK(detail::to_string(where.placement()) != nullptr);
 
     const std::vector<std::byte> request = subscriber.make_close_request(2);
-    publisher.handle_coordination(request.data(), request.size());
+    detail::PublisherAccess::coordination(publisher, request.data(), request.size());
 }
 
 TEST_CASE("Query answers server-wide and per session", "[m4][session]")
@@ -547,4 +593,35 @@ TEST_CASE("Query answers server-wide and per session", "[m4][session]")
     }
 
     close(publisher, granted.session_id);
+}
+
+TEST_CASE("coordination adapter echoes correlation on outer failures", "[m4][coordination]")
+{
+    BulkPublisher publisher(publisher_config());
+
+    // This is structurally valid coordination data, but the address cannot be
+    // used to create a UCX endpoint.  The failure therefore leaves the typed
+    // publisher path through its outer exception conversion.
+    Protocol::OpenRequest request;
+    request.stream_name = "bulk.slice";
+    request.client_instance_id = Protocol::generate_client_instance_id();
+    request.requested_max_frame_bytes = k_frame_bytes;
+    request.requested_ring_depth = k_ring_depth;
+    request.requested_credit_window = k_credit_window;
+    request.client_ucx_address = {std::byte{0}};
+
+    constexpr std::uint64_t correlation_id = 0x0102030405060708ull;
+    const std::vector<std::byte> encoded = Protocol::encode(request, correlation_id);
+    const std::vector<std::byte> raw =
+        detail::PublisherAccess::coordination(publisher, encoded.data(), encoded.size());
+
+    Protocol::Envelope envelope;
+    REQUIRE(Protocol::decode_envelope(raw.data(), raw.size(), envelope) == Status::Ok);
+    CHECK(envelope.msg_type == Protocol::CoordType::Error);
+    CHECK(envelope.correlation_id == correlation_id);
+
+    Protocol::ErrorMessage error;
+    REQUIRE(Protocol::decode(raw.data(), raw.size(), error) == Status::Ok);
+    CHECK(error.status == Status::TransportFailure);
+    CHECK(publisher.session_count() == 0);
 }

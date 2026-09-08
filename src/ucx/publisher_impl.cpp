@@ -10,6 +10,8 @@
 #include <core/bounded_queue.h>
 #include <core/cpu_topology.h>
 #include <core/credit_window.h>
+#include <core/geometry_conversion.h>
+#include <core/publisher_internal.h>
 
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/publisher.h>
@@ -24,7 +26,10 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
+#include <type_traits>
+#include <variant>
 #include <vector>
 
 /// The publisher: registered producer ring, engine thread, and the session
@@ -54,6 +59,27 @@ using detail::RegisteredRing;
 using detail::UcxContext;
 using detail::UcxWorker;
 using Protocol::SessionState;
+
+/// Typed coordination values deliberately carry no envelope or correlation.
+/// The encoded adapter recovers those at the ingress boundary; the publisher
+/// only decides what a request means and returns one typed outcome.
+using CoordinationRequest =
+    std::variant<Protocol::OpenRequest,
+                 Protocol::RenewRequest,
+                 Protocol::CloseRequest,
+                 Protocol::QueryRequest>;
+using CoordinationReply =
+    std::variant<Protocol::OpenReply,
+                 Protocol::RenewReply,
+                 Protocol::CloseReply,
+                 Protocol::QueryReply,
+                 Protocol::ErrorMessage>;
+
+template <typename Message>
+CoordinationReply typed_reply(Message message)
+{
+    return CoordinationReply{std::move(message)};
+}
 
 std::uint64_t now_realtime_ns() noexcept
 {
@@ -292,8 +318,9 @@ struct BulkPublisher::Impl
     };
 
     /// Endpoint creation is a `ucp_*` call, so it belongs to the engine thread
-    /// (5.1).  `handle_coordination` runs on the caller's thread -- a Tango
-    /// command thread in production -- and therefore asks rather than acts.
+    /// (5.1).  The encoded coordination adapter runs on the caller's thread --
+    /// a Tango command thread in production -- and therefore asks rather than
+    /// acts.
     struct ConnectTask
     {
         const std::byte *address{nullptr};
@@ -1169,18 +1196,20 @@ struct BulkPublisher::Impl
         return nullptr;
     }
 
-    std::vector<std::byte> handle_open(const std::byte *data,
-                                       std::size_t size,
-                                       std::uint64_t correlation_id);
-    std::vector<std::byte> handle_renew(const std::byte *data,
-                                        std::size_t size,
-                                        std::uint64_t correlation_id);
-    std::vector<std::byte> handle_close(const std::byte *data,
-                                        std::size_t size,
-                                        std::uint64_t correlation_id);
-    std::vector<std::byte> handle_query(const std::byte *data,
-                                        std::size_t size,
-                                        std::uint64_t correlation_id);
+    /// The typed target.  Request classification and envelope handling stay
+    /// at the encoded boundary below; these handlers never see caller-owned
+    /// bytes or correlation identifiers.
+    CoordinationReply handle_coordination(const CoordinationRequest &request);
+
+    std::vector<std::byte> handle_encoded_coordination(
+        const std::byte *data,
+        std::size_t size,
+        std::optional<Protocol::CoordType> expected = std::nullopt) noexcept;
+
+    CoordinationReply handle_open(const Protocol::OpenRequest &request);
+    CoordinationReply handle_renew(const Protocol::RenewRequest &request);
+    CoordinationReply handle_close(const Protocol::CloseRequest &request);
+    CoordinationReply handle_query(const Protocol::QueryRequest &request);
 
     /// The geometry this publisher grants, at the current epoch.
     ///
@@ -1477,87 +1506,229 @@ PublisherCounters BulkPublisher::counters() const noexcept
     return out;
 }
 
-std::vector<std::byte> BulkPublisher::handle_coordination(const std::byte *data,
-                                                          std::size_t size) noexcept
+PublisherSnapshot BulkPublisher::snapshot() const
 {
-    // The seam that keeps Tango out of the core: encoded bytes in, encoded bytes
-    // out.  The Tango adapter (M4) is a DevVarCharArray wrapper over this, and
-    // the tests drive the whole session lifecycle through it with no Tango
-    // process at all.
-    //
-    // noexcept, and it means it: this is reached from a Tango command
-    // implementation, where an escaping C++ exception is a device server crash
-    // rather than a DevFailed.
+    PublisherSnapshot out;
+    out.stream_name = impl_->config.stream_name;
+    out.geometry = detail::to_geometry(impl_->current_geometry());
+    out.counters = counters();
+    out.active_sessions = impl_->armed_sessions.load(std::memory_order_acquire);
+    out.sampled_at_steady_ns = now_steady_ms() * 1'000'000ull;
+    out.accepting = impl_->running.load(std::memory_order_acquire);
+    return out;
+}
+
+StreamOffer PublisherSnapshot::stream_offer() const
+{
+    StreamOffer out;
+    out.stream_name = stream_name;
+    out.geometry = geometry;
+    out.status = accepting ? Status::Ok : Status::UnknownStream;
+    if(!accepting)
+    {
+        out.message = "publisher is not accepting sessions";
+    }
+    return out;
+}
+
+std::vector<std::byte> encode_coordination_error(Status status,
+                                                  const std::string &message,
+                                                  std::uint64_t correlation_id) noexcept
+{
+    try
+    {
+        return Protocol::encode(Protocol::ErrorMessage{status, message}, correlation_id);
+    }
+    catch(...)
+    {
+        // Allocation failure cannot be represented as another encoded Error.
+        return {};
+    }
+}
+
+std::vector<std::byte> encode_coordination_reply(const CoordinationReply &reply,
+                                                 std::uint64_t correlation_id) noexcept
+{
+    try
+    {
+        return std::visit(
+            [correlation_id](const auto &message)
+            { return Protocol::encode(message, correlation_id); },
+            reply);
+    }
+    catch(...)
+    {
+        return encode_coordination_error(Status::Internal,
+                                         "could not encode coordination reply",
+                                         correlation_id);
+    }
+}
+
+CoordinationReply BulkPublisher::Impl::handle_coordination(const CoordinationRequest &request)
+{
+    return std::visit(
+        [this](const auto &typed_request) -> CoordinationReply
+        {
+            using Request = std::decay_t<decltype(typed_request)>;
+            if constexpr(std::is_same_v<Request, Protocol::OpenRequest>)
+            {
+                return handle_open(typed_request);
+            }
+            else if constexpr(std::is_same_v<Request, Protocol::RenewRequest>)
+            {
+                return handle_renew(typed_request);
+            }
+            else if constexpr(std::is_same_v<Request, Protocol::CloseRequest>)
+            {
+                return handle_close(typed_request);
+            }
+            else
+            {
+                return handle_query(typed_request);
+            }
+        },
+        request);
+}
+
+std::vector<std::byte> BulkPublisher::Impl::handle_encoded_coordination(
+    const std::byte *data,
+    std::size_t size,
+    std::optional<Protocol::CoordType> expected) noexcept
+{
+    std::uint64_t correlation_id = 0;
+
+    // The encoded ingress boundary is shared by Tango and in-process adapters.
     try
     {
         Protocol::Envelope envelope;
         if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
         {
-            impl_->counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-            return Protocol::encode(
-                Protocol::ErrorMessage{Status::MalformedMessage, "undecodable envelope"}, 0);
+            counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+            return encode_coordination_error(Status::MalformedMessage,
+                                             "undecodable envelope",
+                                             0);
         }
 
+        correlation_id = envelope.correlation_id;
+        if(expected && envelope.msg_type != *expected)
+        {
+            counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+            return encode_coordination_error(
+                Status::MalformedMessage,
+                std::string("this command carries ") + Protocol::to_string(*expected) +
+                    ", not " + Protocol::to_string(envelope.msg_type),
+                correlation_id);
+        }
         switch(envelope.msg_type)
         {
         case Protocol::CoordType::Open:
-            return impl_->handle_open(data, size, envelope.correlation_id);
+        {
+            Protocol::OpenRequest request;
+            if(Protocol::decode(data, size, request) != Status::Ok)
+            {
+                counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+                return encode_coordination_error(Status::MalformedMessage,
+                                                 "undecodable Open",
+                                                 correlation_id);
+            }
+            return encode_coordination_reply(handle_open(request), correlation_id);
+        }
         case Protocol::CoordType::Renew:
-            return impl_->handle_renew(data, size, envelope.correlation_id);
+        {
+            Protocol::RenewRequest request;
+            if(Protocol::decode(data, size, request) != Status::Ok)
+            {
+                counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+                return encode_coordination_error(Status::MalformedMessage,
+                                                 "undecodable Renew",
+                                                 correlation_id);
+            }
+            return encode_coordination_reply(handle_renew(request), correlation_id);
+        }
         case Protocol::CoordType::Close:
-            return impl_->handle_close(data, size, envelope.correlation_id);
+        {
+            Protocol::CloseRequest request;
+            if(Protocol::decode(data, size, request) != Status::Ok)
+            {
+                counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+                return encode_coordination_error(Status::MalformedMessage,
+                                                 "undecodable Close",
+                                                 correlation_id);
+            }
+            return encode_coordination_reply(handle_close(request), correlation_id);
+        }
         case Protocol::CoordType::Query:
-            return impl_->handle_query(data, size, envelope.correlation_id);
+        {
+            Protocol::QueryRequest request;
+            if(Protocol::decode(data, size, request) != Status::Ok)
+            {
+                counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+                return encode_coordination_error(Status::MalformedMessage,
+                                                 "undecodable Query",
+                                                 correlation_id);
+            }
+            return encode_coordination_reply(handle_query(request), correlation_id);
+        }
         default:
             // Everything left is a *reply* type, which a publisher never
             // receives.  Naming it beats a stub that answers Ok and quietly does
             // nothing.
-            impl_->counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-            return Protocol::encode(
-                Protocol::ErrorMessage{Status::MalformedMessage,
-                                       std::string(Protocol::to_string(envelope.msg_type)) +
-                                           " is not a request a publisher answers"},
-                envelope.correlation_id);
+            counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+            return encode_coordination_error(
+                Status::MalformedMessage,
+                std::string(Protocol::to_string(envelope.msg_type)) +
+                    " is not a request a publisher answers",
+                correlation_id);
         }
     }
     catch(const BulkException &e)
     {
-        return Protocol::encode(Protocol::ErrorMessage{e.error().status, e.error().message},
-                                0);
+        return encode_coordination_error(e.error().status, e.error().message, correlation_id);
     }
     catch(const std::exception &e)
     {
-        return Protocol::encode(Protocol::ErrorMessage{Status::Internal, e.what()}, 0);
+        return encode_coordination_error(Status::Internal, e.what(), correlation_id);
+    }
+    catch(...)
+    {
+        return encode_coordination_error(Status::Internal,
+                                         "unknown coordination failure",
+                                         correlation_id);
     }
 }
 
-std::vector<std::byte> BulkPublisher::Impl::handle_open(const std::byte *data,
-                                                        std::size_t size,
-                                                        std::uint64_t correlation_id)
+CoordinationReply BulkPublisher::Impl::handle_open(const Protocol::OpenRequest &request)
 {
-    Protocol::OpenRequest request;
-    if(Protocol::decode(data, size, request) != Status::Ok)
+    if(request.requested_transport != Protocol::Transport::Any &&
+       request.requested_transport != Protocol::Transport::ActiveMessage)
     {
-        counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::MalformedMessage, "undecodable Open"}, correlation_id);
+        throw BulkException(BulkError{Status::MalformedMessage,
+                                      "Open requested an unsupported transport",
+                                      "publisher"});
+    }
+
+    if(request.requested_memory_kind != MemoryKind::Host &&
+       request.requested_memory_kind != MemoryKind::Cuda &&
+       request.requested_memory_kind != MemoryKind::Rocm)
+    {
+        throw BulkException(BulkError{Status::MalformedMessage,
+                                      "Open requested an unsupported memory kind",
+                                      "publisher"});
     }
 
     // 3.5 step 2: version intersect.
     if(request.version_min > Protocol::k_version_major ||
        request.version_max < Protocol::k_version_major)
     {
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::UnsupportedVersion, "no common protocol major"},
-            correlation_id);
+        return typed_reply(
+            Protocol::ErrorMessage{Status::UnsupportedVersion, "no common protocol major"});
     }
 
     // 3.5 step 3: resolve stream_name.
     if(request.stream_name != config.stream_name)
     {
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::UnknownStream, "no such stream on this publisher"},
-            correlation_id);
+        return typed_reply(
+            Protocol::ErrorMessage{Status::UnknownStream, "no such stream on this publisher"});
     }
 
     // 3.5 step 5: clamp downward.  A grant is never larger than requested and
@@ -1570,9 +1741,8 @@ std::vector<std::byte> BulkPublisher::Impl::handle_open(const std::byte *data,
 
     if(geometry.max_frame_bytes == 0 || geometry.ring_depth == 0 || geometry.credit_window == 0)
     {
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::MalformedMessage, "Open requested a zero geometry"},
-            correlation_id);
+        return typed_reply(
+            Protocol::ErrorMessage{Status::MalformedMessage, "Open requested a zero geometry"});
     }
 
     // 3.5 step 4.  4.4: a duplicate Open -- same client_instance_id or not --
@@ -1612,9 +1782,8 @@ std::vector<std::byte> BulkPublisher::Impl::handle_open(const std::byte *data,
     if(session == nullptr)
     {
         counters.sessions_rejected.fetch_add(1, std::memory_order_relaxed);
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::TooManySessions, "no free session on this publisher"},
-            correlation_id);
+        return typed_reply(
+            Protocol::ErrorMessage{Status::TooManySessions, "no free session on this publisher"});
     }
 
     // 3.5 step 7.  The endpoint has to exist before a probe can go out, and
@@ -1670,21 +1839,11 @@ std::vector<std::byte> BulkPublisher::Impl::handle_open(const std::byte *data,
     reply.geometry = geometry;
     reply.server_ucx_address = worker->address();
 
-    return Protocol::encode(reply, correlation_id);
+    return typed_reply(std::move(reply));
 }
 
-std::vector<std::byte> BulkPublisher::Impl::handle_renew(const std::byte *data,
-                                                         std::size_t size,
-                                                         std::uint64_t correlation_id)
+CoordinationReply BulkPublisher::Impl::handle_renew(const Protocol::RenewRequest &request)
 {
-    Protocol::RenewRequest request;
-    if(Protocol::decode(data, size, request) != Status::Ok)
-    {
-        counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::MalformedMessage, "undecodable Renew"}, correlation_id);
-    }
-
     Protocol::RenewReply reply;
     reply.session_id = request.session_id;
     reply.lease_ttl_ms = config.lease_ttl_ms;
@@ -1699,7 +1858,7 @@ std::vector<std::byte> BulkPublisher::Impl::handle_renew(const std::byte *data,
         // gone, reopen" from "your message was garbage".
         reply.status = Status::UnknownSession;
         reply.server_state = SessionState::Unknown;
-        return Protocol::encode(reply, correlation_id);
+        return typed_reply(std::move(reply));
     }
 
     reply.geometry = session->geometry;
@@ -1717,7 +1876,7 @@ std::vector<std::byte> BulkPublisher::Impl::handle_renew(const std::byte *data,
                 ? Status::UnknownSession
                 : Status::SessionExpired;
         reply.server_state = state;
-        return Protocol::encode(reply, correlation_id);
+        return typed_reply(std::move(reply));
     }
 
     const std::uint64_t now = now_steady_ms();
@@ -1736,7 +1895,7 @@ std::vector<std::byte> BulkPublisher::Impl::handle_renew(const std::byte *data,
         counters.renewals_rejected.fetch_add(1, std::memory_order_relaxed);
         reply.status = Status::RenewTooFrequent;
         reply.server_state = state;
-        return Protocol::encode(reply, correlation_id);
+        return typed_reply(std::move(reply));
     }
 
     // 4.4: a late Renew that is still inside the TTL is accepted and counted,
@@ -1756,21 +1915,11 @@ std::vector<std::byte> BulkPublisher::Impl::handle_renew(const std::byte *data,
 
     reply.status = Status::Ok;
     reply.server_state = state;
-    return Protocol::encode(reply, correlation_id);
+    return typed_reply(std::move(reply));
 }
 
-std::vector<std::byte> BulkPublisher::Impl::handle_close(const std::byte *data,
-                                                         std::size_t size,
-                                                         std::uint64_t correlation_id)
+CoordinationReply BulkPublisher::Impl::handle_close(const Protocol::CloseRequest &request)
 {
-    Protocol::CloseRequest request;
-    if(Protocol::decode(data, size, request) != Status::Ok)
-    {
-        counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::MalformedMessage, "undecodable Close"}, correlation_id);
-    }
-
     Protocol::CloseReply reply;
     reply.session_id = request.session_id;
     reply.frames_credited_final =
@@ -1787,34 +1936,24 @@ std::vector<std::byte> BulkPublisher::Impl::handle_close(const std::byte *data,
     if(session == nullptr)
     {
         reply.status = Status::UnknownSession;
-        return Protocol::encode(reply, correlation_id);
+        return typed_reply(std::move(reply));
     }
 
     if(!begin_expiry(*session, EndReason::Close))
     {
         reply.status = Status::UnknownSession;
-        return Protocol::encode(reply, correlation_id);
+        return typed_reply(std::move(reply));
     }
 
     // Teardown itself belongs to the engine: steps 2 and 3 of 4.2 are ucp_*
     // calls on the worker.  The reply does not wait for it -- the counters it
     // carries are diagnostics, and 3.8 asks for idempotence, not synchrony.
     reply.status = Status::Ok;
-    return Protocol::encode(reply, correlation_id);
+    return typed_reply(std::move(reply));
 }
 
-std::vector<std::byte> BulkPublisher::Impl::handle_query(const std::byte *data,
-                                                         std::size_t size,
-                                                         std::uint64_t correlation_id)
+CoordinationReply BulkPublisher::Impl::handle_query(const Protocol::QueryRequest &request)
 {
-    Protocol::QueryRequest request;
-    if(Protocol::decode(data, size, request) != Status::Ok)
-    {
-        counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::MalformedMessage, "undecodable Query"}, correlation_id);
-    }
-
     Protocol::QueryReply reply;
     reply.session_id = request.session_id;
     reply.generation = generation;
@@ -1918,7 +2057,20 @@ std::vector<std::byte> BulkPublisher::Impl::handle_query(const std::byte *data,
     }
 
     reply.counters = std::move(blob);
-    return Protocol::encode(reply, correlation_id);
+    return typed_reply(std::move(reply));
 }
 
 } // namespace TangoBulk
+
+namespace TangoBulk::detail
+{
+
+std::vector<std::byte> PublisherAccess::coordination(BulkPublisher &publisher,
+                                                     const std::byte *data,
+                                                     std::size_t size,
+                                                     std::optional<Protocol::CoordType> expected) noexcept
+{
+    return publisher.impl_->handle_encoded_coordination(data, size, expected);
+}
+
+} // namespace TangoBulk::detail
