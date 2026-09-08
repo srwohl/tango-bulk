@@ -13,16 +13,53 @@
 
 #include <chrono>
 #include <functional>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace TangoBulk::detail
 {
 
 using CoordinationChannel =
-    std::function<std::vector<std::byte>(Protocol::CoordType, const std::vector<std::byte> &)>;
+    std::function<std::vector<std::byte>(Protocol::CoordType,
+                                         const std::vector<std::byte> &,
+                                         std::chrono::steady_clock::time_point)>;
 
 using TransportFactory = std::function<std::unique_ptr<SubscriberTransport>(
     const SubscriberConfig &, std::shared_ptr<DeliveryQueue>)>;
+
+/// A small test and embedding adapter for the same seam a real discovery
+/// source uses.  It owns copies of offers and never contacts coordination,
+/// making it useful to Subscription callers and lifecycle tests without
+/// introducing a second establishment module.
+class InMemoryStreamDiscovery
+{
+  public:
+    explicit InMemoryStreamDiscovery(std::vector<StreamOffer> offers) :
+        offers_(std::move(offers))
+    {
+    }
+
+    StreamOffer discover(const std::string &stream_name) const
+    {
+        for(const StreamOffer &offer : offers_)
+        {
+            if(offer.stream_name == stream_name)
+            {
+                return offer;
+            }
+        }
+
+        StreamOffer unavailable;
+        unavailable.stream_name = stream_name;
+        unavailable.status = Status::UnknownStream;
+        unavailable.message = "stream was not present in discovery";
+        return unavailable;
+    }
+
+  private:
+    std::vector<StreamOffer> offers_;
+};
 
 class SubscriptionFactory
 {

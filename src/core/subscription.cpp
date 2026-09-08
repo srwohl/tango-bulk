@@ -4,13 +4,13 @@
 
 #include <core/subscription_internal.h>
 
-#include <core/session_client.h>
 #include <core/geometry_conversion.h>
 
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -63,6 +63,234 @@ std::chrono::milliseconds detail::backoff_delay(std::uint32_t attempt,
 
 struct Subscription::Impl
 {
+    /// The wire-level session is implementation state of a Subscription.  It
+    /// deliberately has no header of its own: callers own a Subscription, not
+    /// a second session object, and a replacement transport must not become a
+    /// second lifecycle owner.
+    struct SessionState
+    {
+        std::vector<std::byte> make_open_request(const SubscriberConfig &config,
+                                                 const std::vector<std::byte> &client_address,
+                                                 std::uint64_t correlation_id) const
+        {
+            Protocol::OpenRequest request;
+            request.version_min = Protocol::k_version_major;
+            request.version_max = Protocol::k_version_major;
+            // Coalescing and probe.  Geometry re-arm is left out because the
+            // two-ring interlock is not implemented, and claiming a capability
+            // this side cannot honour is worse than not having it.
+            request.requested_caps = Protocol::k_caps_credit_coalescing | Protocol::k_caps_probe;
+            request.client_instance_id = Protocol::generate_client_instance_id();
+            const ReceivePlan upper = ReceivePlan::from_limits(
+                config.max_frame_bytes, config.ring_depth, config.credit_window);
+            request.requested_max_frame_bytes = upper.max_frame_bytes;
+            request.requested_ring_depth = upper.ring_depth;
+            request.requested_credit_window = upper.credit_window;
+            request.requested_memory_kind = config.receive_memory_kind;
+            request.requested_transport = Protocol::Transport::ActiveMessage;
+            request.drop_policy = config.drop_policy;
+            request.stream_name = config.stream_name;
+            request.client_ucx_address = client_address;
+
+            return Protocol::encode(request, correlation_id);
+        }
+
+        Status adopt_open_reply(const std::byte *data,
+                                std::size_t size,
+                                const SubscriberConfig &config,
+                                std::uint64_t expected_correlation)
+        {
+            Protocol::Envelope envelope;
+            if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
+            {
+                return Status::MalformedMessage;
+            }
+
+            if(envelope.correlation_id != expected_correlation)
+            {
+                return Status::MalformedMessage;
+            }
+
+            // A client must accept Error in place of any expected reply.
+            if(envelope.msg_type == Protocol::CoordType::Error)
+            {
+                Protocol::ErrorMessage error;
+                const Status decoded = Protocol::decode(data, size, error);
+                return decoded == Status::Ok ? error.status : Status::MalformedMessage;
+            }
+
+            Protocol::OpenReply reply;
+            if(Protocol::decode(data, size, reply) != Status::Ok)
+            {
+                return Status::MalformedMessage;
+            }
+
+            if(reply.status != Status::Ok)
+            {
+                return reply.status;
+            }
+
+            if(reply.geometry.validate() != Status::Ok)
+            {
+                return Status::GeometryMismatch;
+            }
+
+            // A grant is only ever clamped downward, so a ring registered at
+            // the requested geometry is large enough for the granted one.
+            // Check anyway because that depends on peer behaviour.
+            if(reply.geometry.max_frame_bytes > config.max_frame_bytes ||
+               reply.geometry.ring_depth > config.ring_depth ||
+               reply.geometry.credit_window > config.credit_window)
+            {
+                return Status::GeometryMismatch;
+            }
+
+            session_id = reply.session_id;
+            stream_id = reply.stream_id;
+            server_address = reply.server_ucx_address;
+            granted = reply.geometry;
+            lease_ttl_ms = reply.lease_ttl_ms;
+            renew_interval_ms = reply.renew_interval_ms;
+            return Status::Ok;
+        }
+
+        std::vector<std::byte> make_renew_request(std::uint64_t correlation_id,
+                                                  std::uint64_t frames_delivered,
+                                                  std::uint64_t credits_returned,
+                                                  std::uint32_t client_state) const
+        {
+            Protocol::RenewRequest request;
+            request.session_id = session_id;
+            request.client_frames_delivered = frames_delivered;
+            request.client_credits_returned = credits_returned;
+            request.client_state = client_state;
+            return Protocol::encode(request, correlation_id);
+        }
+
+        struct RenewOutcome
+        {
+            Status status{Status::Ok};
+            bool session_lost{false};
+        };
+
+        RenewOutcome adopt_renew_reply(const std::byte *data,
+                                       std::size_t size,
+                                       std::uint64_t expected_correlation)
+        {
+            Protocol::Envelope envelope;
+            if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
+            {
+                return {Status::MalformedMessage, false};
+            }
+
+            if(envelope.correlation_id != expected_correlation)
+            {
+                return {Status::MalformedMessage, false};
+            }
+
+            // Transport errors and Error replies are recovery hints.  A
+            // session is terminal only when the publisher says it is gone.
+            if(envelope.msg_type == Protocol::CoordType::Error)
+            {
+                Protocol::ErrorMessage error;
+                const Status decoded = Protocol::decode(data, size, error);
+                return {decoded == Status::Ok ? error.status : Status::MalformedMessage, false};
+            }
+
+            Protocol::RenewReply reply;
+            if(Protocol::decode(data, size, reply) != Status::Ok)
+            {
+                return {Status::MalformedMessage, false};
+            }
+
+            if(reply.session_id != session_id)
+            {
+                return {Status::MalformedMessage, false};
+            }
+
+            if(reply.status != Status::Ok)
+            {
+                return {reply.status, reply.status != Status::RenewTooFrequent};
+            }
+
+            lease_ttl_ms = reply.lease_ttl_ms;
+            renew_interval_ms = reply.renew_interval_ms;
+            return {Status::Ok, false};
+        }
+
+        std::vector<std::byte> make_close_request(std::uint64_t correlation_id) const
+        {
+            Protocol::CloseRequest request;
+            request.session_id = session_id;
+            request.reason = Protocol::CloseReason::ClientShutdown;
+            return Protocol::encode(request, correlation_id);
+        }
+
+        Status adopt_close_reply(const std::byte *data,
+                                 std::size_t size,
+                                 std::uint64_t expected_correlation) const noexcept
+        {
+            Protocol::Envelope envelope;
+            if(Protocol::decode_envelope(data, size, envelope) != Status::Ok ||
+               envelope.correlation_id != expected_correlation)
+            {
+                return Status::MalformedMessage;
+            }
+
+            if(envelope.msg_type == Protocol::CoordType::Error)
+            {
+                Protocol::ErrorMessage error;
+                return Protocol::decode(data, size, error) == Status::Ok
+                           ? error.status
+                           : Status::MalformedMessage;
+            }
+
+            Protocol::CloseReply reply;
+            if(Protocol::decode(data, size, reply) != Status::Ok)
+            {
+                return Status::MalformedMessage;
+            }
+            if(reply.session_id != session_id)
+            {
+                return Status::MalformedMessage;
+            }
+            return reply.status;
+        }
+
+        const std::vector<std::byte> &server_address_value() const noexcept
+        {
+            return server_address;
+        }
+
+        Protocol::StreamId stream_id_value() const noexcept
+        {
+            return stream_id;
+        }
+
+        const Protocol::GeometryBlock &granted_geometry() const noexcept
+        {
+            return granted;
+        }
+
+        std::uint32_t lease_ttl() const noexcept
+        {
+            return lease_ttl_ms;
+        }
+
+        std::uint32_t renew_interval() const noexcept
+        {
+            return renew_interval_ms;
+        }
+
+      private:
+        Protocol::SessionId session_id{};
+        Protocol::StreamId stream_id{0};
+        std::vector<std::byte> server_address;
+        Protocol::GeometryBlock granted{};
+        std::uint32_t lease_ttl_ms{0};
+        std::uint32_t renew_interval_ms{0};
+    };
+
     Impl(SubscriberConfig cfg,
          detail::CoordinationChannel coordination,
          detail::TransportFactory transport_factory,
@@ -106,17 +334,18 @@ struct Subscription::Impl
             return false;
         }
 
-        detail::SessionClient candidate;
+        SessionState candidate;
 
         try
         {
+            const std::uint64_t correlation_id = next_correlation_id();
             const std::vector<std::byte> request = candidate.make_open_request(
-                config, fresh->local_address(), next_correlation_id());
+                config, fresh->local_address(), correlation_id);
             const std::vector<std::byte> reply =
-                channel(Protocol::CoordType::Open, request);
+                channel(Protocol::CoordType::Open, request, establishment_deadline);
 
             const Status status =
-                candidate.adopt_open_reply(reply.data(), reply.size(), config);
+                candidate.adopt_open_reply(reply.data(), reply.size(), config, correlation_id);
             if(status != Status::Ok)
             {
                 error = BulkError{status,
@@ -155,13 +384,16 @@ struct Subscription::Impl
             std::lock_guard<std::mutex> lock(observation);
             session = candidate;
             current_geometry = granted;
+            actual_plan = ReceivePlan::from_limits(granted.max_frame_bytes,
+                                                    granted.ring_depth,
+                                                    granted.credit_window);
         }
 
         delivered_at_open = delivery->stats().taken;
 
-        if(const Status status = fresh->activate(session.stream_id(),
+        if(const Status status = fresh->activate(session.stream_id_value(),
                                                  session.granted_geometry(),
-                                                 session.server_address());
+                                                 session.server_address_value());
            status != Status::Ok)
         {
             const BulkError reported = fresh->last_error();
@@ -170,6 +402,12 @@ struct Subscription::Impl
                         : BulkError{status, "the transport could not adopt the grant",
                                     "subscriber"};
             fresh.reset();
+            {
+                const std::lock_guard<std::mutex> lock(observation);
+                session = SessionState{};
+                current_geometry = Geometry{};
+                actual_plan = ReceivePlan{};
+            }
             return false;
         }
 
@@ -215,20 +453,31 @@ struct Subscription::Impl
             std::this_thread::sleep_for(1ms);
         }
 
-        close_session();
+        close_session(establishment_deadline);
         return false;
     }
 
-    void close_session() noexcept
+    void close_session(
+        std::chrono::steady_clock::time_point deadline =
+            std::chrono::steady_clock::time_point::max(),
+        bool discard_queued = true) noexcept
     {
+        if(deadline == std::chrono::steady_clock::time_point::max())
+        {
+            deadline = coordination_deadline();
+        }
+
         {
             if(transport)
             {
                 try
                 {
+                    const std::uint64_t correlation_id = next_correlation_id();
                     const std::vector<std::byte> request =
-                        session.make_close_request(next_correlation_id());
-                    channel(Protocol::CoordType::Close, request);
+                        session.make_close_request(correlation_id);
+                    const std::vector<std::byte> reply =
+                        channel(Protocol::CoordType::Close, request, deadline);
+                    (void)session.adopt_close_reply(reply.data(), reply.size(), correlation_id);
                 }
                 catch(const std::exception &)
                 {
@@ -236,7 +485,7 @@ struct Subscription::Impl
             }
         }
 
-        publish_transport(nullptr);
+        publish_transport(nullptr, discard_queued);
     }
 
     bool run_session(BulkError &error) noexcept
@@ -327,16 +576,17 @@ struct Subscription::Impl
 
         try
         {
-            const std::vector<std::byte> request =
-                session.make_renew_request(next_correlation_id(),
-                                           delivery->stats().taken - delivered_at_open,
-                                           credits_returned,
-                                           client_state);
+            const std::uint64_t correlation_id = next_correlation_id();
+            const std::vector<std::byte> request = session.make_renew_request(
+                correlation_id,
+                delivery->stats().taken - delivered_at_open,
+                credits_returned,
+                client_state);
 
             renewals_sent.fetch_add(1, std::memory_order_relaxed);
             const std::vector<std::byte> reply =
-                channel(Protocol::CoordType::Renew, request);
-            status = session.adopt_renew_reply(reply.data(), reply.size()).status;
+                channel(Protocol::CoordType::Renew, request, coordination_deadline());
+            status = session.adopt_renew_reply(reply.data(), reply.size(), correlation_id).status;
 
             if(status != Status::Ok)
             {
@@ -366,8 +616,14 @@ struct Subscription::Impl
 
     std::uint32_t current_renew_interval() noexcept
     {
-        const std::uint32_t granted = session.renew_interval_ms();
+        const std::uint32_t granted = session.renew_interval();
         return granted == 0 ? 1'000u : granted;
+    }
+
+    std::chrono::steady_clock::time_point coordination_deadline() const noexcept
+    {
+        return std::chrono::steady_clock::now() +
+               std::chrono::milliseconds(config.command_timeout_ms);
     }
 
 
@@ -388,7 +644,10 @@ struct Subscription::Impl
                 break; // teardown ended it.
             }
 
-            close_session();
+            // Keep accepted frames until we know whether this is a terminal
+            // failure. A reconnect attempt discards them before it allocates
+            // or activates its replacement transport.
+            close_session(std::chrono::steady_clock::time_point::max(), false);
 
             if(!running.load(std::memory_order_acquire))
             {
@@ -403,12 +662,14 @@ struct Subscription::Impl
             attempt = 0;
         }
 
-        close_session();
+        if(!interrupted.load(std::memory_order_acquire))
+        {
+            close_session();
+        }
         if(state.load(std::memory_order_acquire) == SubscriberState::Failed)
         {
             running.store(false, std::memory_order_release);
             delivery->stop();
-            delivery->discard();
             wake.notify_all();
         }
     }
@@ -442,6 +703,7 @@ struct Subscription::Impl
 
             ++attempt;
 
+            delivery->discard();
             transition(SubscriberState::Opening, BulkError{});
             if(open_subscription(error))
             {
@@ -488,7 +750,8 @@ struct Subscription::Impl
     }
 
 
-    void publish_transport(std::unique_ptr<detail::SubscriberTransport> next) noexcept
+    void publish_transport(std::unique_ptr<detail::SubscriberTransport> next,
+                           bool discard_queued = true) noexcept
     {
         if(transport)
         {
@@ -496,22 +759,23 @@ struct Subscription::Impl
 
             accumulate(retired, transport->counters());
             live = SubscriberCounters{};
-            last_lease_ttl_ms = std::max(last_lease_ttl_ms, session.lease_ttl_ms());
+            last_lease_ttl_ms = std::max(last_lease_ttl_ms, session.lease_ttl());
 
             if(current_geometry.generation != 0)
             {
                 retired_geometry = current_geometry;
             }
 
-            session = detail::SessionClient{};
+            session = SessionState{};
             current_geometry = Geometry{};
+            actual_plan = ReceivePlan{};
         }
 
         const bool retired_one = transport != nullptr;
 
         transport = nullptr;
 
-        if(retired_one)
+        if(retired_one && discard_queued)
         {
             delivery->discard();
         }
@@ -601,9 +865,20 @@ struct Subscription::Impl
 
     void dispatch_loop() noexcept
     {
-        while(running.load(std::memory_order_acquire))
+        for(;;)
         {
-            deliver_frames(k_dispatch_quantum, 32);
+            const bool active = running.load(std::memory_order_acquire) &&
+                                !interrupted.load(std::memory_order_acquire);
+            if(!active && delivery->stats().depth == 0)
+            {
+                return;
+            }
+
+            // A terminal Session failure stops ingress but deliberately leaves
+            // accepted frames in the queue. Drain those frames before the
+            // dispatcher exits; orderly close and interrupt discard first, so
+            // they still stop immediately.
+            deliver_frames(active ? k_dispatch_quantum : std::chrono::milliseconds::zero(), 32);
         }
     }
 
@@ -688,7 +963,7 @@ struct Subscription::Impl
 
     FrameCallback frame_callback;
 
-    detail::SessionClient session;
+    SessionState session;
 
     std::uint64_t delivered_at_open{0};
 
@@ -709,6 +984,7 @@ struct Subscription::Impl
     std::uint32_t last_lease_ttl_ms{0};
 
     Geometry current_geometry{};
+    ReceivePlan actual_plan{};
     Geometry retired_geometry{};
     BulkError last_error{};
 
@@ -747,7 +1023,104 @@ void Subscription::close() noexcept
 void Subscription::interrupt() noexcept
 {
     impl_->interrupted.store(true, std::memory_order_release);
-    impl_->shutdown(true);
+    impl_->delivery->stop();
+    impl_->wake.notify_all();
+}
+
+std::optional<FrameView> Subscription::try_read()
+{
+    Impl &impl = *impl_;
+
+    if(impl.config.delivery_mode != DeliveryMode::Pull)
+    {
+        throw BulkException(BulkError{Status::Internal,
+                                      "try_read() requires DeliveryMode::Pull",
+                                      "subscriber"});
+    }
+
+    if(impl.interrupted.load(std::memory_order_acquire))
+    {
+        throw BulkException(BulkError{Status::Shutdown,
+                                      "the subscription was interrupted",
+                                      "subscriber"});
+    }
+
+    FrameView frame;
+    if(impl.delivery->try_take(frame))
+    {
+        return frame;
+    }
+
+    const SubscriberState state = impl.state.load(std::memory_order_acquire);
+    if(state == SubscriberState::Failed)
+    {
+        std::lock_guard<std::mutex> lock(impl.observation);
+        throw BulkException(impl.last_error.status == Status::Ok
+                                ? BulkError{Status::TransportFailure,
+                                            "the subscription failed",
+                                            "subscriber"}
+                                : impl.last_error);
+    }
+    if(state == SubscriberState::Closed)
+    {
+        throw BulkException(BulkError{Status::Shutdown,
+                                      "the subscription is closed",
+                                      "subscriber"});
+    }
+
+    return std::nullopt;
+}
+
+std::optional<FrameView> Subscription::read_for(std::chrono::milliseconds timeout)
+{
+    Impl &impl = *impl_;
+
+    if(impl.config.delivery_mode != DeliveryMode::Pull)
+    {
+        throw BulkException(BulkError{Status::Internal,
+                                      "read_for() requires DeliveryMode::Pull",
+                                      "subscriber"});
+    }
+
+    if(impl.interrupted.load(std::memory_order_acquire))
+    {
+        throw BulkException(BulkError{Status::Shutdown,
+                                      "the subscription was interrupted",
+                                      "subscriber"});
+    }
+
+    FrameView frame;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    if(impl.delivery->take(frame, deadline))
+    {
+        return frame;
+    }
+
+    if(impl.interrupted.load(std::memory_order_acquire))
+    {
+        throw BulkException(BulkError{Status::Shutdown,
+                                      "the subscription was interrupted",
+                                      "subscriber"});
+    }
+
+    const SubscriberState state = impl.state.load(std::memory_order_acquire);
+    if(state == SubscriberState::Failed)
+    {
+        std::lock_guard<std::mutex> lock(impl.observation);
+        throw BulkException(impl.last_error.status == Status::Ok
+                                ? BulkError{Status::TransportFailure,
+                                            "the subscription failed",
+                                            "subscriber"}
+                                : impl.last_error);
+    }
+    if(state == SubscriberState::Closed)
+    {
+        throw BulkException(BulkError{Status::Shutdown,
+                                      "the subscription is closed",
+                                      "subscriber"});
+    }
+
+    return std::nullopt;
 }
 
 std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
@@ -763,6 +1136,14 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
             status, std::string("invalid SubscriberConfig: ") + to_string(status), "subscriber"});
     }
 
+    // Normalize all caller intent before constructing a transport. The
+    // transport allocates the receive ring before Open, so it must see the
+    // exact same upper plan that the coordination request advertises.
+    const ReceivePlan upper = config.upper_receive_plan();
+    config.max_frame_bytes = upper.max_frame_bytes;
+    config.ring_depth = upper.ring_depth;
+    config.credit_window = upper.credit_window;
+
     if(!channel || !factory)
     {
         throw BulkException(BulkError{Status::Internal,
@@ -771,7 +1152,7 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
                                       "subscriber"});
     }
 
-    if(!callbacks.on_frame)
+    if(config.delivery_mode != DeliveryMode::Pull && !callbacks.on_frame)
     {
         throw BulkException(BulkError{Status::Internal,
                                       "SubscriptionCallbacks needs on_frame",
@@ -847,6 +1228,13 @@ std::size_t Subscription::poll(std::chrono::milliseconds timeout, std::size_t ma
 {
     Impl &impl = *impl_;
 
+    if(impl.interrupted.load(std::memory_order_acquire))
+    {
+        throw BulkException(BulkError{Status::Shutdown,
+                                      "the subscription was interrupted",
+                                      "subscriber"});
+    }
+
     if(impl.config.delivery_mode != DeliveryMode::Manual)
     {
         throw BulkException(BulkError{Status::Internal,
@@ -859,6 +1247,13 @@ std::size_t Subscription::poll(std::chrono::milliseconds timeout, std::size_t ma
     {
         throw BulkException(BulkError{Status::DepthTooLarge,
                                       "poll() requires a positive max_frames bound",
+                                      "subscriber"});
+    }
+
+    if(!impl.frame_callback)
+    {
+        throw BulkException(BulkError{Status::Internal,
+                                      "poll() requires a callback; use read_for() for Pull",
                                       "subscriber"});
     }
 
@@ -908,7 +1303,10 @@ SubscriberState Subscription::state() const noexcept
 
 int Subscription::fd() const noexcept
 {
-    return impl_->config.delivery_mode == DeliveryMode::Manual ? impl_->delivery->fd() : -1;
+    return impl_->config.delivery_mode == DeliveryMode::Pull ||
+                   impl_->config.delivery_mode == DeliveryMode::Manual
+               ? impl_->delivery->fd()
+               : -1;
 }
 
 Geometry Subscription::geometry() const noexcept
@@ -920,8 +1318,7 @@ Geometry Subscription::geometry() const noexcept
 ReceivePlan Subscription::plan() const noexcept
 {
     const std::lock_guard<std::mutex> lock(impl_->observation);
-    return ReceivePlan::derive(impl_->current_geometry,
-                               impl_->config.pinned_memory_limit_bytes);
+    return impl_->actual_plan;
 }
 
 SubscriptionSnapshot Subscription::snapshot() const noexcept

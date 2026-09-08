@@ -8,6 +8,8 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <limits>
 #include <thread>
 
 namespace TangoBulk::detail
@@ -31,7 +33,36 @@ DeliveryQueue::~DeliveryQueue()
 
 bool DeliveryQueue::push(FrameView frame) noexcept
 {
+    if(stopped_.load(std::memory_order_acquire))
+    {
+        frame.reset();
+        discarded_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
     bool queued = queue_.try_push(std::move(frame));
+    bool dropped = false;
+
+    if(!queued && policy_ == DropPolicy::DropOldest)
+    {
+        FrameView oldest;
+        if(queue_.try_pop(oldest))
+        {
+            oldest.reset();
+            dropped = true;
+            queued = queue_.try_push(std::move(frame));
+        }
+    }
+
+    if(!queued)
+    {
+        dropped = true;
+    }
+
+    if(dropped)
+    {
+        dropped_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     if(queued)
     {
@@ -40,26 +71,17 @@ bool DeliveryQueue::push(FrameView frame) noexcept
         {
             high_water_.store(depth, std::memory_order_relaxed);
         }
-    }
-    else
-    {
-        if(policy_ == DropPolicy::DropOldest)
-        {
-            FrameView oldest;
-            if(queue_.try_pop(oldest))
-            {
-                oldest.reset();
-                queued = queue_.try_push(std::move(frame));
-            }
-        }
 
-        dropped_.fetch_add(1, std::memory_order_relaxed);
+        // Enqueue and readiness form one producer operation. Keeping them
+        // together prevents a transport adapter from publishing a frame that
+        // a blocked reader cannot observe.
+        signal_waiter();
     }
 
     return queued;
 }
 
-void DeliveryQueue::notify() noexcept
+void DeliveryQueue::signal_waiter() noexcept
 {
     if(wakeup_fd_ < 0 || queue_.empty() ||
        !consumer_waiting_.exchange(false, std::memory_order_acq_rel))
@@ -144,7 +166,10 @@ bool DeliveryQueue::await(std::chrono::steady_clock::time_point deadline) noexce
     descriptor.fd = wakeup_fd_;
     descriptor.events = POLLIN;
 
-    const int ready = ::poll(&descriptor, 1, remaining > 0 ? static_cast<int>(remaining) : 1);
+    const auto bounded_remaining = std::min<std::int64_t>(
+        static_cast<std::int64_t>(remaining), std::numeric_limits<int>::max());
+    const int timeout_ms = static_cast<int>(std::max<std::int64_t>(1, bounded_remaining));
+    const int ready = ::poll(&descriptor, 1, timeout_ms);
 
     consumer_waiting_.store(false, std::memory_order_release);
 

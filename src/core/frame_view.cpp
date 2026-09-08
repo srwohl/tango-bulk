@@ -14,9 +14,9 @@ namespace
 
 /// What the accessors report for a disengaged view.
 ///
-/// A default-constructed or reset() FrameView is a legal object -- `poll()`
-/// returns one when there is nothing to deliver -- so every accessor has to
-/// answer something.  Zeroes throughout, and `operator bool` is the way to tell
+/// A default-constructed or reset() FrameView is a legal object -- a timed
+/// delivery operation can return one when there is nothing to deliver -- so every accessor has to
+/// answer something. Zeroes throughout, and `operator bool` is the way to tell
 /// the two cases apart.
 const detail::FrameFields &empty_fields() noexcept
 {

@@ -20,10 +20,10 @@
 #include <vector>
 
 /// M4 end to end: a stock device server, a stock `Tango::DeviceProxy`, and a
-/// `BulkSubscriber` that carries its coordination plane over ordinary commands.
+/// `Subscription` that carries its coordination plane over ordinary commands.
 ///
 /// Everything here goes through the same door an application would use.  There
-/// is no `handle_coordination()` call in this file and no `SubscriberEngine`:
+/// is no encoded-adapter call in this file and no `SubscriberEngine`:
 /// if the adapter is wrong, these tests are how it shows.
 namespace
 {

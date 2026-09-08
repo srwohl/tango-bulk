@@ -10,7 +10,10 @@
 #include <tango/tango.h>
 
 #include <atomic>
+#include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -74,6 +77,8 @@ std::string describe(const Tango::DevFailed &failure)
            std::string(failure.errors[0].desc.in());
 }
 
+std::atomic<std::uint64_t> query_correlation{0};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -93,7 +98,8 @@ class CommandChannel
     ///
     ///
     std::vector<std::byte> command(Protocol::CoordType kind,
-                                   const std::vector<std::byte> &request);
+                                   const std::vector<std::byte> &request,
+                                   std::chrono::steady_clock::time_point deadline);
 
   private:
     const std::string &name_for(Protocol::CoordType kind) const
@@ -122,43 +128,63 @@ class CommandChannel
 };
 
 std::vector<std::byte> CommandChannel::command(Protocol::CoordType kind,
-                                               const std::vector<std::byte> &request)
+                                               const std::vector<std::byte> &request,
+                                               std::chrono::steady_clock::time_point deadline)
 {
+    const std::string &name = name_for(kind);
+
+    try
     {
-        const std::string &name = name_for(kind);
-
-        try
+        std::uint32_t timeout_ms = command_timeout_ms;
+        if(deadline != std::chrono::steady_clock::time_point::max())
         {
-            std::vector<unsigned char> in(request.size());
-            if(!request.empty())
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            if(remaining <= std::chrono::steady_clock::duration::zero())
             {
-                std::memcpy(in.data(), request.data(), request.size());
+                throw BulkException(BulkError{Status::TransportFailure,
+                                              "coordination deadline expired",
+                                              "tango"});
             }
 
-            Tango::DeviceData argument;
-            argument << in;
-
-            const ScopedTimeout guard(proxy, command_timeout_ms);
-            Tango::DeviceData reply = proxy.command_inout(name, argument);
-
-            std::vector<unsigned char> out;
-            if(!(reply >> out))
+            auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+            if(remaining_ms < remaining)
             {
-                throw BulkException(BulkError{
-                    Status::MalformedMessage, name + " did not return a DevVarCharArray", "tango"});
+                ++remaining_ms;
             }
-
-            std::vector<std::byte> bytes(out.size());
-            if(!out.empty())
-            {
-                std::memcpy(bytes.data(), out.data(), out.size());
-            }
-            return bytes;
+            const auto bounded = std::max<std::int64_t>(1, remaining_ms.count());
+            timeout_ms = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                command_timeout_ms, static_cast<std::uint64_t>(bounded)));
         }
-        catch(const Tango::DevFailed &failure)
+
+        std::vector<unsigned char> in(request.size());
+        if(!request.empty())
         {
-            throw BulkException(BulkError{Status::TransportFailure, describe(failure), "tango"});
+            std::memcpy(in.data(), request.data(), request.size());
         }
+
+        Tango::DeviceData argument;
+        argument << in;
+
+        const ScopedTimeout guard(proxy, timeout_ms);
+        Tango::DeviceData reply = proxy.command_inout(name, argument);
+
+        std::vector<unsigned char> out;
+        if(!(reply >> out))
+        {
+            throw BulkException(BulkError{
+                Status::MalformedMessage, name + " did not return a DevVarCharArray", "tango"});
+        }
+
+        std::vector<std::byte> bytes(out.size());
+        if(!out.empty())
+        {
+            std::memcpy(bytes.data(), out.data(), out.size());
+        }
+        return bytes;
+    }
+    catch(const Tango::DevFailed &failure)
+    {
+        throw BulkException(BulkError{Status::TransportFailure, describe(failure), "tango"});
     }
 }
 
@@ -174,8 +200,10 @@ std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
 
     return detail::SubscriptionFactory::open_default(
         std::move(config),
-        [adapter](Protocol::CoordType kind, const std::vector<std::byte> &request)
-        { return adapter->command(kind, request); },
+        [adapter](Protocol::CoordType kind,
+                  const std::vector<std::byte> &request,
+                  std::chrono::steady_clock::time_point deadline)
+        { return adapter->command(kind, request, deadline); },
         std::move(callbacks));
 }
 
@@ -183,30 +211,28 @@ std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
 BulkQueryResult bulk_query(Tango::DeviceProxy &proxy, const CommandNames &names)
 {
     Protocol::QueryRequest request; ///< all-zero session_id: server-wide status
-    const std::vector<std::byte> encoded = Protocol::encode(request, 1);
+    const std::uint64_t correlation_id =
+        query_correlation.fetch_add(1, std::memory_order_relaxed) + 1;
+    const std::vector<std::byte> encoded = Protocol::encode(request, correlation_id);
+    CommandChannel channel(proxy, names, 5'000);
+    const std::vector<std::byte> out =
+        channel.command(Protocol::CoordType::Query,
+                        encoded,
+                        std::chrono::steady_clock::time_point::max());
 
-    std::vector<unsigned char> in(encoded.size());
-    std::memcpy(in.data(), encoded.data(), encoded.size());
-
-    Tango::DeviceData argument;
-    argument << in;
-
-    Tango::DeviceData reply = proxy.command_inout(names.query, argument);
-
-    std::vector<unsigned char> out;
-    if(!(reply >> out))
-    {
-        throw BulkException(BulkError{
-            Status::MalformedMessage, names.query + " did not return a DevVarCharArray", "tango"});
-    }
-
-    const auto *data = reinterpret_cast<const std::byte *>(out.data());
+    const std::byte *data = out.empty() ? nullptr : out.data();
 
     Protocol::Envelope envelope;
     if(Protocol::decode_envelope(data, out.size(), envelope) != Status::Ok)
     {
         throw BulkException(
             BulkError{Status::MalformedMessage, "undecodable BulkQuery reply", "tango"});
+    }
+
+    if(envelope.correlation_id != correlation_id)
+    {
+        throw BulkException(
+            BulkError{Status::MalformedMessage, "BulkQuery correlation mismatch", "tango"});
     }
 
     // A client must accept Error in place of any expected reply (3.3).

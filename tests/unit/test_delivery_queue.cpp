@@ -216,7 +216,6 @@ TEST_CASE("take() returns as soon as a producer pushes and notifies",
     std::thread producer([&queue] {
         std::this_thread::sleep_for(20ms);
         queue.push(frame_over(storage(7), 7));
-        queue.notify();
     });
 
     const auto started = std::chrono::steady_clock::now();
@@ -275,8 +274,21 @@ TEST_CASE("a stopped queue hands over what it already holds, then stops waiting"
     CHECK_FALSE(queue.take(frame, std::chrono::steady_clock::now() + 5s));
 }
 
+TEST_CASE("a stopped queue refuses new ingress and accounts it as discarded",
+          "[core][delivery]")
+{
+    detail::DeliveryQueue queue(2, DropPolicy::DropNewest);
+    queue.stop();
 
-TEST_CASE("notify() with nobody armed makes no signal at all", "[core][delivery]")
+    const auto payload = storage(3);
+    CHECK_FALSE(queue.push(frame_over(payload, 3)));
+    CHECK(queue.stats().depth == 0);
+    CHECK(queue.stats().discarded == 1);
+    CHECK(payload.use_count() == 1);
+}
+
+
+TEST_CASE("push() with nobody armed makes no signal at all", "[core][delivery]")
 {
     detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
     REQUIRE(queue.fd() >= 0);
@@ -286,7 +298,7 @@ TEST_CASE("notify() with nobody armed makes no signal at all", "[core][delivery]
     CHECK_FALSE(readable(queue.fd()));
 }
 
-TEST_CASE("an empty try_take() arms, so the next notify() is seen",
+TEST_CASE("an empty try_take() arms, so the next push() is seen",
           "[core][delivery]")
 {
     detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
@@ -297,7 +309,6 @@ TEST_CASE("an empty try_take() arms, so the next notify() is seen",
     CHECK_FALSE(readable(queue.fd()));
 
     CHECK(queue.push(frame_over(storage(5), 5)));
-    queue.notify();
 
     CHECK(readable(queue.fd()));
     REQUIRE(queue.try_take(frame));
