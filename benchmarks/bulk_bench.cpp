@@ -4,12 +4,11 @@
 
 #include "oob.h"
 
-#include <ucx/subscriber_engine.h>
-
-#include <core/delivery_queue.h>
-#include <core/session_client.h>
+#include <core/publisher_internal.h>
+#include <core/subscription_internal.h>
 
 #include <tango-bulk/publisher.h>
+#include <tango-bulk/subscription.h>
 
 #include <algorithm>
 #include <chrono>
@@ -27,7 +26,7 @@
 /// This replaces `experiments/ucx-bulk-spike/` in the cppTango prototype tree.
 /// The spike hand-rolled a registered ring, a negotiation protocol and both data
 /// paths, because at the time there was no library to measure.  There is now, so
-/// this measures *that* -- the same `BulkPublisher` and `SubscriberEngine` the
+/// this measures *that* -- the same `BulkPublisher` and `Subscription` the
 /// tests exercise and a device server would link, with nothing reimplemented for
 /// the benchmark's convenience.  A number produced here is a number about the
 /// shipping code.
@@ -38,10 +37,9 @@
 /// settled by 6.3 and 5.1 respectively.  They are absent rather than stubbed,
 /// because a flag that silently does nothing is worse than a missing one.
 ///
-/// The subscriber side drives `detail::SubscriberEngine` directly, since
-/// `BulkSubscriber` needs a `Tango::DeviceProxy` and arrives with M4.  The
-/// coordination bytes travel over `oob.h` exactly as the M4 adapter will carry
-/// them over a Tango command.
+/// Both roles use the same production lifecycle. The subscriber carries
+/// coordination bytes over `oob.h`, while Subscription owns Open, Probe,
+/// renewal, delivery and close ordering.
 namespace
 {
 
@@ -268,7 +266,9 @@ int run_publisher(const Options &options)
 
     // 7.1's command, minus Tango: encoded bytes in, encoded bytes out.
     const std::vector<std::byte> open_request = oob.recv();
-    oob.send(publisher.handle_coordination(open_request.data(), open_request.size()));
+    oob.send(detail::PublisherAccess::coordination(publisher,
+                                                   open_request.data(),
+                                                   open_request.size()));
 
     // 4.2 arms on ProbeAck, so the grant precedes eligibility by one round trip.
     const auto armed_by = Clock::now() + std::chrono::seconds(10);
@@ -433,39 +433,14 @@ int run_publisher(const Options &options)
                 options.fill.c_str());
 
     const std::vector<std::byte> close_request = oob.recv();
-    oob.send(publisher.handle_coordination(close_request.data(), close_request.size()));
+    oob.send(detail::PublisherAccess::coordination(publisher,
+                                                   close_request.data(),
+                                                   close_request.size()));
 
     return counters.frames_credited >= total ? 0 : 1;
 }
 
 // -- subscriber --------------------------------------------------------------
-
-std::size_t take_frames(detail::DeliveryQueue &delivery,
-                        std::chrono::milliseconds timeout,
-                        const FrameCallback &cb,
-                        std::size_t max_frames = 0)
-{
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    std::size_t dispatched = 0;
-
-    while(max_frames == 0 || dispatched < max_frames)
-    {
-        FrameView view;
-        const bool got =
-            dispatched == 0 ? delivery.take(view, deadline) : delivery.try_take(view);
-
-        if(!got)
-        {
-            break;
-        }
-
-        ++dispatched;
-        cb(std::move(view));
-        view.reset();
-    }
-
-    return dispatched;
-}
 
 int run_subscriber(const Options &options)
 {
@@ -475,87 +450,86 @@ int run_subscriber(const Options &options)
     config.ring_depth = options.ring_depth;
     config.credit_window = options.credit_window;
     config.delivery_queue_depth = std::max<std::uint32_t>(64, options.ring_depth * 2);
-    config.delivery_mode = DeliveryMode::Manual;
+    config.delivery_mode = DeliveryMode::Pull;
     config.ucx_tls = options.tls;
-
-    const auto delivery = std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
-                                                                  config.drop_policy);
-    detail::SessionClient session;
-    detail::SubscriberEngine engine(config, delivery);
 
     const OobChannel oob = OobChannel::connect_to(options.host, options.port);
 
-    oob.send(session.make_open_request(config, engine.local_address(), 1));
-    const std::vector<std::byte> reply = oob.recv();
-    if(const Status status = session.adopt_open_reply(reply.data(), reply.size(), config);
-       status != Status::Ok)
-    {
-        fail(std::string("Open was refused: ") + to_string(status));
-    }
-
-    if(const Status status = engine.activate(
-           session.stream_id(), session.granted_geometry(), session.server_address());
-       status != Status::Ok)
-    {
-        fail(std::string("the transport could not adopt the grant: ") + to_string(status));
-    }
-
-    const auto active_by = Clock::now() + std::chrono::seconds(10);
-    while(engine.state() != SubscriberState::Active && Clock::now() < active_by)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    if(engine.state() != SubscriberState::Active)
-    {
-        fail("never reached Active: the probe went unanswered");
-    }
-
-    std::printf("subscriber  ring %" PRIu32 " x %" PRIu64 " B  window %" PRIu32
-                "  pinned %.1f MiB  verify %s\n",
-                config.ring_depth,
-                config.max_frame_bytes,
-                config.credit_window,
-                static_cast<double>(engine.counters().pinned_bytes) / (1024.0 * 1024.0),
-                options.verify ? "on" : "off");
-
-    const std::uint64_t total = options.warmup + options.iters;
     std::uint64_t received = 0;
     std::uint64_t mismatched = 0;
     std::uint64_t short_frames = 0;
-    Clock::time_point start{};
+    const Clock::time_point start_if_no_warmup = Clock::now();
+    Clock::time_point start = options.warmup == 0 ? start_if_no_warmup : Clock::time_point{};
+
+    const auto inspect = [&](const FrameView &view)
+    {
+        if(view.size() != options.size)
+        {
+            ++short_frames;
+        }
+        else if(options.verify && options.fill == "each" &&
+                !pattern_matches(view.data(), view.size(), view.event_counter()))
+        {
+            ++mismatched;
+        }
+
+        ++received;
+        if(received == options.warmup)
+        {
+            start = Clock::now();
+        }
+    };
+
+    auto subscription = detail::SubscriptionFactory::open_default(
+        config,
+        [&oob](Protocol::CoordType,
+               const std::vector<std::byte> &request,
+               std::chrono::steady_clock::time_point deadline)
+        {
+            oob.send(request, deadline);
+            return oob.recv(deadline);
+        },
+        SubscriptionCallbacks{});
+
+    const ReceivePlan plan = subscription->plan();
+
+    std::printf("subscriber  ring %" PRIu32 " x %" PRIu64 " B  window %" PRIu32
+                "  pinned %.1f MiB  verify %s\n",
+                plan.ring_depth,
+                plan.max_frame_bytes,
+                plan.credit_window,
+                static_cast<double>(plan.pinned_bytes) / (1024.0 * 1024.0),
+                options.verify ? "on" : "off");
+
+    const std::uint64_t total = options.warmup + options.iters;
 
     const auto deadline = Clock::now() + std::chrono::seconds(120);
     while(received < total && Clock::now() < deadline)
     {
-        take_frames(*delivery,
-                    std::chrono::milliseconds(10),
-                    [&](FrameView view)
-                    {
-                        if(view.size() != options.size)
-                        {
-                            ++short_frames;
-                        }
-                        else if(options.verify && options.fill == "each" &&
-                                !pattern_matches(view.data(), view.size(), view.event_counter()))
-                        {
-                            ++mismatched;
-                        }
+        const auto first = subscription->read_for(std::chrono::milliseconds(10));
+        if(first)
+        {
+            inspect(*first);
+        }
 
-                        ++received;
-                        if(received == options.warmup)
-                        {
-                            start = Clock::now();
-                        }
-                        // The view is released here, at the end of the callback,
-                        // and that release *is* the credit return (5.5).
-                    });
+        for(std::size_t i = 1; i < 32 && received < total; ++i)
+        {
+            const auto next = subscription->try_read();
+            if(!next)
+            {
+                break;
+            }
+            inspect(*next);
+        }
     }
 
-    const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    const double seconds = start == Clock::time_point{}
+                               ? 0.0
+                               : std::chrono::duration<double>(Clock::now() - start).count();
 
-    const SubscriberCounters counters = engine.counters();
+    const SubscriberCounters counters = subscription->counters();
 
-    const std::uint64_t dropped_queue_full = delivery->stats().dropped;
+    const std::uint64_t dropped_queue_full = counters.frames_dropped_queue_full;
 
     report_rate("subscriber", received > options.warmup ? received - options.warmup : 0,
                 options.size, seconds);
@@ -577,7 +551,7 @@ int run_subscriber(const Options &options)
                     ? static_cast<double>(counters.credits_returned) /
                           static_cast<double>(counters.credit_messages_sent)
                     : 0.0,
-                engine.bytes_copied());
+                static_cast<std::uint64_t>(0));
 
     int status = 0;
 
@@ -608,9 +582,7 @@ int run_subscriber(const Options &options)
         status = 1;
     }
 
-    oob.send(session.make_close_request(2));
-    const std::vector<std::byte> close_reply = oob.recv();
-    (void) close_reply;
+    subscription->close();
 
     return status;
 }

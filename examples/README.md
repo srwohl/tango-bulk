@@ -289,8 +289,9 @@ the database, and the coordination plane is three ordinary commands.
 
 ## Watching a running publisher
 
-`BulkQuery` is a read-only command any Tango client can call, and `TangoBulk::bulk_query()` is the
-typed wrapper:
+`BulkQuery` is a temporary read-only compatibility command for peers that have not adopted
+StreamOffer discovery. `TangoBulk::bulk_query()` remains available while that migration is in
+progress:
 
 ```cpp
 Tango::DeviceProxy proxy("bulk/example/1");

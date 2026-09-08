@@ -16,7 +16,7 @@ file changes.
 
 > **Status: M4 — the stock-Tango adapter.** It is a Tango extension now, not a library with a
 > Tango-shaped plan. `BulkOpen` / `BulkRenew` / `BulkClose` / `BulkQuery` are ordinary commands
-> on an ordinary device class; `BulkSubscriber` takes a stock `Tango::DeviceProxy`, opens a
+> on an ordinary device class; `TangoBulk::subscribe()` takes a stock `Tango::DeviceProxy`, opens a
 > session over it, renews on a timer, reconnects with backoff, and delivers frames on a
 > library-owned dispatch thread that never touches Tango or UCX. A device server integrates in
 > three lines and links one target.
@@ -105,7 +105,8 @@ scripts/                layering check, verbs test runner
 The third row is the load-bearing one. The Tango adapter deals in encoded byte vectors and
 opaque handles, so a device server that links it never inherits UCX headers.
 
-It survives M4 intact, which was the interesting question: `BulkSubscriber` lives in the Tango
+It survives M4 intact, which was the interesting question: `Subscription` is the client-facing
+object and its Tango adapter lives in the Tango
 layer and has to *construct* a UCX transport. It does so through an abstract interface declared
 in `src/core/` whose factory is defined in the UCX library, and `tango-bulk-tango` links
 `tango-bulk::ucx` **PRIVATE** — so the symbols resolve and no include directory travels. The
@@ -287,7 +288,7 @@ if(lease)                             // never blocks; a full ring means drop, n
 }
 ```
 
-A client. Construct, two callbacks, `start()`:
+A client. Construct a Subscription and provide its frame callback:
 
 ```cpp
 Tango::DeviceProxy proxy("bulk/example/1");   // BORROWED; you keep it alive
@@ -295,15 +296,15 @@ Tango::DeviceProxy proxy("bulk/example/1");   // BORROWED; you keep it alive
 TangoBulk::SubscriberConfig config;
 config.stream_name = "image";
 
-TangoBulk::BulkSubscriber subscriber(proxy, config);
-subscriber.set_frame_callback([](TangoBulk::FrameView f) { process(f); });
-subscriber.set_state_callback([](auto state, const auto &err) { log(state, err); });
-subscriber.start();
+TangoBulk::SubscriptionCallbacks callbacks;
+callbacks.on_frame = [](TangoBulk::FrameView f) { process(f); };
+auto subscription = TangoBulk::subscribe(proxy, config, std::move(callbacks));
 ```
 
 The frame callback runs on a library-owned dispatch thread — never the UCX engine thread, so a
 slow consumer cannot stall the transport, and never a Tango thread, so a stuck `command_inout`
-cannot stall delivery. `DeliveryMode::Manual` plus `poll()` hands the thread back to you.
+cannot stall delivery. Select `DeliveryMode::Pull` and use `read_for()` when the application
+should own frame reads.
 
 Working versions of all of the above, including the decimated preview attribute for legacy
 visibility, are in [examples/](examples/) with instructions for running them with or without a
@@ -319,9 +320,8 @@ submit-and-progress loop; user callbacks never run on it. The subscriber receive
 registered ring and hands the application a reference-counted `FrameView` whose destruction
 *is* the credit return, so slow consumers apply backpressure by construction rather than by
 convention. Session leases over ordinary Tango commands (`BulkOpen` / `BulkRenew` /
-`BulkClose` / `BulkQuery`) are the cleanup authority: a client that crashes releases pinned
-memory when its lease expires, which is something Tango's server→client ZMQ heartbeat cannot
-tell the supplier.
+`BulkClose`) are the cleanup authority. `BulkQuery` remains only as a temporary compatibility
+command while StreamOffer discovery and Publisher observation are completed.
 
 ## Licence
 

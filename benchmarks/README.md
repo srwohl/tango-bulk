@@ -72,7 +72,7 @@ to any verification claim, so it is wired in here from the start.
 ## Coordination
 
 `oob.h` is a length-prefixed blob channel over TCP, standing in for a Tango
-command. `handle_coordination()` takes encoded bytes and returns encoded bytes,
+command. The internal coordination adapter takes encoded bytes and returns encoded bytes,
 which is the whole of §7.1's contract, so this is what the M4 adapter will do over
 a `DevVarCharArray`. It is deliberately not a transport: no framing beyond a u32
 length, no retries, no concurrency.

@@ -8,7 +8,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -66,40 +65,17 @@ int main(int argc, char *argv[])
     {
         Tango::DeviceProxy proxy(device);
 
-        // Discover the stream before allocating GPU memory. BulkOpen can clamp
-        // an oversized request, but cannot enlarge an undersized CUDA slot.
-        const TangoBulk::BulkQueryResult publisher = TangoBulk::bulk_query(proxy);
-        if(publisher.status != TangoBulk::Status::Ok)
-        {
-            throw TangoBulk::BulkException(
-                {publisher.status, "publisher is not ready", "BulkQuery"});
-        }
+        // BulkOpen can clamp a request downward, but it cannot enlarge an
+        // undersized CUDA slot. Until StreamOffer discovery is available, use
+        // one complete conservative upper plan before allocating the device
+        // ring. It reserves 512 MiB at most and works for every valid peer.
+        constexpr std::uint32_t ring_depth = TangoBulk::k_min_ring_depth;
+        constexpr std::uint32_t credit_window = 2;
+        constexpr std::uint64_t slot_bytes = TangoBulk::k_max_frame_bytes_hard_cap;
+        constexpr std::uint64_t ring_bytes = slot_bytes * ring_depth;
 
-        // Everything below divides by this, and it arrives from the peer.
-        if(publisher.max_frame_bytes == 0)
-        {
-            throw TangoBulk::BulkException({TangoBulk::Status::GeometryMismatch,
-                                            "publisher advertised a zero maximum frame size",
-                                            "BulkQuery"});
-        }
-
-        // Preserve the example's original 256 MiB receive-ring target. The
-        // protocol requires at least two slots, so an exceptionally large frame
-        // can raise the actual allocation above that target -- to at most twice
-        // k_max_frame_bytes_hard_cap, which is the 512 MiB worst case.
-        constexpr std::uint64_t ring_memory_target = 256ull << 20;
-        const std::uint64_t slots_in_target =
-            ring_memory_target / publisher.max_frame_bytes;
-        const std::uint32_t ring_depth = std::min<std::uint32_t>(
-            publisher.ring_depth,
-            static_cast<std::uint32_t>(std::max<std::uint64_t>(2, slots_in_target)));
-        const std::uint32_t credit_window =
-            std::min(publisher.credit_window, ring_depth);
-        const std::uint64_t ring_bytes = publisher.max_frame_bytes * ring_depth;
-
-        std::cout << "publisher geometry: max_frame_bytes=" << publisher.max_frame_bytes
-                  << " ring_depth=" << ring_depth
-                  << " credit_window=" << credit_window
+        std::cout << "requested receive plan: max_frame_bytes=" << slot_bytes
+                  << " ring_depth=" << ring_depth << " credit_window=" << credit_window
                   << " cuda_ring_bytes=" << ring_bytes << std::endl;
 
         check_cuda(cudaSetDevice(gpu), "cudaSetDevice");
@@ -134,9 +110,8 @@ int main(int argc, char *argv[])
 
         TangoBulk::SubscriberConfig config;
         config.stream_name = stream;
-        config.max_frame_bytes = publisher.max_frame_bytes;
-        config.ring_depth = ring_depth;
-        config.credit_window = credit_window;
+        config.receive_plan = TangoBulk::ReceivePlan::from_limits(
+            slot_bytes, ring_depth, credit_window);
         config.delivery_mode = TangoBulk::DeliveryMode::DispatchThread;
         config.reconnect_policy = TangoBulk::ReconnectPolicy::BoundedRetry;
         config.receive_buffer = receive_buffer;
@@ -204,6 +179,10 @@ int main(int argc, char *argv[])
 
         auto subscription =
             TangoBulk::subscribe(proxy, config, std::move(callbacks));
+        const TangoBulk::ReceivePlan actual = subscription->plan();
+        std::cout << "granted receive plan: max_frame_bytes=" << actual.max_frame_bytes
+                  << " ring_depth=" << actual.ring_depth
+                  << " credit_window=" << actual.credit_window << std::endl;
 
         auto last = std::chrono::steady_clock::now();
         std::uint64_t last_frames = 0;
@@ -227,8 +206,8 @@ int main(int argc, char *argv[])
             last_bytes = total_bytes;
         }
 
-        subscription.reset();
         const TangoBulk::SubscriberCounters counters = subscription->counters();
+        subscription.reset();
         std::cout << "received=" << counters.frames_received
                   << " delivered=" << counters.frames_delivered
                   << " credits_returned=" << counters.credits_returned

@@ -158,7 +158,7 @@ class ExampleDetector : public TANGO_BASE_CLASS
         //
         // Before the publisher is destroyed, and not merely tidiness:
         // detach_publisher() returns only once no command is still inside
-        // handle_coordination(), which is what makes the next line safe.
+        // the encoded coordination adapter, which is what makes the next line safe.
         detach_publisher(*this);
         // -----------------------------------------------------------------
 
@@ -288,8 +288,9 @@ class ExampleDetector : public TANGO_BASE_CLASS
 
             const PublishResult result = publisher_->publish(std::move(lease), meta);
 
-            // Nothing here throws and nothing blocks.  A drop is a counter, and
-            // an operator reads it through BulkQuery.
+            // Nothing here throws and nothing blocks. A drop is a counter; the
+            // operator can inspect it through the temporary BulkQuery adapter
+            // until Publisher snapshot attributes are deployed.
             if(result == PublishResult::Accepted)
             {
                 ++frame;
@@ -369,7 +370,8 @@ class ExampleDetectorClass : public Tango::DeviceClass
     {
         // ---- 7.2, line one of three -------------------------------------
         //
-        // Adds BulkOpen, BulkRenew, BulkClose and BulkQuery as ordinary
+        // Adds BulkOpen, BulkRenew, BulkClose and the temporary BulkQuery
+        // compatibility command as ordinary
         // commands.  If this device class already had a command by one of those
         // names, this throws rather than shadowing it, and
         // CommandNames::with_prefix("Xyz") is the way out.
