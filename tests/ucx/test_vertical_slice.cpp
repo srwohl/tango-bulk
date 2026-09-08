@@ -85,7 +85,7 @@ TEST_CASE("The delivered payload lives in the registered receive ring", "[m2][sl
 TEST_CASE("Slots recycle: sequence s lands in slot s % ring_depth", "[m2][slice]")
 {
     Slice slice;
-    const std::uint32_t depth = slice.subscriber.session.granted_ring_depth();
+    const std::uint32_t depth = slice.subscriber.granted_ring_depth();
     REQUIRE(depth == k_ring_depth);
 
     const std::size_t total = 4u * depth;
@@ -127,7 +127,7 @@ TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring
     sub.credit_window = 2;
 
     Slice slice(pub, sub);
-    REQUIRE(slice.subscriber.session.granted_ring_depth() == 2);
+    REQUIRE(slice.subscriber.granted_ring_depth() == 2);
 
     // Fill beyond the client's negotiated window before polling.  BestEffort
     // may skip frames for this session, but it must not assign them sequences:
@@ -572,7 +572,7 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
     REQUIRE(subscriber.adopt_open_reply(forged.data(), forged.size()) == Status::Ok);
     REQUIRE(await_armed(publisher, subscriber));
 
-    REQUIRE(subscriber.session.granted_geometry().element_type == ElementType::UInt16);
+    REQUIRE(subscriber.granted_geometry().element_type == ElementType::UInt16);
 
     {
         auto lease = publisher.try_acquire();

@@ -253,6 +253,10 @@ TEST_CASE("a foreign major is rejected as UnsupportedVersion", "[protocol][versi
     OpenRequest out;
     CHECK(decode(bytes.data(), bytes.size(), out) == Status::UnsupportedVersion);
 
+    Envelope envelope;
+    CHECK(decode_envelope(bytes.data(), bytes.size(), envelope) == Status::UnsupportedVersion);
+    CHECK(envelope.correlation_id == 1);
+
     // Never silently downgraded on the data plane either.
     auto frame = encode(valid_frame());
     frame[4] = std::byte{0};

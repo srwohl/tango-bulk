@@ -8,7 +8,7 @@
 #include <ucx/subscriber_engine.h>
 
 #include <core/delivery_queue.h>
-#include <core/session_client.h>
+#include <core/publisher_internal.h>
 #include <core/cpu_topology.h>
 
 #include <tango-bulk/publisher.h>
@@ -87,7 +87,6 @@ struct Subscriber
 {
     SubscriberConfig config;
     std::shared_ptr<detail::DeliveryQueue> delivery;
-    detail::SessionClient session;
     detail::SubscriberEngine engine;
 
     explicit Subscriber(SubscriberConfig cfg = subscriber_config()) :
@@ -99,41 +98,141 @@ struct Subscriber
 
     std::vector<std::byte> make_open_request(std::uint64_t correlation_id)
     {
-        return session.make_open_request(config, engine.local_address(), correlation_id);
+        Protocol::OpenRequest request;
+        request.version_min = Protocol::k_version_major;
+        request.version_max = Protocol::k_version_major;
+        request.requested_caps = Protocol::k_caps_credit_coalescing | Protocol::k_caps_probe;
+        request.client_instance_id = Protocol::generate_client_instance_id();
+        request.requested_max_frame_bytes = config.max_frame_bytes;
+        request.requested_ring_depth = config.ring_depth;
+        request.requested_credit_window = config.credit_window;
+        request.requested_memory_kind = config.receive_memory_kind;
+        request.requested_transport = Protocol::Transport::ActiveMessage;
+        request.drop_policy = config.drop_policy;
+        request.stream_name = config.stream_name;
+        request.client_ucx_address = engine.local_address();
+        return Protocol::encode(request, correlation_id);
     }
 
     Status adopt_open_reply(const std::byte *data, std::size_t size)
     {
-        const Status status = session.adopt_open_reply(data, size, config);
-        if(status != Status::Ok)
+        Protocol::Envelope envelope;
+        if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
         {
-            return status;
+            return Status::MalformedMessage;
         }
 
-        return engine.activate(
-            session.stream_id(), session.granted_geometry(), session.server_address());
+        if(envelope.msg_type == Protocol::CoordType::Error)
+        {
+            Protocol::ErrorMessage error;
+            const Status decoded = Protocol::decode(data, size, error);
+            return decoded == Status::Ok ? error.status : Status::MalformedMessage;
+        }
+
+        Protocol::OpenReply reply;
+        if(Protocol::decode(data, size, reply) != Status::Ok)
+        {
+            return Status::MalformedMessage;
+        }
+        if(reply.status != Status::Ok)
+        {
+            return reply.status;
+        }
+        if(reply.geometry.validate() != Status::Ok ||
+           reply.geometry.max_frame_bytes > config.max_frame_bytes ||
+           reply.geometry.ring_depth > config.ring_depth)
+        {
+            return Status::GeometryMismatch;
+        }
+
+        session_id_ = reply.session_id;
+        stream_id_ = reply.stream_id;
+        server_address_ = reply.server_ucx_address;
+        granted_ = reply.geometry;
+        lease_ttl_ms_ = reply.lease_ttl_ms;
+        renew_interval_ms_ = reply.renew_interval_ms;
+
+        return engine.activate(stream_id_, granted_, server_address_);
     }
 
     std::vector<std::byte> make_renew_request(std::uint64_t correlation_id)
     {
-        return session.make_renew_request(correlation_id,
-                                          delivery->stats().taken,
-                                          engine.counters().credits_returned,
-                                          static_cast<std::uint32_t>(engine.state()));
+        Protocol::RenewRequest request;
+        request.session_id = session_id_;
+        request.client_frames_delivered = delivery->stats().taken;
+        request.client_credits_returned = engine.counters().credits_returned;
+        request.client_state = static_cast<std::uint32_t>(engine.state());
+        return Protocol::encode(request, correlation_id);
     }
 
     Status adopt_renew_reply(const std::byte *data, std::size_t size)
     {
-        return session.adopt_renew_reply(data, size).status;
+        Protocol::Envelope envelope;
+        if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
+        {
+            last_renew_lost_ = false;
+            return Status::MalformedMessage;
+        }
+        if(envelope.msg_type == Protocol::CoordType::Error)
+        {
+            Protocol::ErrorMessage error;
+            const Status decoded = Protocol::decode(data, size, error);
+            last_renew_lost_ = false;
+            return decoded == Status::Ok ? error.status : Status::MalformedMessage;
+        }
+
+        Protocol::RenewReply reply;
+        if(Protocol::decode(data, size, reply) != Status::Ok)
+        {
+            last_renew_lost_ = false;
+            return Status::MalformedMessage;
+        }
+        if(reply.status != Status::Ok)
+        {
+            last_renew_lost_ = reply.status != Status::RenewTooFrequent;
+            return reply.status;
+        }
+
+        lease_ttl_ms_ = reply.lease_ttl_ms;
+        renew_interval_ms_ = reply.renew_interval_ms;
+        last_renew_lost_ = false;
+        return Status::Ok;
     }
 
     std::vector<std::byte> make_close_request(std::uint64_t correlation_id) const
     {
-        return session.make_close_request(correlation_id);
+        Protocol::CloseRequest request;
+        request.session_id = session_id_;
+        request.reason = Protocol::CloseReason::ClientShutdown;
+        return Protocol::encode(request, correlation_id);
     }
+
+    const Protocol::GeometryBlock &granted_geometry() const noexcept
+    {
+        return granted_;
+    }
+
+    std::uint32_t granted_ring_depth() const noexcept
+    {
+        return granted_.ring_depth;
+    }
+
+    bool last_renew_lost() const noexcept
+    {
+        return last_renew_lost_;
+    }
+
+  private:
+    Protocol::SessionId session_id_{};
+    Protocol::StreamId stream_id_{0};
+    std::vector<std::byte> server_address_;
+    Protocol::GeometryBlock granted_{};
+    std::uint32_t lease_ttl_ms_{0};
+    std::uint32_t renew_interval_ms_{0};
+    bool last_renew_lost_{false};
 };
 
-/// Run the `Open` exchange, straight through `handle_coordination`.
+/// Run the `Open` exchange through the internal encoded coordination adapter.
 ///
 /// No Tango process, no DeviceProxy, no commands -- the bytes are the real
 /// protocol bytes and only the transport carrying them is short-circuited.
@@ -143,7 +242,7 @@ inline std::vector<std::byte> exchange_open(BulkPublisher &publisher,
                                             std::uint64_t correlation_id = 1)
 {
     const std::vector<std::byte> request = subscriber.make_open_request(correlation_id);
-    return publisher.handle_coordination(request.data(), request.size());
+    return detail::PublisherAccess::coordination(publisher, request.data(), request.size());
 }
 
 /// Wait out the `Probe`/`ProbeAck` round trip on both sides.
@@ -286,7 +385,7 @@ struct Slice
     ~Slice()
     {
         const std::vector<std::byte> request = subscriber.make_close_request(2);
-        publisher.handle_coordination(request.data(), request.size());
+        detail::PublisherAccess::coordination(publisher, request.data(), request.size());
     }
 
     Slice(const Slice &) = delete;

@@ -19,9 +19,9 @@
 ///
 /// Each is `DevVarCharArray -> DevVarCharArray` carrying an encoded coordination
 /// message (3.3), and each is a thin wrapper over
-/// `BulkPublisher::handle_coordination()`.  There is no bulk-specific IDL, no
-/// DServer command, and nothing here that a stock device server does not already
-/// know how to expose.
+/// the internal encoded coordination adapter.  There is no bulk-specific IDL,
+/// no DServer command, and nothing here that a stock device server does not
+/// already know how to expose.
 ///
 /// The rule that shapes this file: **a command MUST NOT throw `DevFailed` for a
 /// protocol-level failure.**  Protocol failures come back as an encoded `Error`
@@ -96,24 +96,7 @@ class CoordinationCommand : public Tango::Command
                                const std::byte *data,
                                std::size_t size) const noexcept
     {
-        Protocol::Envelope envelope;
-        if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
-        {
-            return Protocol::encode(
-                Protocol::ErrorMessage{Status::MalformedMessage, "undecodable envelope"}, 0);
-        }
-
-        if(envelope.msg_type != expected_)
-        {
-            return Protocol::encode(
-                Protocol::ErrorMessage{Status::MalformedMessage,
-                                       std::string("this command carries ") +
-                                           Protocol::to_string(expected_) + ", not " +
-                                           Protocol::to_string(envelope.msg_type)},
-                envelope.correlation_id);
-        }
-
-        return dispatch_coordination(device, data, size);
+        return dispatch_coordination(device, data, size, expected_);
     }
 
     Protocol::CoordType expected_;

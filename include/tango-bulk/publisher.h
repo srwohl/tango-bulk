@@ -8,6 +8,7 @@
 #include <tango-bulk/counters.h>
 #include <tango-bulk/errors.h>
 #include <tango-bulk/frame.h>
+#include <tango-bulk/geometry.h>
 #include <tango-bulk/limits.h>
 
 #include <cstddef>
@@ -61,6 +62,7 @@ struct PublisherConfig
 namespace detail
 {
 class ProducerSlots;
+class PublisherAccess;
 } // namespace detail
 
 enum class PublishResult : std::uint32_t
@@ -75,6 +77,24 @@ enum class PublishResult : std::uint32_t
 };
 
 const char *to_string(PublishResult result) noexcept;
+
+/// A copied owner observation of one publisher.
+///
+/// The geometry and counters are sampled together as one diagnostic value;
+/// `sampled_at_steady_ns` makes its age observable.  It is never authority for
+/// admission or session reclamation, and a StreamOffer made from it remains an
+/// upper bound until OpenReply supplies the actual grant.
+struct PublisherSnapshot
+{
+    std::string stream_name;
+    Geometry geometry{};
+    PublisherCounters counters{};
+    std::size_t active_sessions{0};
+    std::uint64_t sampled_at_steady_ns{0};
+    bool accepting{false};
+
+    StreamOffer stream_offer() const;
+};
 
 class BulkPublisher
 {
@@ -118,16 +138,11 @@ class BulkPublisher
     std::uint32_t generation() const noexcept;
     std::size_t session_count() const noexcept;
     PublisherCounters counters() const noexcept;
-
-    /// Coordination entry point: encoded bytes in, encoded bytes out.
-    ///
-    /// This is the seam that keeps Tango out of the core.  The Tango adapter is
-    /// a thin DevVarCharArray wrapper over it, and the unit tests drive the
-    /// entire session lifecycle through it with no Tango process at all.
-    std::vector<std::byte> handle_coordination(const std::byte *data,
-                                               std::size_t size) noexcept;
+    PublisherSnapshot snapshot() const;
 
   private:
+    friend class detail::PublisherAccess;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

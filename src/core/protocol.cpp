@@ -105,6 +105,11 @@ Status open_coord(const std::byte *data, std::size_t size, CoordType expected,
         return Status::MalformedMessage;
     }
 
+    // Recover the correlation before validating the version and body. An
+    // unsupported peer version can still be answered with an Error carrying
+    // the request's correlation; adapters use this field for failure replies.
+    env.correlation_id = wire::get64(data + 16);
+
     if(wire::get32(data + 0) != k_coord_magic)
     {
         return Status::MalformedMessage;
