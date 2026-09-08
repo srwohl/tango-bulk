@@ -70,7 +70,9 @@ std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
                                         SubscriptionCallbacks callbacks,
                                         const CommandNames &names = {});
 
-/// What BulkQuery reports about a publisher.
+/// Temporary compatibility projection for peers that still expose BulkQuery.
+/// New clients should establish a Subscription and use its Geometry/plan;
+/// this second state model is removed once StreamOffer discovery is deployed.
 struct BulkQueryResult
 {
     Status status{Status::Ok};
@@ -95,13 +97,12 @@ struct BulkQueryResult
     std::string counters;
 };
 
-/// Server-wide status of a device's bulk publisher, over the ordinary BulkQuery
-/// command.
+/// Server-wide status of a device's bulk publisher, over the temporary
+/// compatibility BulkQuery command.
 ///
 /// Server-wide because that is the question an operator has.  3.8 also allows a
 /// Query naming one session, which needs a `session_id` no public API hands out;
-/// that path is driven through `handle_coordination` and is covered by the UCX
-/// tests, which decode the `OpenReply` themselves.
+/// that path is retained only for peers that have not yet adopted discovery.
 ///
 /// Throws BulkException on a malformed reply, and lets Tango::DevFailed out of
 /// the command call itself -- a device that cannot be reached is the caller's

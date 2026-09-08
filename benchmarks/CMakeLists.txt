@@ -6,9 +6,9 @@
 # no Tango, and keeping it off that dependency is what lets it run on a machine
 # with a NIC and no Tango database.
 #
-# It reaches into ${PROJECT_SOURCE_DIR}/src for detail::SubscriberEngine, as the
-# UCX tests do, because BulkSubscriber needs a Tango::DeviceProxy and arrives
-# with M4. That include path goes away when it does.
+# It reaches into ${PROJECT_SOURCE_DIR}/src for the internal Subscription factory
+# and Publisher coordination carrier. The public benchmark path remains the
+# same Pull/Push surface used by bindings; only byte transport is supplied here.
 
 add_executable(tango-bulk-bench bulk_bench.cpp)
 

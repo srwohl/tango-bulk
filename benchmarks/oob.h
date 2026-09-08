@@ -9,19 +9,24 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 /// A length-prefixed blob channel over TCP, standing in for a Tango command.
 ///
-/// `BulkPublisher::handle_coordination()` takes encoded bytes and returns
+/// The internal publisher coordination adapter takes encoded bytes and returns
 /// encoded bytes, which is the whole of the coordination contract -- 7.1 makes
 /// `BulkOpen` / `BulkRenew` / `BulkClose` ordinary commands carrying a
 /// `DevVarCharArray`, and the M4 adapter is a wrapper over exactly this call.
@@ -124,17 +129,25 @@ class OobChannel
         return channel;
     }
 
-    void send(const std::vector<std::byte> &payload) const
+    void send(const std::vector<std::byte> &payload,
+              std::chrono::steady_clock::time_point deadline =
+                  std::chrono::steady_clock::time_point::max()) const
     {
+        if(payload.size() > 65'536)
+        {
+            throw std::runtime_error("oob: message is too large");
+        }
+
         const auto length = static_cast<std::uint32_t>(payload.size());
-        write_all(&length, sizeof(length));
-        write_all(payload.data(), payload.size());
+        write_all(&length, sizeof(length), deadline);
+        write_all(payload.data(), payload.size(), deadline);
     }
 
-    std::vector<std::byte> recv() const
+    std::vector<std::byte> recv(std::chrono::steady_clock::time_point deadline =
+                                    std::chrono::steady_clock::time_point::max()) const
     {
         std::uint32_t length = 0;
-        read_all(&length, sizeof(length));
+        read_all(&length, sizeof(length), deadline);
 
         // The coordination plane is bounded by 3.9 at 65 536 bytes; anything
         // larger is a desynchronised stream, not a big message.
@@ -144,7 +157,7 @@ class OobChannel
         }
 
         std::vector<std::byte> payload(length);
-        read_all(payload.data(), payload.size());
+        read_all(payload.data(), payload.size(), deadline);
         return payload;
     }
 
@@ -164,33 +177,107 @@ class OobChannel
         }
     }
 
-    void write_all(const void *data, std::size_t size) const
+    void wait_for(short events, std::chrono::steady_clock::time_point deadline) const
+    {
+        for(;;)
+        {
+            int timeout = -1;
+            if(deadline != std::chrono::steady_clock::time_point::max())
+            {
+                const auto remaining = deadline - std::chrono::steady_clock::now();
+                if(remaining <= std::chrono::steady_clock::duration::zero())
+                {
+                    throw std::runtime_error("oob: coordination deadline expired");
+                }
+
+                auto milliseconds =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+                if(milliseconds < remaining)
+                {
+                    ++milliseconds;
+                }
+                timeout = static_cast<int>(std::min<std::int64_t>(
+                    milliseconds.count(), std::numeric_limits<int>::max()));
+            }
+
+            pollfd descriptor{};
+            descriptor.fd = fd_;
+            descriptor.events = events;
+            const int result = ::poll(&descriptor, 1, timeout);
+            if(result > 0)
+            {
+                return;
+            }
+            if(result == 0)
+            {
+                throw std::runtime_error("oob: coordination deadline expired");
+            }
+            if(errno != EINTR)
+            {
+                throw std::runtime_error("oob: poll() failed");
+            }
+        }
+    }
+
+    void write_all(const void *data,
+                   std::size_t size,
+                   std::chrono::steady_clock::time_point deadline) const
     {
         const auto *p = static_cast<const char *>(data);
         while(size > 0)
         {
-            const ssize_t n = ::send(fd_, p, size, MSG_NOSIGNAL);
-            if(n <= 0)
+            const ssize_t n = ::send(fd_, p, size, MSG_NOSIGNAL | MSG_DONTWAIT);
+            if(n > 0)
+            {
+                p += n;
+                size -= static_cast<std::size_t>(n);
+                continue;
+            }
+            if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            {
+                wait_for(POLLOUT, deadline);
+                continue;
+            }
+            if(n < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            if(n == 0)
             {
                 throw std::runtime_error("oob: peer closed during send");
             }
-            p += n;
-            size -= static_cast<std::size_t>(n);
+            throw std::runtime_error("oob: send() failed");
         }
     }
 
-    void read_all(void *data, std::size_t size) const
+    void read_all(void *data,
+                  std::size_t size,
+                  std::chrono::steady_clock::time_point deadline) const
     {
         auto *p = static_cast<char *>(data);
         while(size > 0)
         {
-            const ssize_t n = ::recv(fd_, p, size, 0);
-            if(n <= 0)
+            const ssize_t n = ::recv(fd_, p, size, MSG_DONTWAIT);
+            if(n > 0)
+            {
+                p += n;
+                size -= static_cast<std::size_t>(n);
+                continue;
+            }
+            if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            {
+                wait_for(POLLIN, deadline);
+                continue;
+            }
+            if(n < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            if(n == 0)
             {
                 throw std::runtime_error("oob: peer closed during recv");
             }
-            p += n;
-            size -= static_cast<std::size_t>(n);
+            throw std::runtime_error("oob: recv() failed");
         }
     }
 
