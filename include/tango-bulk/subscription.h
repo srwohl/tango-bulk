@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <optional>
 
 namespace TangoBulk
 {
@@ -44,6 +45,16 @@ class Subscription
     void close() noexcept;
 
     void interrupt() noexcept;
+
+    /// Claim one frame without registering a callback. Returns no value only
+    /// when no frame is ready; terminal lifecycle outcomes are reported as a
+    /// BulkException. Only available for DeliveryMode::Pull.
+    std::optional<FrameView> try_read();
+
+    /// Claim one frame, waiting up to `timeout`. A timeout is represented by
+    /// an empty optional and is distinct from close, interruption, and failure.
+    /// Only available for DeliveryMode::Pull.
+    std::optional<FrameView> read_for(std::chrono::milliseconds timeout);
 
     std::size_t poll(std::chrono::milliseconds timeout, std::size_t max_frames);
 

@@ -113,6 +113,40 @@ TEST_CASE("bounded retry completes initial establishment before returning",
     CHECK(subscription->geometry().generation == 1);
 }
 
+TEST_CASE("initial retries share one absolute coordination deadline", "[core][subscription]")
+{
+    Script script;
+    script.open_results = {Status::TransportFailure};
+
+    SubscriberConfig config = subscription_config();
+    config.establishment_timeout_ms = 200;
+    config.reconnect_backoff_ms = 1;
+
+    const auto started = std::chrono::steady_clock::now();
+    auto subscription = detail::SubscriptionFactory::open(
+        config, fake_channel(script), fake_factory(script), noop_callbacks());
+
+    std::vector<std::chrono::steady_clock::time_point> open_deadlines;
+    {
+        std::lock_guard<std::mutex> lock(script.mutex);
+        for(const auto &[kind, deadline] : script.channel_deadlines)
+        {
+            if(kind == Protocol::CoordType::Open)
+            {
+                open_deadlines.push_back(deadline);
+            }
+        }
+    }
+
+    REQUIRE(open_deadlines.size() == 2);
+    CHECK(open_deadlines[0] == open_deadlines[1]);
+    CHECK(open_deadlines[0] > started);
+    // Allow the clock to advance between recording `started` and entering the
+    // factory; the contract under test is that the retry does not extend the
+    // same deadline, not that the caller's timestamp is the construction time.
+    CHECK(open_deadlines[0] <= started + std::chrono::milliseconds{250});
+}
+
 
 TEST_CASE("RenewTooFrequent slows the timer and does not end the session",
           "[core][subscription]")
@@ -444,6 +478,24 @@ TEST_CASE("a frame the transport received reaches the application", "[core][subs
     CHECK(seen.sizes == std::vector<std::size_t>(3, std::size_t{128}));
 }
 
+TEST_CASE("Pull delivery needs no callback and returns frames directly", "[core][subscription]")
+{
+    Script script;
+    SubscriberConfig config = subscription_config();
+    config.delivery_mode = DeliveryMode::Pull;
+
+    auto subscription = detail::SubscriptionFactory::open(
+        config, fake_channel(script), fake_factory(script), SubscriptionCallbacks{});
+
+    script.receive(9);
+    const std::optional<FrameView> frame = subscription->read_for(200ms);
+
+    REQUIRE(frame.has_value());
+    CHECK(frame->sequence() == 9);
+    CHECK(subscription->try_read() == std::nullopt);
+    CHECK(subscription->fd() >= 0);
+}
+
 TEST_CASE("a manual callback failure is surfaced and stops the subscription",
           "[core][subscription]")
 {
@@ -539,9 +591,13 @@ TEST_CASE("interrupt is sticky and distinct from an orderly close",
     subscription->interrupt();
     CHECK(subscription->snapshot().interrupted);
     CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{0}, 1), BulkException);
+    CHECK(script.closes.load() == 0);
 
     subscription->interrupt();
     CHECK(subscription->snapshot().interrupted);
+
+    subscription->close();
+    CHECK(script.closes.load() == 1);
 }
 
 TEST_CASE("frames arriving after the open are delivered too", "[core][subscription]")

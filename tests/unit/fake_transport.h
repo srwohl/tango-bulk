@@ -70,6 +70,8 @@ struct Script
     std::atomic<int> closes{0};
 
     std::set<std::thread::id> channel_threads;
+    std::vector<std::pair<Protocol::CoordType, std::chrono::steady_clock::time_point>>
+        channel_deadlines;
     std::atomic<int> channel_inside{0};
     std::atomic<int> channel_max_concurrent{0};
 
@@ -235,7 +237,6 @@ struct Script
     {
         delivery->push(
             detail::DetachedFrameFactory::make(frame.payload, frame.bytes(), frame.fields));
-        delivery->notify();
     }
 };
 
@@ -317,7 +318,8 @@ inline detail::TransportFactory fake_factory(Script &script,
 inline detail::CoordinationChannel fake_channel(Script &script)
 {
     return [&script](Protocol::CoordType kind,
-                     const std::vector<std::byte> &request) -> std::vector<std::byte>
+                     const std::vector<std::byte> &request,
+                     std::chrono::steady_clock::time_point deadline) -> std::vector<std::byte>
     {
         const int inside = script.channel_inside.fetch_add(1, std::memory_order_acq_rel) + 1;
         int observed = script.channel_max_concurrent.load(std::memory_order_relaxed);
@@ -337,6 +339,7 @@ inline detail::CoordinationChannel fake_channel(Script &script)
         {
             std::lock_guard<std::mutex> lock(script.mutex);
             script.channel_threads.insert(std::this_thread::get_id());
+            script.channel_deadlines.emplace_back(kind, deadline);
             if(script.channel_throws > 0)
             {
                 --script.channel_throws;

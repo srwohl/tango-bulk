@@ -91,8 +91,14 @@ ReceiveArena::ReceiveArena(std::shared_ptr<UcxContext> context,
                                           depth,
                                           std::move(receive_buffer),
                                           receive_buffer_bytes,
-                                          memory_kind)
-                         : RegisteredRing(*context_, slot_bytes, depth, false, pinned_limit)),
+                                          memory_kind,
+                                          pinned_limit)
+                         : RegisteredRing(*context_,
+                                          slot_bytes,
+                                          depth,
+                                          false,
+                                          pinned_limit,
+                                          "subscriber")),
     slots_(depth),
     credit_returns_(static_cast<std::size_t>(depth) * 2),
     lease_pool_(std::make_shared<LeasePool>(static_cast<std::size_t>(depth) + 8))
@@ -266,8 +272,9 @@ void SubscriberEngine::register_am_handlers()
 //
 // What is left here is the transport's share of it: the worker address to put
 // in the request, the endpoint to create from the reply, and the state this
-// class publishes to the layer above.  `SessionClient` owns the rest, and owns
-// it in `core/` where it can be tested without a NIC.
+// class publishes to the Subscription layer. Session request ordering and
+// reply validation live in Subscription-owned state, where they can be tested
+// without a NIC.
 
 Status SubscriberEngine::activate(Protocol::StreamId stream_id,
                                   const Protocol::GeometryBlock &granted,
@@ -327,10 +334,9 @@ void SubscriberEngine::engine_loop()
             worked = true;
         }
 
-        // AM callbacks only enqueue.  Signalling after progress returns keeps
-        // the eventfd out of the UCX callback path and gives the waiter one
-        // stable notification point for a batch of received frames.
-        delivery_->notify();
+        // AM callbacks enqueue through DeliveryQueue. That ingress owns both
+        // the bounded insertion and the conditional readiness signal, so this
+        // engine never needs a second notification path.
 
         if(worked)
         {
@@ -960,7 +966,7 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
 std::unique_ptr<SubscriberTransport> make_subscriber_transport(
     SubscriberConfig config, std::shared_ptr<DeliveryQueue> delivery)
 {
-    // point of the seam: `BulkSubscriber` constructs a transport without naming
+    // point of the seam: `Subscription` constructs a transport without naming
     // the concrete type, and therefore without compiling against `ucp/*`.
     return std::make_unique<SubscriberEngine>(std::move(config), std::move(delivery));
 }
