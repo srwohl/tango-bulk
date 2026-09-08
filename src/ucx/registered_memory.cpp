@@ -4,40 +4,142 @@
 
 #include <ucx/registered_memory.h>
 
-#include <core/pinned_budget.h>
-
 #include <tango-bulk/errors.h>
 
+#include <sys/resource.h>
+
+#include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <utility>
 
 namespace TangoBulk::detail
 {
+namespace
+{
+
+std::atomic<std::uint64_t> &pinned_bytes() noexcept
+{
+    static std::atomic<std::uint64_t> value{0};
+    return value;
+}
+
+bool try_reserve(std::uint64_t bytes, std::uint64_t limit) noexcept
+{
+    std::atomic<std::uint64_t> &counter = pinned_bytes();
+    std::uint64_t observed = counter.load(std::memory_order_relaxed);
+
+    for(;;)
+    {
+        if(bytes > limit || observed > limit - bytes)
+        {
+            return false;
+        }
+
+        if(counter.compare_exchange_weak(observed,
+                                         observed + bytes,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_relaxed))
+        {
+            return true;
+        }
+    }
+}
+
+void release_reservation(std::uint64_t bytes) noexcept
+{
+    pinned_bytes().fetch_sub(bytes, std::memory_order_acq_rel);
+}
+
+void check_memlock(std::uint64_t limit) noexcept
+{
+    static std::once_flag once;
+
+    std::call_once(
+        once,
+        [](std::uint64_t configured)
+        {
+            struct rlimit rl
+            {
+            };
+
+            if(getrlimit(RLIMIT_MEMLOCK, &rl) != 0 || rl.rlim_cur == RLIM_INFINITY)
+            {
+                return;
+            }
+
+            const auto allowed = static_cast<std::uint64_t>(rl.rlim_cur);
+            if(configured > allowed)
+            {
+                std::fprintf(stderr,
+                             "tango-bulk: warning: pinned_memory_limit_bytes is %llu but "
+                             "RLIMIT_MEMLOCK is %llu. Registration will fail with an opaque "
+                             "UCX error once the ring exceeds the kernel limit; raise "
+                             "'ulimit -l' or lower the configured limit.\n",
+                             static_cast<unsigned long long>(configured),
+                             static_cast<unsigned long long>(allowed));
+            }
+        },
+        limit);
+}
+
+} // namespace
+
+class RegisteredMemory::Reservation
+{
+  public:
+    static std::unique_ptr<Reservation> acquire(std::uint64_t bytes,
+                                                std::uint64_t limit,
+                                                const char *origin)
+    {
+        check_memlock(limit);
+        if(!try_reserve(bytes, limit))
+        {
+            throw BulkException(
+                BulkError{Status::ResourceExhausted,
+                          "pinned memory budget exceeded: this region needs " +
+                              std::to_string(bytes) + " bytes, the process already holds " +
+                              std::to_string(pinned_bytes().load(std::memory_order_relaxed)) +
+                              ", limit is " + std::to_string(limit),
+                          origin});
+        }
+
+        try
+        {
+            return std::unique_ptr<Reservation>(new Reservation(bytes));
+        }
+        catch(...)
+        {
+            release_reservation(bytes);
+            throw;
+        }
+    }
+
+    ~Reservation()
+    {
+        release_reservation(bytes_);
+    }
+
+    Reservation(const Reservation &) = delete;
+    Reservation &operator=(const Reservation &) = delete;
+
+  private:
+    explicit Reservation(std::uint64_t bytes) noexcept : bytes_(bytes) {}
+
+    std::uint64_t bytes_;
+};
 
 RegisteredMemory RegisteredMemory::ucx_allocated(UcxContext &context,
                                                  std::uint64_t bytes,
-                                                 std::uint64_t pinned_limit)
+                                                 std::uint64_t pinned_limit,
+                                                 const char *origin)
 {
     RegisteredMemory memory;
     memory.context_ = context.get();
     memory.bytes_ = bytes;
-
-    PinnedBudget::check_memlock(pinned_limit);
-
-    // 6.1: reserve before mapping.  A rejection here costs nothing; a rejection
-    // after ucp_mem_map would mean unwinding a registration.
-    if(!PinnedBudget::try_reserve(bytes, pinned_limit))
-    {
-        throw BulkException(
-            BulkError{Status::ResourceExhausted,
-                      "pinned memory budget exceeded: this region needs " + std::to_string(bytes) +
-                          " bytes, the process already holds " +
-                          std::to_string(PinnedBudget::current()) + ", limit is " +
-                          std::to_string(pinned_limit),
-                      "publisher"});
-    }
-    memory.reserved_ = true;
+    memory.reservation_ = Reservation::acquire(bytes, pinned_limit, origin);
 
     ucp_mem_map_params_t params;
     std::memset(&params, 0, sizeof(params));
@@ -56,7 +158,7 @@ RegisteredMemory RegisteredMemory::ucx_allocated(UcxContext &context,
         memory.release();
         // RLIMIT_MEMLOCK is the usual cause and UCX does not say so; the warning
         // from check_memlock() above is what connects the two.
-        throw_ucx_error("ucp_mem_map", status, "publisher");
+        throw_ucx_error("ucp_mem_map", status, origin);
     }
 
     ucp_mem_attr_t attr;
@@ -67,7 +169,7 @@ RegisteredMemory RegisteredMemory::ucx_allocated(UcxContext &context,
     if(status != UCS_OK)
     {
         memory.release();
-        throw_ucx_error("ucp_mem_query", status, "publisher");
+        throw_ucx_error("ucp_mem_query", status, origin);
     }
 
     memory.base_ = static_cast<std::byte *>(attr.address);
@@ -79,7 +181,7 @@ RegisteredMemory RegisteredMemory::ucx_allocated(UcxContext &context,
         memory.release();
         throw BulkException(BulkError{Status::Internal,
                                       "ucp_mem_map returned a shorter region than requested",
-                                      "publisher"});
+                                      origin});
     }
 
     return memory;
@@ -88,12 +190,14 @@ RegisteredMemory RegisteredMemory::ucx_allocated(UcxContext &context,
 RegisteredMemory RegisteredMemory::adopted(UcxContext &context,
                                            std::shared_ptr<void> owner,
                                            std::uint64_t bytes,
-                                           MemoryKind memory_kind)
+                                           MemoryKind memory_kind,
+                                           std::uint64_t pinned_limit)
 {
     RegisteredMemory memory;
     memory.context_ = context.get();
     memory.bytes_ = bytes;
     memory.owner_ = std::move(owner);
+    memory.reservation_ = Reservation::acquire(bytes, pinned_limit, "subscriber");
 
     ucp_mem_map_params_t params;
     std::memset(&params, 0, sizeof(params));
@@ -122,11 +226,7 @@ void RegisteredMemory::release() noexcept
         memh_ = nullptr;
     }
 
-    if(reserved_)
-    {
-        PinnedBudget::release(bytes_);
-        reserved_ = false;
-    }
+    reservation_.reset();
 
     base_ = nullptr;
     owner_.reset();
@@ -142,12 +242,11 @@ RegisteredMemory::RegisteredMemory(RegisteredMemory &&other) noexcept :
     memh_(other.memh_),
     base_(other.base_),
     bytes_(other.bytes_),
-    reserved_(other.reserved_),
+    reservation_(std::move(other.reservation_)),
     owner_(std::move(other.owner_))
 {
     other.memh_ = nullptr;
     other.base_ = nullptr;
-    other.reserved_ = false;
 }
 
 RegisteredMemory &RegisteredMemory::operator=(RegisteredMemory &&other) noexcept
@@ -160,12 +259,11 @@ RegisteredMemory &RegisteredMemory::operator=(RegisteredMemory &&other) noexcept
         memh_ = other.memh_;
         base_ = other.base_;
         bytes_ = other.bytes_;
-        reserved_ = other.reserved_;
+        reservation_ = std::move(other.reservation_);
         owner_ = std::move(other.owner_);
 
         other.memh_ = nullptr;
         other.base_ = nullptr;
-        other.reserved_ = false;
     }
     return *this;
 }

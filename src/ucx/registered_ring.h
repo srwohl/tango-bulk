@@ -39,14 +39,16 @@ class RegisteredRing
                    std::uint64_t slot_bytes,
                    std::uint32_t depth,
                    bool pad_stride,
-                   std::uint64_t pinned_limit);
+                   std::uint64_t pinned_limit,
+                   const char *origin = "publisher");
 
     RegisteredRing(UcxContext &context,
                    std::uint64_t slot_bytes,
                    std::uint32_t depth,
                    std::shared_ptr<void> receive_buffer,
                    std::uint64_t receive_buffer_bytes,
-                   MemoryKind memory_kind);
+                   MemoryKind memory_kind,
+                   std::uint64_t pinned_limit = 64ull << 30);
 
     /// No destructor: `RegisteredMemory` unmaps the region and returns its
     /// pinned-budget reservation. Nothing else here owns anything.
@@ -95,8 +97,10 @@ class RegisteredRing
 
     /// 6.2's stride rule, exposed for testing.
     ///
+    /// Without padding, stride is exactly slot_bytes so a prepared receive
+    /// plan accounts for the complete registered region. With padding,
     /// stride = align_up(slot_bytes, 4096), and then one extra page if the
-    /// result is a power of two at or above 256 KiB.  That last clause is not
+    /// result is a power of two at or above 256 KiB. That last clause is not
     /// superstition: with an exactly-1 MiB stride every slot aliases into the
     /// same cache sets and the receive-side copy measured ~5.9 GiB/s against
     /// ~16 GiB/s once a 200-byte prefix broke the alignment.

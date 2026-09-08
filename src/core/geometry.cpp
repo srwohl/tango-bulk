@@ -10,6 +10,8 @@
 #include "core/byte_order.h"
 #include "core/geometry_rules.h"
 
+#include <string>
+
 namespace TangoBulk
 {
 
@@ -171,6 +173,90 @@ bool Geometry::describes_same_array(const Geometry &other) const noexcept
 {
     return element_type == other.element_type && element_size == other.element_size &&
            rank == other.rank && shape == other.shape && strides == other.strides;
+}
+
+bool operator==(const Geometry &left, const Geometry &right) noexcept
+{
+    return left.generation == right.generation && left.element_type == right.element_type &&
+           left.element_size == right.element_size && left.rank == right.rank &&
+           left.max_frame_bytes == right.max_frame_bytes &&
+           left.ring_depth == right.ring_depth &&
+           left.credit_window == right.credit_window && left.shape == right.shape &&
+           left.strides == right.strides;
+}
+
+bool operator!=(const Geometry &left, const Geometry &right) noexcept
+{
+    return !(left == right);
+}
+
+namespace
+{
+
+bool valid_stream_name(const std::string &name) noexcept
+{
+    if(name.size() < k_min_stream_name_bytes || name.size() > k_max_stream_name_bytes)
+    {
+        return false;
+    }
+
+    for(const char c : name)
+    {
+        const bool valid = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                           (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
+        if(!valid)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+bool StreamOffer::available() const noexcept
+{
+    return status == Status::Ok && validate() == Status::Ok;
+}
+
+Status StreamOffer::validate() const noexcept
+{
+    if(version != k_version)
+    {
+        return Status::UnsupportedVersion;
+    }
+
+    if(status != Status::Ok)
+    {
+        return status;
+    }
+
+    if(!valid_stream_name(stream_name))
+    {
+        return Status::MalformedMessage;
+    }
+
+    return geometry.validate();
+}
+
+bool operator==(const StreamOffer &left, const StreamOffer &right) noexcept
+{
+    return left.version == right.version && left.stream_name == right.stream_name &&
+           left.geometry.generation == right.geometry.generation &&
+           left.geometry.element_type == right.geometry.element_type &&
+           left.geometry.element_size == right.geometry.element_size &&
+           left.geometry.rank == right.geometry.rank &&
+           left.geometry.max_frame_bytes == right.geometry.max_frame_bytes &&
+           left.geometry.ring_depth == right.geometry.ring_depth &&
+           left.geometry.credit_window == right.geometry.credit_window &&
+           left.geometry.shape == right.geometry.shape &&
+           left.geometry.strides == right.geometry.strides && left.status == right.status &&
+           left.message == right.message;
+}
+
+bool operator!=(const StreamOffer &left, const StreamOffer &right) noexcept
+{
+    return !(left == right);
 }
 
 namespace detail

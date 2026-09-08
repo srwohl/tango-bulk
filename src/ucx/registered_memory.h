@@ -77,7 +77,8 @@ class RegisteredMemory
     /// matters more right now than controlling it.
     static RegisteredMemory ucx_allocated(UcxContext &context,
                                           std::uint64_t bytes,
-                                          std::uint64_t pinned_limit);
+                                          std::uint64_t pinned_limit,
+                                          const char *origin = "publisher");
 
     /// Register caller-owned memory, including CUDA and ROCm device memory.
     /// The shared owner is retained for as long as UCX or any FrameView can
@@ -85,7 +86,8 @@ class RegisteredMemory
     static RegisteredMemory adopted(UcxContext &context,
                                     std::shared_ptr<void> owner,
                                     std::uint64_t bytes,
-                                    MemoryKind memory_kind);
+                                    MemoryKind memory_kind,
+                                    std::uint64_t pinned_limit = 64ull << 30);
 
     // The two modes this shape exists to make additive rather than invasive:
     //
@@ -124,6 +126,8 @@ class RegisteredMemory
     bool contains(const void *p) const noexcept;
 
   private:
+    class Reservation;
+
     RegisteredMemory() = default;
 
     void release() noexcept;
@@ -133,10 +137,10 @@ class RegisteredMemory
     std::byte *base_{nullptr};
     std::uint64_t bytes_{0};
 
-    /// Whether this object owes the pinned budget a release. Tracked separately
-    /// from `memh_` because a failed map must give the reservation back without
-    /// there being anything to unmap.
-    bool reserved_{false};
+    /// The reservation owns process-wide accounting. It is separate from
+    /// `memh_` because a failed map must give it back without there being
+    /// anything to unmap.
+    std::unique_ptr<Reservation> reservation_;
     std::shared_ptr<void> owner_;
 };
 
