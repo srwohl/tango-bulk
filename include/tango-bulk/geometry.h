@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 namespace TangoBulk
 {
@@ -34,6 +35,32 @@ struct Geometry
     std::uint64_t reachable_span() const noexcept;
     bool describes_same_array(const Geometry &other) const noexcept;
 };
+
+bool operator==(const Geometry &left, const Geometry &right) noexcept;
+bool operator!=(const Geometry &left, const Geometry &right) noexcept;
+
+/// The conservative, pre-Open description of one bulk stream.
+///
+/// A valid available offer is an upper bound, not a grant: the publisher may
+/// clamp every sizing field in OpenReply, but it must never require more than
+/// this value.  The generation and Geometry are discovery observations and
+/// therefore never replace OpenReply as the session authority.
+struct StreamOffer
+{
+    static constexpr std::uint32_t k_version = 1;
+
+    std::uint32_t version{k_version};
+    std::string stream_name;
+    Geometry geometry{};
+    Status status{Status::UnknownStream};
+    std::string message;
+
+    bool available() const noexcept;
+    Status validate() const noexcept;
+};
+
+bool operator==(const StreamOffer &left, const StreamOffer &right) noexcept;
+bool operator!=(const StreamOffer &left, const StreamOffer &right) noexcept;
 
 } // namespace TangoBulk
 

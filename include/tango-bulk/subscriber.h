@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace TangoBulk
@@ -31,10 +32,53 @@ enum class SubscriberState : std::uint32_t
 
 const char *to_string(SubscriberState state) noexcept;
 
+/// The receive dimensions selected for a subscription.
+///
+/// A value supplied in SubscriberConfig is a complete upper limit. A value
+/// returned by Subscription::plan() is the actual grant-backed plan. In both
+/// cases the byte count is derived here so every storage adapter shares one
+/// interpretation of the ring.
+struct ReceivePlan
+{
+    std::uint64_t max_frame_bytes{0};
+    std::uint32_t ring_depth{0};
+    std::uint32_t credit_window{0};
+    std::uint64_t pinned_bytes{0};
+
+    Status validate() const noexcept;
+
+    static ReceivePlan from_limits(std::uint64_t max_frame_bytes,
+                                   std::uint32_t ring_depth,
+                                   std::uint32_t credit_window) noexcept;
+
+    static ReceivePlan intersect(const ReceivePlan &upper,
+                                 const Geometry &grant) noexcept;
+
+    static ReceivePlan intersect(const ReceivePlan &upper,
+                                 const ReceivePlan &grant) noexcept;
+
+    static ReceivePlan intersect(const ReceivePlan &upper,
+                                 const StreamOffer &offer) noexcept;
+
+    static ReceivePlan derive(const Geometry &geometry,
+                              std::uint64_t pinned_memory_limit_bytes) noexcept;
+
+    static ReceivePlan derive(const StreamOffer &offer,
+                              std::uint64_t pinned_memory_limit_bytes) noexcept;
+};
+
+bool operator==(const ReceivePlan &left, const ReceivePlan &right) noexcept;
+bool operator!=(const ReceivePlan &left, const ReceivePlan &right) noexcept;
+
 enum class DeliveryMode : std::uint32_t
 {
-    DispatchThread = 0, ///< library-owned thread invokes the callback (default)
-    Manual = 1,         ///< application calls poll(); no dispatch thread created
+    Push = 0, ///< a dedicated library thread invokes the callback (default)
+    Pull = 1, ///< the application claims frames with Subscription::read_for()
+
+    // Transitional spellings retained for source compatibility. New code
+    // should choose the ownership model explicitly as Push or Pull.
+    DispatchThread = Push,
+    Manual = 2,
 };
 
 enum class ReconnectPolicy : std::uint32_t
@@ -80,26 +124,21 @@ struct SubscriberConfig
     std::uint64_t receive_buffer_bytes{0};
     MemoryKind receive_memory_kind{MemoryKind::Host};
 
+    /// Optional complete upper plan. When present it replaces the individual
+    /// sizing fields for preparation and Open, and is still intersected with
+    /// discovery and the pinned budget.
+    std::optional<ReceivePlan> receive_plan;
+
+    /// Optional conservative pre-Open discovery. The offer is only used to
+    /// choose a safe upper request; OpenReply remains authoritative for the
+    /// actual geometry and lease.
+    std::optional<StreamOffer> discovery_offer;
+
+    ReceivePlan upper_receive_plan() const noexcept;
     Status validate() const noexcept;
 };
 
 using FrameCallback = std::function<void(FrameView)>;
-
-/// The receive dimensions selected for a subscription.
-struct ReceivePlan
-{
-    std::uint64_t max_frame_bytes{0};
-    std::uint32_t ring_depth{0};
-    std::uint32_t credit_window{0};
-    std::uint64_t pinned_bytes{0};
-
-    Status validate() const noexcept;
-
-    /// Select the largest safe ring accepted by the negotiated geometry and
-    /// the caller's pinned-memory budget.
-    static ReceivePlan derive(const Geometry &geometry,
-                              std::uint64_t pinned_memory_limit_bytes) noexcept;
-};
 
 } // namespace TangoBulk
 
