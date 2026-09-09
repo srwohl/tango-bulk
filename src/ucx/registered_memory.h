@@ -5,6 +5,8 @@
 #ifndef TANGO_BULK_SRC_UCX_REGISTERED_MEMORY_H
 #define TANGO_BULK_SRC_UCX_REGISTERED_MEMORY_H
 
+#include <core/pinned_ledger.h>
+
 #include <ucx/ucx_context.h>
 
 #include <tango-bulk/frame.h>
@@ -126,8 +128,6 @@ class RegisteredMemory
     bool contains(const void *p) const noexcept;
 
   private:
-    class Reservation;
-
     RegisteredMemory() = default;
 
     void release() noexcept;
@@ -140,7 +140,7 @@ class RegisteredMemory
     /// The reservation owns process-wide accounting. It is separate from
     /// `memh_` because a failed map must give it back without there being
     /// anything to unmap.
-    std::unique_ptr<Reservation> reservation_;
+    PinnedLedger::Reservation reservation_;
     std::shared_ptr<void> owner_;
 };
 

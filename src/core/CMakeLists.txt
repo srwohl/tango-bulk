@@ -20,6 +20,7 @@ add_library(
     frame_view.cpp
     geometry.cpp
     lease_pool.cpp
+    pinned_ledger.cpp
     protocol.cpp
     subscription.cpp
     session_id.cpp)
