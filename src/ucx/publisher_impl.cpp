@@ -8,6 +8,7 @@
 #include <ucx/ucx_context.h>
 
 #include <core/bounded_queue.h>
+#include <core/byte_order.h>
 #include <core/cpu_topology.h>
 #include <core/credit_window.h>
 #include <core/geometry_conversion.h>
@@ -79,6 +80,22 @@ template <typename Message>
 CoordinationReply typed_reply(Message message)
 {
     return CoordinationReply{std::move(message)};
+}
+
+/// The protocol decoder can reject an envelope after its correlation field is
+/// readable. Preserve that field for failure replies; zero is reserved for
+/// inputs too short to contain the complete correlation value.
+std::uint64_t recover_coordination_correlation(const std::byte *data,
+                                               std::size_t size) noexcept
+{
+    constexpr std::size_t correlation_offset = 16;
+    constexpr std::size_t correlation_bytes = sizeof(std::uint64_t);
+    if(data == nullptr || size < correlation_offset + correlation_bytes)
+    {
+        return 0;
+    }
+
+    return wire::get64(data + correlation_offset);
 }
 
 std::uint64_t now_realtime_ns() noexcept
@@ -1541,7 +1558,8 @@ std::vector<std::byte> encode_coordination_error(Status status,
     }
     catch(...)
     {
-        // Allocation failure cannot be represented as another encoded Error.
+        // There is no allocation-free Error representation. The byte carrier
+        // treats an empty result as a failed/no-reply command.
         return {};
     }
 }
@@ -1595,18 +1613,20 @@ std::vector<std::byte> BulkPublisher::Impl::handle_encoded_coordination(
     std::size_t size,
     std::optional<Protocol::CoordType> expected) noexcept
 {
-    std::uint64_t correlation_id = 0;
+    std::uint64_t correlation_id = recover_coordination_correlation(data, size);
 
     // The encoded ingress boundary is shared by Tango and in-process adapters.
     try
     {
         Protocol::Envelope envelope;
-        if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
+        const Status envelope_status = Protocol::decode_envelope(data, size, envelope);
+        if(envelope_status != Status::Ok)
         {
             counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-            return encode_coordination_error(Status::MalformedMessage,
-                                             "undecodable envelope",
-                                             0);
+            const char *message = envelope_status == Status::UnsupportedVersion
+                                      ? "unsupported coordination protocol version"
+                                      : "undecodable envelope";
+            return encode_coordination_error(envelope_status, message, correlation_id);
         }
 
         correlation_id = envelope.correlation_id;
@@ -1619,55 +1639,50 @@ std::vector<std::byte> BulkPublisher::Impl::handle_encoded_coordination(
                     ", not " + Protocol::to_string(envelope.msg_type),
                 correlation_id);
         }
+
+        CoordinationRequest request{Protocol::OpenRequest{}};
+        Status decode_status = Status::MalformedMessage;
         switch(envelope.msg_type)
         {
         case Protocol::CoordType::Open:
         {
-            Protocol::OpenRequest request;
-            if(Protocol::decode(data, size, request) != Status::Ok)
+            Protocol::OpenRequest decoded;
+            decode_status = Protocol::decode(data, size, decoded);
+            if(decode_status == Status::Ok)
             {
-                counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-                return encode_coordination_error(Status::MalformedMessage,
-                                                 "undecodable Open",
-                                                 correlation_id);
+                request = std::move(decoded);
             }
-            return encode_coordination_reply(handle_open(request), correlation_id);
+            break;
         }
         case Protocol::CoordType::Renew:
         {
-            Protocol::RenewRequest request;
-            if(Protocol::decode(data, size, request) != Status::Ok)
+            Protocol::RenewRequest decoded;
+            decode_status = Protocol::decode(data, size, decoded);
+            if(decode_status == Status::Ok)
             {
-                counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-                return encode_coordination_error(Status::MalformedMessage,
-                                                 "undecodable Renew",
-                                                 correlation_id);
+                request = std::move(decoded);
             }
-            return encode_coordination_reply(handle_renew(request), correlation_id);
+            break;
         }
         case Protocol::CoordType::Close:
         {
-            Protocol::CloseRequest request;
-            if(Protocol::decode(data, size, request) != Status::Ok)
+            Protocol::CloseRequest decoded;
+            decode_status = Protocol::decode(data, size, decoded);
+            if(decode_status == Status::Ok)
             {
-                counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-                return encode_coordination_error(Status::MalformedMessage,
-                                                 "undecodable Close",
-                                                 correlation_id);
+                request = std::move(decoded);
             }
-            return encode_coordination_reply(handle_close(request), correlation_id);
+            break;
         }
         case Protocol::CoordType::Query:
         {
-            Protocol::QueryRequest request;
-            if(Protocol::decode(data, size, request) != Status::Ok)
+            Protocol::QueryRequest decoded;
+            decode_status = Protocol::decode(data, size, decoded);
+            if(decode_status == Status::Ok)
             {
-                counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-                return encode_coordination_error(Status::MalformedMessage,
-                                                 "undecodable Query",
-                                                 correlation_id);
+                request = std::move(decoded);
             }
-            return encode_coordination_reply(handle_query(request), correlation_id);
+            break;
         }
         default:
             // Everything left is a *reply* type, which a publisher never
@@ -1680,6 +1695,17 @@ std::vector<std::byte> BulkPublisher::Impl::handle_encoded_coordination(
                     " is not a request a publisher answers",
                 correlation_id);
         }
+
+        if(decode_status != Status::Ok)
+        {
+            counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+            return encode_coordination_error(
+                decode_status,
+                std::string("undecodable ") + Protocol::to_string(envelope.msg_type),
+                correlation_id);
+        }
+
+        return encode_coordination_reply(handle_coordination(request), correlation_id);
     }
     catch(const BulkException &e)
     {

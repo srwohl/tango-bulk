@@ -88,6 +88,14 @@ Protocol::QueryReply query(BulkPublisher &publisher,
     return reply;
 }
 
+Protocol::ErrorMessage decode_error_reply(const std::vector<std::byte> &bytes,
+                                          Protocol::Envelope &envelope)
+{
+    Protocol::ErrorMessage error;
+    REQUIRE(Protocol::decode(bytes.data(), bytes.size(), error, &envelope) == Status::Ok);
+    return error;
+}
+
 /// The value of `key` in a `key=value;` blob, or empty if it is absent.
 ///
 /// Split into fields rather than searched for `key=`, because a substring search
@@ -624,4 +632,92 @@ TEST_CASE("coordination adapter echoes correlation on outer failures", "[m4][coo
     REQUIRE(Protocol::decode(raw.data(), raw.size(), error) == Status::Ok);
     CHECK(error.status == Status::TransportFailure);
     CHECK(publisher.session_count() == 0);
+}
+
+TEST_CASE("coordination adapter preserves recoverable correlations on envelope failures",
+          "[coordination][adapter]")
+{
+    BulkPublisher publisher(publisher_config());
+    constexpr std::uint64_t correlation_id = 0x0102030405060708ull;
+
+    SECTION("malformed envelope")
+    {
+        std::vector<std::byte> request =
+            Protocol::encode(Protocol::QueryRequest{}, correlation_id);
+        request[0] = std::byte{0};
+
+        const std::vector<std::byte> raw =
+            detail::PublisherAccess::coordination(publisher, request.data(), request.size());
+        Protocol::Envelope envelope;
+        const Protocol::ErrorMessage error = decode_error_reply(raw, envelope);
+
+        CHECK(error.status == Status::MalformedMessage);
+        CHECK(envelope.correlation_id == correlation_id);
+    }
+
+    SECTION("unsupported version")
+    {
+        std::vector<std::byte> request =
+            Protocol::encode(Protocol::QueryRequest{}, correlation_id);
+        request[4] = std::byte{2};
+
+        const std::vector<std::byte> raw =
+            detail::PublisherAccess::coordination(publisher, request.data(), request.size());
+        Protocol::Envelope envelope;
+        const Protocol::ErrorMessage error = decode_error_reply(raw, envelope);
+
+        CHECK(error.status == Status::UnsupportedVersion);
+        CHECK(envelope.correlation_id == correlation_id);
+    }
+}
+
+TEST_CASE("coordination adapter rejects the wrong request class and replies",
+          "[coordination][adapter]")
+{
+    BulkPublisher publisher(publisher_config());
+    constexpr std::uint64_t correlation_id = 0x0A0B0C0D0E0F1011ull;
+
+    SECTION("expected command mismatch")
+    {
+        const std::vector<std::byte> request =
+            Protocol::encode(Protocol::RenewRequest{}, correlation_id);
+        const std::vector<std::byte> raw = detail::PublisherAccess::coordination(
+            publisher,
+            request.data(),
+            request.size(),
+            Protocol::CoordType::Open);
+        Protocol::Envelope envelope;
+        const Protocol::ErrorMessage error = decode_error_reply(raw, envelope);
+
+        CHECK(error.status == Status::MalformedMessage);
+        CHECK(envelope.correlation_id == correlation_id);
+        CHECK(publisher.session_count() == 0);
+    }
+
+    SECTION("reply received as a request")
+    {
+        const std::vector<std::byte> request =
+            Protocol::encode(Protocol::CloseReply{}, correlation_id);
+        const std::vector<std::byte> raw =
+            detail::PublisherAccess::coordination(publisher, request.data(), request.size());
+        Protocol::Envelope envelope;
+        const Protocol::ErrorMessage error = decode_error_reply(raw, envelope);
+
+        CHECK(error.status == Status::MalformedMessage);
+        CHECK(envelope.correlation_id == correlation_id);
+    }
+}
+
+TEST_CASE("encoded coordination ingress is nonthrowing for short input",
+          "[coordination][adapter]")
+{
+    BulkPublisher publisher(publisher_config());
+    std::vector<std::byte> raw;
+
+    CHECK_NOTHROW(raw = detail::PublisherAccess::coordination(publisher, nullptr, 0));
+    REQUIRE_FALSE(raw.empty());
+
+    Protocol::ErrorMessage error;
+    REQUIRE(Protocol::decode(raw.data(), raw.size(), error) == Status::Ok);
+    CHECK(error.status == Status::MalformedMessage);
 }
