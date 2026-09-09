@@ -20,7 +20,9 @@ namespace TangoBulk::detail
 /// The public publisher owns publication and session state; this access shim
 /// keeps the encoded ingress out of the public class. Tango and in-process
 /// adapters carry bytes through the same boundary, while typed request
-/// handling remains private to `BulkPublisher::Impl`.
+/// handling remains private to `BulkPublisher::Impl`. An empty result means
+/// even the fallback encoded Error could not be allocated; byte carriers must
+/// treat that as a failed/no-reply command.
 class PublisherAccess
 {
   public:
