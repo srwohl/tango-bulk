@@ -28,6 +28,7 @@ add_executable(
     unit/test_protocol_layout.cpp
     unit/test_protocol_malformed.cpp
     unit/test_protocol_roundtrip.cpp
+    unit/test_pinned_budget.cpp
     unit/test_receive_plan.cpp)
 
 target_link_libraries(tango-bulk-unit-tests PRIVATE tango-bulk::core
