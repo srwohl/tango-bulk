@@ -108,8 +108,6 @@ TEST_CASE("every message type carries its spec msg_type", "[protocol][layout]")
     CHECK(type_of(encode(RenewReply{}, 0)) == 0x0004);
     CHECK(type_of(encode(CloseRequest{}, 0)) == 0x0005);
     CHECK(type_of(encode(CloseReply{}, 0)) == 0x0006);
-    CHECK(type_of(encode(QueryRequest{}, 0)) == 0x0007);
-    CHECK(type_of(encode(QueryReply{}, 0)) == 0x0008);
     CHECK(type_of(encode(ErrorMessage{Status::Internal, ""}, 0)) == 0x00FF);
 }
 
@@ -304,37 +302,6 @@ TEST_CASE("Close and CloseReply bodies match spec 3.8", "[protocol][layout]")
     CHECK_FIELD(reply_bytes, b + 20, 4, k_probe_u32);
 }
 
-TEST_CASE("Query and QueryReply bodies match spec 3.8", "[protocol][layout]")
-{
-    QueryRequest query;
-    query.query_flags = k_probe_u32;
-
-    const auto query_bytes = encode(query, 0);
-    constexpr std::size_t b = k_coord_envelope_bytes;
-
-    REQUIRE(query_bytes.size() == b + 24);
-    CHECK_FIELD(query_bytes, b + 16, 4, k_probe_u32);
-    CHECK_FIELD(query_bytes, b + 20, 4, 0); // reserved
-
-    QueryReply reply;
-    reply.active_sessions = 3;
-    reply.generation = 7;
-    reply.geometry = sample_geometry();
-    reply.counters = "frames=10;drops=0;";
-
-    const auto reply_bytes = encode(reply, 0);
-
-    CHECK_FIELD(reply_bytes, b + 16, 2, 0);  // status
-    CHECK_FIELD(reply_bytes, b + 18, 2, 0);  // reserved
-    CHECK_FIELD(reply_bytes, b + 20, 4, 3);  // active_sessions
-    CHECK_FIELD(reply_bytes, b + 24, 4, 7);  // generation
-    CHECK_FIELD(reply_bytes, b + 28, 4, 0);  // reserved
-    CHECK_FIELD(reply_bytes, b + 32, 4, 7);  // geometry.generation
-    CHECK_FIELD(reply_bytes, b + 128, 4, reply.counters.size());
-
-    CHECK(reply_bytes.size() == b + 128 + 4 + reply.counters.size());
-}
-
 TEST_CASE("Error body matches spec 3.8", "[protocol][layout]")
 {
     const ErrorMessage msg{Status::TooManySessions, "no"};
@@ -387,8 +354,6 @@ TEST_CASE("data-plane header sizes and AM ids match spec 3.10", "[protocol][layo
     CHECK(k_credit_bytes == 32);
     CHECK(k_probe_bytes == 32);
     CHECK(k_probe_ack_bytes == 32);
-    CHECK(k_geometry_bytes == 128);
-    CHECK(k_geometry_ack_bytes == 32);
 
     // Credit and ProbeAck have distinct ids.  The prototype shared one, which is
     // what forced a reserved sequence sentinel to keep a probe ack from sliding
@@ -399,12 +364,6 @@ TEST_CASE("data-plane header sizes and AM ids match spec 3.10", "[protocol][layo
     CHECK(k_am_id_credit == 1);
     CHECK(k_am_id_probe == 2);
     CHECK(k_am_id_probe_ack == 3);
-    CHECK(k_am_id_geometry == 4);
-    CHECK(k_am_id_geometry_ack == 5);
-
-    // The engine must confirm the transport can carry the largest header before
-    // the first frame, not at it.
-    CHECK(k_max_am_header_bytes == 160);
 }
 
 // ---------------------------------------------------------------------------
@@ -499,36 +458,6 @@ TEST_CASE("Probe and ProbeAck match spec 3.13", "[protocol][layout]")
     CHECK_FIELD(ack_bytes, 24, 8, 0xFEEDFACECAFEBEEFull);
 }
 
-TEST_CASE("Geometry and GeometryAck match spec 3.14", "[protocol][layout]")
-{
-    GeometryMessage geom;
-    geom.generation = 7;
-    geom.stream_id = k_probe_u64;
-    geom.first_sequence = 4096;
-    geom.geometry = sample_geometry();
-
-    const auto geom_bytes = encode(geom);
-
-    REQUIRE(geom_bytes.size() == 128);
-    CHECK_FIELD(geom_bytes, 6, 2, 128);           // header_bytes
-    CHECK_FIELD(geom_bytes, 8, 2, 5);             // msg_type = Geometry
-    CHECK_FIELD(geom_bytes, 12, 4, 7);            // generation = the NEW epoch
-    CHECK_FIELD(geom_bytes, 16, 8, k_probe_u64);  // stream_id
-    CHECK_FIELD(geom_bytes, 24, 8, 4096);         // first_sequence
-    CHECK_FIELD(geom_bytes, 32, 4, 7);            // geometry.generation
-
-    GeometryAckMessage ack;
-    ack.generation = 7;
-    ack.stream_id = k_probe_u64;
-    ack.first_sequence = 4096;
-
-    const auto ack_bytes = encode(ack);
-
-    REQUIRE(ack_bytes.size() == 32);
-    CHECK_FIELD(ack_bytes, 8, 2, 6);      // msg_type = GeometryAck
-    CHECK_FIELD(ack_bytes, 24, 8, 4096);  // first_sequence echoed
-}
-
 // ---------------------------------------------------------------------------
 // 3.0.2 -- every fixed part is a multiple of 8
 // ---------------------------------------------------------------------------
@@ -545,11 +474,8 @@ TEST_CASE("every fixed part is a multiple of eight bytes", "[protocol][layout]")
     CHECK(k_renew_reply_bytes % 8 == 0);
     CHECK(k_close_bytes % 8 == 0);
     CHECK(k_close_reply_bytes % 8 == 0);
-    CHECK(k_query_bytes % 8 == 0);
-    CHECK(k_query_reply_fixed_bytes % 8 == 0);
     CHECK(k_error_fixed_bytes % 8 == 0);
     CHECK(k_data_prefix_bytes % 8 == 0);
     CHECK(k_frame_header_bytes % 8 == 0);
     CHECK(k_credit_bytes % 8 == 0);
-    CHECK(k_geometry_bytes % 8 == 0);
 }

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include <tango-bulk/frame.h>
+#include <core/frame_fields.h>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -19,7 +20,7 @@ namespace
 struct Frame
 {
     std::shared_ptr<std::vector<std::uint16_t>> pixels;
-    FrameView::Fields fields;
+    detail::FrameFields fields;
 };
 
 Frame make_frame(std::uint64_t height, std::uint64_t width)
@@ -49,7 +50,7 @@ Frame make_frame(std::uint64_t height, std::uint64_t width)
 
 FrameView detach(const Frame &frame)
 {
-    return FrameView::detached(
+    return detail::DetachedFrameFactory::make(
         frame.pixels,
         reinterpret_cast<const std::byte *>(frame.pixels->data()),
         frame.fields);
@@ -153,7 +154,7 @@ TEST_CASE("a detached view accepts a null owner and an unreadable pointer",
     // A device pointer is the case this supports: detached() must not
     // dereference `data`, so a caller can build a view over GPU memory to
     // exercise a callback without a GPU present.
-    FrameView::Fields fields;
+    detail::FrameFields fields;
     fields.rank = 2;
     fields.shape = {2208, 3216, 0, 0};
     fields.strides = {3216 * 2, 2, 0, 0};
@@ -166,7 +167,7 @@ TEST_CASE("a detached view accepts a null owner and an unreadable pointer",
         reinterpret_cast<const std::byte *>(std::uintptr_t{0x7f0000000000ull});
 
     const FrameView view =
-        FrameView::detached(nullptr, pretend_device_pointer, fields);
+        detail::DetachedFrameFactory::make(nullptr, pretend_device_pointer, fields);
 
     REQUIRE(static_cast<bool>(view));
     CHECK(view.data() == pretend_device_pointer);

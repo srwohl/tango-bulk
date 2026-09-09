@@ -4,6 +4,9 @@
 
 #include "slice.h"
 
+#include <poll.h>
+#include <thread>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -32,7 +35,7 @@ TEST_CASE("A published frame arrives intact with its metadata", "[m2][slice]")
 
     REQUIRE(slice.publish(bytes, 0x5A) == PublishResult::Accepted);
 
-    const std::vector<FrameView> views = collect(slice.subscriber, 1);
+    const std::vector<FrameView> views = collect(*slice.subscription, 1);
     REQUIRE(views.size() == 1);
 
     const FrameView &view = views.front();
@@ -56,62 +59,6 @@ TEST_CASE("A published frame arrives intact with its metadata", "[m2][slice]")
     CHECK(payload_matches(view, 0x5A));
 }
 
-TEST_CASE("The delivered payload lives in the registered receive ring", "[m2][slice]")
-{
-    Slice slice;
-
-    REQUIRE(slice.publish(k_frame_bytes, 0x11) == PublishResult::Accepted);
-
-    const std::vector<FrameView> views = collect(slice.subscriber, 1);
-    REQUIRE(views.size() == 1);
-    const FrameView &view = views.front();
-
-    // The pointer half of 9.3's zero-copy criterion: the address handed to the
-    // application is inside the registered region, not in a staging buffer the
-    // library copied out of.
-    CHECK(slice.subscriber.ring_contains(view.data()));
-    CHECK(view.data() == slice.subscriber.slot_address(0));
-
-    // The registration half.  bytes_copied() counts only payload that went
-    // through an eager staging copy; for a rendezvous-sized frame there must be
-    // none, and no amount of reading the code substitutes for the count.
-    CHECK(slice.subscriber.bytes_copied() == 0);
-    CHECK(payload_matches(view, 0x11));
-}
-
-TEST_CASE("Slots recycle: sequence s lands in slot s % ring_depth", "[m2][slice]")
-{
-    Slice slice;
-    const std::uint32_t depth = slice.subscriber.granted_ring_depth();
-    REQUIRE(depth == k_ring_depth);
-
-    const std::size_t total = 4u * depth;
-    const std::uint64_t bytes = 8192;
-
-    for(std::size_t n = 0; n < total; ++n)
-    {
-        const auto seed = static_cast<unsigned>(n);
-        REQUIRE(slice.publish(bytes, seed) == PublishResult::Accepted);
-
-        std::vector<FrameView> views = collect(slice.subscriber, 1);
-        REQUIRE(views.size() == 1);
-
-        const FrameView &view = views.front();
-        CHECK(view.sequence() == n);
-        CHECK(view.data() == slice.subscriber.slot_address(n % depth));
-        CHECK(payload_matches(view, seed));
-
-        // Released here, at the end of the iteration, which is what keeps the
-        // credit window open for the next one.
-        views.clear();
-    }
-
-    // Every producer slot came back.  A wraparound bug that leaked one slot per
-    // lap shows up here and nowhere else.
-    CHECK(eventually([&] { return slice.publisher.counters().frames_credited == total; }));
-    CHECK(eventually([&] { return slice.publisher.source().retained() == 0; }));
-}
-
 TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring",
           "[m2][slice]")
 {
@@ -124,7 +71,7 @@ TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring
     sub.credit_window = 2;
 
     Slice slice(pub, sub);
-    REQUIRE(slice.subscriber.granted_ring_depth() == 2);
+    REQUIRE(slice.subscription->plan().ring_depth == 2);
 
     // Fill beyond the client's negotiated window before polling.  BestEffort
     // may skip frames for this session, but it must not assign them sequences:
@@ -132,7 +79,7 @@ TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring
     for(unsigned seed = 0; seed < 4; ++seed)
         REQUIRE(slice.publish(4096, seed) == PublishResult::Accepted);
 
-    std::vector<FrameView> first = collect(slice.subscriber, 2);
+    std::vector<FrameView> first = collect(*slice.subscription, 2);
     REQUIRE(first.size() == 2);
     CHECK(first[0].sequence() == 0);
     CHECK(first[1].sequence() == 1);
@@ -145,7 +92,7 @@ TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring
     REQUIRE(slice.publish(4096, 4) == PublishResult::Accepted);
     REQUIRE(slice.publish(4096, 5) == PublishResult::Accepted);
 
-    std::vector<FrameView> second = collect(slice.subscriber, 2);
+    std::vector<FrameView> second = collect(*slice.subscription, 2);
     REQUIRE(second.size() == 2);
     CHECK(second[0].sequence() == 2);
     CHECK(second[1].sequence() == 3);
@@ -163,13 +110,14 @@ TEST_CASE("A retained view withholds exactly one credit", "[m2][slice]")
         REQUIRE(slice.publish(bytes, n) == PublishResult::Accepted);
     }
 
-    std::vector<FrameView> held = collect(slice.subscriber, k_credit_window);
+    std::vector<FrameView> held = collect(*slice.subscription, k_credit_window);
     REQUIRE(held.size() == k_credit_window);
-    CHECK(slice.subscriber.counters().views_outstanding == k_credit_window);
+    REQUIRE(eventually(
+        [&] { return slice.subscription->counters().views_outstanding == k_credit_window; }));
 
     // The window is full and every view is retained, so the publisher stalls.
     {
-        BulkSource::Lease lease = slice.publisher.source().try_acquire();
+        BulkPublisher::SlotHandle lease = slice.publisher.try_acquire();
         REQUIRE(lease);
         CHECK(slice.publisher.publish(std::move(lease), meta_for(bytes, 99)) ==
               PublishResult::CreditStalled);
@@ -182,7 +130,8 @@ TEST_CASE("A retained view withholds exactly one credit", "[m2][slice]")
     held.erase(held.begin());
 
     REQUIRE(eventually([&] { return slice.publisher.counters().frames_credited == 1; }));
-    CHECK(slice.subscriber.counters().views_outstanding == k_credit_window - 1);
+    CHECK(eventually(
+        [&] { return slice.subscription->counters().views_outstanding == k_credit_window - 1; }));
 
     // ...and the publisher resumes, which is the other half of the criterion:
     // the stall must be a stall, not a wedge.
@@ -200,7 +149,7 @@ TEST_CASE("Out-of-order release advances the ack only across the contiguous pref
         REQUIRE(slice.publish(bytes, n) == PublishResult::Accepted);
     }
 
-    std::vector<FrameView> held = collect(slice.subscriber, k_credit_window);
+    std::vector<FrameView> held = collect(*slice.subscription, k_credit_window);
     REQUIRE(held.size() == k_credit_window);
     REQUIRE(held[0].sequence() == 0);
     REQUIRE(held[1].sequence() == 1);
@@ -221,8 +170,8 @@ TEST_CASE("Out-of-order release advances the ack only across the contiguous pref
 
     // One Credit message carried both releases: that ratio is the coalescing
     // measurement 2.5 asks for, not a log line.
-    CHECK(slice.subscriber.counters().credit_messages_sent <=
-          slice.subscriber.counters().credits_returned);
+    CHECK(slice.subscription->counters().credit_messages_sent <=
+          slice.subscription->counters().credits_returned);
 }
 
 TEST_CASE("With every view retained, publish reports CreditStalled and never blocks",
@@ -238,7 +187,7 @@ TEST_CASE("With every view retained, publish reports CreditStalled and never blo
 
     for(std::uint32_t n = 0; n < k_ring_depth; ++n)
     {
-        BulkSource::Lease lease = slice.publisher.source().try_acquire();
+        BulkPublisher::SlotHandle lease = slice.publisher.try_acquire();
         REQUIRE(lease);
         fill(lease, bytes, n);
 
@@ -265,7 +214,35 @@ TEST_CASE("With every view retained, publish reports CreditStalled and never blo
     // No slot was reused: every accepted frame still holds its own, and every
     // stalled frame gave its slot straight back.
     CHECK(counters.leases_retained == accepted);
-    CHECK(slice.publisher.source().retained() == accepted);
+    CHECK(slice.publisher.counters().leases_retained == accepted);
+}
+
+TEST_CASE("A slot handle outlives the publisher that issued it", "[m2][slice]")
+{
+    BulkPublisher::SlotHandle handle;
+
+    {
+        BulkPublisher publisher(publisher_config());
+        handle = publisher.try_acquire();
+        REQUIRE(handle);
+
+        fill(handle, k_frame_bytes, 5);
+        CHECK(publisher.counters().leases_retained == 1);
+    }
+
+    REQUIRE(handle);
+    CHECK(handle.capacity() >= k_frame_bytes);
+
+    const auto *bytes = static_cast<const unsigned char *>(handle.data());
+    bool intact = true;
+    for(std::uint64_t i = 0; i < k_frame_bytes && intact; ++i)
+    {
+        intact = bytes[i] == static_cast<unsigned char>((5u * 31u + static_cast<unsigned>(i)) & 0xFFu);
+    }
+    CHECK(intact);
+
+    handle.reset();
+    CHECK_FALSE(handle);
 }
 
 TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", "[m2][slice]")
@@ -286,10 +263,10 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
     Slice slice(pub, sub);
 
     // Fill the leases first, so the publish burst is nothing but publish calls.
-    std::vector<BulkSource::Lease> leases;
+    std::vector<BulkPublisher::SlotHandle> leases;
     for(std::uint32_t n = 0; n < 64; ++n)
     {
-        BulkSource::Lease lease = slice.publisher.source().try_acquire();
+        BulkPublisher::SlotHandle lease = slice.publisher.try_acquire();
         REQUIRE(lease);
         fill(lease, k_frame_bytes, n);
         leases.push_back(std::move(lease));
@@ -300,7 +277,6 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
     for(std::size_t n = 0; n < leases.size(); ++n)
     {
         const void *before = leases[n].data();
-        const std::size_t index_before = leases[n].index();
 
         const PublishResult result =
             slice.publisher.publish(std::move(leases[n]), meta_for(k_frame_bytes, n));
@@ -317,7 +293,6 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
         // the same slot, still the bytes it was filled with.
         REQUIRE(leases[n]);
         CHECK(leases[n].data() == before);
-        CHECK(leases[n].index() == index_before);
         CHECK(leases[n].capacity() == k_frame_bytes);
 
         // And usable: a retry once the engine has drained must be accepted.
@@ -333,6 +308,227 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
 
     REQUIRE(saw_queue_full);
     CHECK(slice.publisher.counters().dropped_queue_full >= 1);
+}
+
+TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
+          "[m2][slice]")
+{
+    BulkPublisher publisher(publisher_config());
+    std::unique_ptr<Subscription> subscription = open_subscription(publisher);
+
+    REQUIRE(subscription->fd() >= 0);
+
+    REQUIRE(subscription->try_read() == std::nullopt);
+    {
+        pollfd pfd{};
+        pfd.fd = subscription->fd();
+        pfd.events = POLLIN;
+        CHECK(::poll(&pfd, 1, 40) == 0);
+    }
+
+    REQUIRE(subscription->try_read() == std::nullopt);
+
+    std::thread producer([&] {
+        std::this_thread::sleep_for(60ms);
+        auto lease = publisher.try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, 9);
+        REQUIRE(publisher.publish(std::move(lease), meta_for(k_frame_bytes, 9)) ==
+                PublishResult::Accepted);
+    });
+
+    pollfd pfd{};
+    pfd.fd = subscription->fd();
+    pfd.events = POLLIN;
+
+    const auto started = std::chrono::steady_clock::now();
+    const int ready = ::poll(&pfd, 1, 5000);
+    const auto waited = std::chrono::steady_clock::now() - started;
+    producer.join();
+
+    REQUIRE(ready == 1);
+    CHECK((pfd.revents & POLLIN) != 0);
+    CHECK(waited < 3s);
+
+    const std::optional<FrameView> got = subscription->read_for(100ms);
+    REQUIRE(got);
+    CHECK(payload_matches(*got, 9));
+}
+
+TEST_CASE("A drained Pull descriptor is not signalled until another frame arrives",
+          "[m2][slice]")
+{
+    BulkPublisher publisher(publisher_config());
+    std::unique_ptr<Subscription> subscription = open_subscription(publisher);
+
+    for(int i = 0; i < 4; ++i)
+    {
+        auto lease = publisher.try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, static_cast<unsigned>(i));
+        REQUIRE(publisher.publish(std::move(lease),
+                                  meta_for(k_frame_bytes, static_cast<std::uint64_t>(i))) ==
+                PublishResult::Accepted);
+    }
+
+    REQUIRE(eventually([&] { return subscription->counters().frames_received >= 4; }));
+
+    pollfd pfd{};
+    pfd.fd = subscription->fd();
+    pfd.events = POLLIN;
+    CHECK(::poll(&pfd, 1, 60) == 0);
+
+    for(int i = 0; i < 4; ++i)
+    {
+        const std::optional<FrameView> frame = subscription->read_for(20ms);
+        REQUIRE(frame);
+    }
+
+    CHECK(subscription->try_read() == std::nullopt);
+    CHECK(::poll(&pfd, 1, 60) == 0);
+}
+
+TEST_CASE("Pull reads one frame at a time and withholds only retained credit",
+          "[m2][slice]")
+{
+    BulkPublisher publisher(publisher_config());
+    std::unique_ptr<Subscription> subscription = open_subscription(publisher);
+
+    constexpr int k_published = 4;
+    for(int i = 0; i < k_published; ++i)
+    {
+        auto lease = publisher.try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, static_cast<unsigned>(i));
+        REQUIRE(publisher.publish(std::move(lease),
+                                  meta_for(k_frame_bytes, static_cast<std::uint64_t>(i))) ==
+                PublishResult::Accepted);
+    }
+
+    REQUIRE(eventually(
+        [&] { return subscription->counters().frames_received >= k_published; }));
+
+    for(int i = 0; i < k_published; ++i)
+    {
+        const std::optional<FrameView> frame = subscription->read_for(50ms);
+        REQUIRE(frame);
+        CHECK(subscription->counters().frames_delivered == static_cast<std::uint64_t>(i) + 1);
+    }
+
+    CHECK(subscription->try_read() == std::nullopt);
+
+    for(int i = 0; i < k_published; ++i)
+    {
+        auto lease = publisher.try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, static_cast<unsigned>(i));
+        REQUIRE(publisher.publish(std::move(lease),
+                                  meta_for(k_frame_bytes,
+                                           static_cast<std::uint64_t>(k_published + i))) ==
+                PublishResult::Accepted);
+    }
+
+    REQUIRE(eventually([&] {
+        return subscription->counters().frames_received >= 2 * k_published;
+    }));
+
+    for(int i = 0; i < k_published; ++i)
+    {
+        REQUIRE(subscription->read_for(50ms));
+    }
+}
+
+TEST_CASE("A publisher refuses to send an array it did not declare", "[m2][slice]")
+{
+    PublisherConfig config = publisher_config();
+    config.frame_metadata.element_type = ElementType::UInt8;
+    config.frame_metadata.element_size = 1;
+    config.frame_metadata.rank = 1;
+    config.frame_metadata.shape[0] = k_frame_bytes;
+
+    BulkPublisher publisher(config);
+    std::unique_ptr<Subscription> subscription = open_subscription(publisher);
+
+    {
+        auto lease = publisher.try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, 1);
+        CHECK(publisher.publish(std::move(lease), meta_for(k_frame_bytes, 1)) ==
+              PublishResult::Accepted);
+    }
+
+    {
+        auto lease = publisher.try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, 2);
+
+        FrameMetadata undeclared;
+        undeclared.element_type = ElementType::UInt16;
+        undeclared.element_size = 2;
+        undeclared.rank = 1;
+        undeclared.shape[0] = k_frame_bytes / 2;
+
+        CHECK(publisher.publish(std::move(lease), undeclared) == PublishResult::BadMetadata);
+    }
+
+    CHECK(publisher.counters().dropped_bad_metadata == 1);
+
+    CHECK(subscription->state() == SubscriberState::Active);
+    CHECK(publisher.session_count() == 1);
+}
+
+TEST_CASE("A frame that contradicts the granted geometry retires the session",
+          "[m2][slice]")
+{
+    PublisherConfig config = publisher_config();
+    config.frame_metadata.element_type = ElementType::UInt8;
+    config.frame_metadata.element_size = 1;
+    config.frame_metadata.rank = 1;
+    config.frame_metadata.shape[0] = k_frame_bytes;
+
+    BulkPublisher publisher(config);
+    SubscriberConfig subscriber = subscriber_config();
+    subscriber.reconnect_policy = ReconnectPolicy::FailFast;
+    std::unique_ptr<Subscription> subscription = open_subscription(
+        publisher,
+        subscriber,
+        {},
+        [](Protocol::CoordType type, std::vector<std::byte> &encoded)
+        {
+            if(type != Protocol::CoordType::Open)
+                return;
+
+            Protocol::Envelope envelope;
+            Protocol::OpenReply reply;
+            REQUIRE(Protocol::decode(encoded.data(), encoded.size(), reply, &envelope) == Status::Ok);
+            reply.geometry.element_type = ElementType::UInt16;
+            reply.geometry.element_size = 2;
+            reply.geometry.rank = 1;
+            reply.geometry.shape = {k_frame_bytes / 2, 0, 0, 0};
+            reply.geometry.strides = {2, 0, 0, 0};
+            REQUIRE(reply.geometry.validate() == Status::Ok);
+            encoded = Protocol::encode(reply, envelope.correlation_id);
+        });
+
+    CHECK(subscription->geometry().element_type == ElementType::UInt16);
+
+    {
+        auto lease = publisher.try_acquire();
+        REQUIRE(lease);
+        fill(lease, k_frame_bytes, 3);
+        REQUIRE(publisher.publish(std::move(lease), meta_for(k_frame_bytes, 3)) ==
+                PublishResult::Accepted);
+    }
+
+    REQUIRE(eventually([&] { return subscription->state() == SubscriberState::Failed; }));
+
+    CHECK(subscription->counters().frames_dropped_geometry_mismatch == 1);
+    CHECK(subscription->counters().frames_dropped_bad_header == 0);
+    CHECK(subscription->counters().frames_delivered == 0);
+
+    const BulkError why = subscription->snapshot().error;
+    CHECK(why.status == Status::GeometryMismatch);
+    CHECK(why.message.find("different array") != std::string::npos);
 }
 
 TEST_CASE("Views outlive the subscriber that delivered them", "[m2][slice]")
@@ -353,7 +549,7 @@ TEST_CASE("Views outlive the subscriber that delivered them", "[m2][slice]")
             REQUIRE(slice.publish(bytes, n) == PublishResult::Accepted);
         }
 
-        held = collect(slice.subscriber, 2);
+        held = collect(*slice.subscription, 2);
         REQUIRE(held.size() == 2);
     }
 

@@ -8,6 +8,7 @@
 #include <tango-bulk/counters.h>
 #include <tango-bulk/errors.h>
 #include <tango-bulk/frame.h>
+#include <tango-bulk/geometry.h>
 #include <tango-bulk/limits.h>
 
 #include <cstddef>
@@ -18,9 +19,6 @@
 
 namespace TangoBulk
 {
-
-// DropPolicy is declared in <tango-bulk/frame.h>, which this header includes.
-// See the note there for why it does not live here.
 
 /// How a publisher treats an armed subscriber that has exhausted its credit.
 enum class FanoutMode : std::uint32_t
@@ -34,7 +32,7 @@ const char *to_string(FanoutMode mode) noexcept;
 struct PublisherConfig
 {
     std::string stream_name; ///< 1..64 bytes, [A-Za-z0-9_.-]
-    /// Initial stream layout advertised by Open and Query.  Leave Unknown/rank
+    /// Initial stream layout advertised by Open and StreamOffer discovery. Leave Unknown/rank
     /// zero for an opaque byte stream; array publishers should declare their
     /// real type and shape before accepting clients.
     FrameMetadata frame_metadata{};
@@ -54,7 +52,6 @@ struct PublisherConfig
     /// See docs/EXTRACTION.md.
     std::uint32_t max_renewals_per_ttl{10};
     std::uint64_t pinned_memory_limit_bytes{1ull << 30};
-    DropPolicy drop_policy{DropPolicy::DropNewest};
     std::string ucx_tls;           ///< empty => let UCX choose; tests pin
     int engine_cpu_affinity{-1};   ///< -1 => unpinned
     bool pad_slot_stride{true};    ///< see IMPLEMENTATION_SPEC.md 6.2
@@ -62,57 +59,11 @@ struct PublisherConfig
     Status validate() const noexcept;
 };
 
-/// Registered producer ring.
-///
-/// One ucp_mem_map registration covers the whole ring and slots are offsets
-/// into it, so the memory-region count is 1 regardless of depth.
-class BulkSource
+namespace detail
 {
-  public:
-    /// Move-only handle to one producer slot.  Publishing consumes the lease.
-    class Lease
-    {
-      public:
-        Lease() noexcept;
-        Lease(Lease &&) noexcept;
-        Lease &operator=(Lease &&) noexcept;
-        Lease(const Lease &) = delete;
-        Lease &operator=(const Lease &) = delete;
-        ~Lease(); ///< an un-published lease returns the slot
-
-        explicit operator bool() const noexcept;
-        void *data() const noexcept;
-        std::size_t capacity() const noexcept;
-        std::size_t index() const noexcept;
-        MemoryKind memory_kind() const noexcept;
-        void reset() noexcept;
-
-      private:
-        friend class BulkSource;
-        friend class BulkPublisher;
-        struct Impl;
-        std::unique_ptr<Impl> impl_;
-    };
-
-    /// Non-blocking by design: an acquisition thread MUST be able to drop
-    /// rather than wait while slots are retained by a slow or dead consumer.
-    Lease try_acquire() noexcept;
-
-    std::size_t slot_count() const noexcept;
-    std::size_t slot_bytes() const noexcept;  ///< usable payload capacity per slot
-    std::size_t slot_stride() const noexcept; ///< >= slot_bytes; see 6.2
-    std::size_t retained() const noexcept;    ///< slots currently uncredited
-
-    ~BulkSource();
-    BulkSource(const BulkSource &) = delete;
-    BulkSource &operator=(const BulkSource &) = delete;
-
-  private:
-    friend class BulkPublisher;
-    BulkSource();
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
+class ProducerSlots;
+class PublisherAccess;
+} // namespace detail
 
 enum class PublishResult : std::uint32_t
 {
@@ -127,6 +78,42 @@ enum class PublishResult : std::uint32_t
 
 const char *to_string(PublishResult result) noexcept;
 
+/// A copied owner observation of one publisher.
+///
+/// The geometry and counters are sampled together as one diagnostic value;
+/// `sampled_at_steady_ns` makes its age observable.  It is never authority for
+/// admission or session reclamation, and a StreamOffer made from it remains an
+/// upper bound until OpenReply supplies the actual grant.
+struct PublisherSnapshot
+{
+    struct SessionObservation
+    {
+        std::string session_id;
+        std::string state;
+        std::uint64_t lag_frames{0};
+    };
+
+    std::string stream_name;
+    Geometry geometry{};
+    PublisherCounters counters{};
+    /// Live sessions; Tango renders each as session_id|state|lag_frames.
+    std::vector<SessionObservation> sessions;
+    std::size_t active_sessions{0};
+    std::string transport; ///< selected data transport, not a discovery result
+    std::uint64_t worst_lag_frames{0}; ///< maximum live-session lag in frames
+    std::uint64_t sampled_at_steady_ns{0};
+    bool accepting{false};
+
+    /// Sum the publisher-side drop reasons from this one sampled counter set.
+    std::uint64_t frames_dropped() const noexcept
+    {
+        return counters.dropped_no_session + counters.dropped_queue_full +
+               counters.dropped_credit_stalled + counters.dropped_bad_metadata;
+    }
+
+    StreamOffer stream_offer() const;
+};
+
 class BulkPublisher
 {
   public:
@@ -137,32 +124,43 @@ class BulkPublisher
     BulkPublisher(const BulkPublisher &) = delete;
     BulkPublisher &operator=(const BulkPublisher &) = delete;
 
-    BulkSource &source() noexcept;
+    class SlotHandle
+    {
+      public:
+        SlotHandle() noexcept;
+        SlotHandle(SlotHandle &&) noexcept;
+        SlotHandle &operator=(SlotHandle &&) noexcept;
+        SlotHandle(const SlotHandle &) = delete;
+        SlotHandle &operator=(const SlotHandle &) = delete;
+        ~SlotHandle(); ///< an unpublished handle returns the slot
 
-    /// Consumes the lease on Accepted; leaves it engaged in the caller's hands
+        explicit operator bool() const noexcept;
+        void *data() const noexcept;
+        std::size_t capacity() const noexcept;
+        void reset() noexcept;
+
+      private:
+        friend class BulkPublisher;
+
+        std::shared_ptr<detail::ProducerSlots> slots_;
+        std::byte *data_{nullptr};
+        std::size_t capacity_{0};
+        std::uint32_t index_{0};
+    };
+
+    SlotHandle try_acquire() noexcept;
+
     /// on QueueFull and WouldBlock.  Never blocks, never throws, never allocates.
-    PublishResult publish(BulkSource::Lease &&lease, const FrameMetadata &meta) noexcept;
-
-    /// Re-declare geometry.  Opens a new epoch; see IMPLEMENTATION_SPEC.md 4.3
-    /// for the two-phase interlock.  On failure the stream keeps running on the
-    /// old epoch -- a failed re-declaration is never a silent clamp.
-    Status declare_geometry(const FrameMetadata &prototype,
-                            std::uint64_t max_frame_bytes,
-                            std::uint32_t ring_depth);
+    PublishResult publish(SlotHandle &&handle, const FrameMetadata &meta) noexcept;
 
     std::uint32_t generation() const noexcept;
     std::size_t session_count() const noexcept;
     PublisherCounters counters() const noexcept;
-
-    /// Coordination entry point: encoded bytes in, encoded bytes out.
-    ///
-    /// This is the seam that keeps Tango out of the core.  The Tango adapter is
-    /// a thin DevVarCharArray wrapper over it, and the unit tests drive the
-    /// entire session lifecycle through it with no Tango process at all.
-    std::vector<std::byte> handle_coordination(const std::byte *data,
-                                               std::size_t size) noexcept;
+    PublisherSnapshot snapshot() const;
 
   private:
+    friend class detail::PublisherAccess;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

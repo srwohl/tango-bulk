@@ -139,26 +139,6 @@ CloseReply canonical_close_reply()
     return msg;
 }
 
-QueryRequest canonical_query()
-{
-    QueryRequest msg;
-    msg.session_id.bytes = canonical_id(0x20);
-    msg.query_flags = 1;
-    return msg;
-}
-
-QueryReply canonical_query_reply()
-{
-    QueryReply msg;
-    msg.session_id.bytes = canonical_id(0x20);
-    msg.status = Status::Ok;
-    msg.active_sessions = 1;
-    msg.generation = 3;
-    msg.geometry = canonical_geometry();
-    msg.counters = "frames=1000;";
-    return msg;
-}
-
 ErrorMessage canonical_error()
 {
     return ErrorMessage{Status::TooManySessions, "session limit reached"};
@@ -185,15 +165,6 @@ FrameHeader canonical_frame()
     return msg;
 }
 
-GeometryMessage canonical_geometry_message()
-{
-    GeometryMessage msg;
-    msg.generation = 3;
-    msg.stream_id = 0x0123'4567'89AB'CDEFull;
-    msg.first_sequence = 4096;
-    msg.geometry = canonical_geometry();
-    return msg;
-}
 
 /// Correlation id shared by every coordination vector, so the envelope bytes are
 /// comparable across them.
@@ -232,8 +203,6 @@ TEST_CASE("golden vectors, coordination plane", "[protocol][golden]")
     CHECK_GOLDEN(k_renew_reply, encode(canonical_renew_reply(), k_correlation));
     CHECK_GOLDEN(k_close, encode(canonical_close(), k_correlation));
     CHECK_GOLDEN(k_close_reply, encode(canonical_close_reply(), k_correlation));
-    CHECK_GOLDEN(k_query, encode(canonical_query(), k_correlation));
-    CHECK_GOLDEN(k_query_reply, encode(canonical_query_reply(), k_correlation));
     CHECK_GOLDEN(k_error, encode(canonical_error(), k_correlation));
 }
 
@@ -245,9 +214,6 @@ TEST_CASE("golden vectors, data plane", "[protocol][golden]")
                                               0x0BAD'C0DE'DEAD'BEEFull}));
     CHECK_GOLDEN(k_probe_ack, encode(ProbeAckMessage{3, 0x0123'4567'89AB'CDEFull,
                                                      0x0BAD'C0DE'DEAD'BEEFull}));
-    CHECK_GOLDEN(k_geometry, encode(canonical_geometry_message()));
-    CHECK_GOLDEN(k_geometry_ack,
-                 encode(GeometryAckMessage{3, 0x0123'4567'89AB'CDEFull, 4096}));
 }
 
 TEST_CASE("every golden vector decodes to the values it was built from",

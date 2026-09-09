@@ -172,10 +172,11 @@ attribute, so the dataset path is normally unnecessary. It treats a rank-three d
     "tango://localhost:10002/bulk/hdf5/1#dbase=no" image 0
 ```
 
-Both example clients call `BulkQuery` before opening the stream and size their receive slots from
-the publisher geometry. The CUDA client does this before allocating its GPU receive ring. This is
-required for this detector shape: a `2208 x 3216 x uint16` frame is 14,201,856 bytes, larger than
-the subscriber API's general-purpose 8 MiB default.
+Both example clients use the publisher's `BulkStreams` discovery offer before opening the stream
+and use the authoritative `Subscription::geometry()` and `Subscription::plan()` after Open. The
+CUDA client does this before allocating its GPU receive ring. This is required for this detector
+shape: a `2208 x 3216 x uint16` frame is 14,201,856 bytes, larger than the subscriber API's
+general-purpose 8 MiB default.
 
 One loader thread reads HDF5 frames directly into registered publisher slots, so the replay path
 does not copy frames through an intermediate application cache. Prepared slots are kept in a
@@ -289,14 +290,7 @@ the database, and the coordination plane is three ordinary commands.
 
 ## Watching a running publisher
 
-`BulkQuery` is a read-only command any Tango client can call, and `TangoBulk::bulk_query()` is the
-typed wrapper:
-
-```cpp
-Tango::DeviceProxy proxy("bulk/example/1");
-const TangoBulk::BulkQueryResult status = TangoBulk::bulk_query(proxy);
-std::cout << status.active_sessions << " session(s): " << status.counters << "\n";
-```
-
-The `counters` blob carries no UCX address, no memory key, and no untruncated session identifier —
-§3.8 forbids all three, and the UCX tests assert it.
+The read-only `BulkStreams` spectrum exposes conservative stream offers for clients. Operator
+state belongs in the publisher's existing snapshot/observation surface; it is not part of session
+establishment. A client must use the established `Subscription` geometry and plan for allocation
+and frame validation.

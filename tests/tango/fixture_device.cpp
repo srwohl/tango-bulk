@@ -51,6 +51,8 @@ unsigned char pattern_byte(unsigned seed, std::uint64_t i)
     return static_cast<unsigned char>((seed * 31u + static_cast<unsigned>(i)) & 0xFFu);
 }
 
+class BulkTestDevice;
+
 class BulkTestDevice : public TANGO_BASE_CLASS
 {
   public:
@@ -73,6 +75,12 @@ class BulkTestDevice : public TANGO_BASE_CLASS
         config.ring_depth = k_ring_depth;
         config.credit_window = k_credit_window;
         config.publish_queue_depth = 8;
+
+        config.frame_metadata.element_type = ElementType::UInt8;
+        config.frame_metadata.element_size = 1;
+        config.frame_metadata.rank = 1;
+        config.frame_metadata.shape[0] = k_frame_bytes;
+
         config.lease_ttl_ms = k_lease_ttl_ms;
         config.renew_interval_ms = k_renew_interval_ms;
 
@@ -90,8 +98,8 @@ class BulkTestDevice : public TANGO_BASE_CLASS
     {
         // 7.2, line three of three.  Detaching before the publisher is destroyed
         // is not tidiness: detach_publisher() returns only once no command is
-        // still inside handle_coordination(), which is what makes the next
-        // statement safe.
+        // still inside the encoded coordination adapter, which is what makes
+        // the next statement safe.
         if(attached_)
         {
             detach_publisher(*this);
@@ -107,7 +115,7 @@ class BulkTestDevice : public TANGO_BASE_CLASS
 
         for(Tango::DevLong i = 0; i < count; ++i)
         {
-            BulkSource::Lease lease = publisher_->source().try_acquire();
+            BulkPublisher::SlotHandle lease = publisher_->try_acquire();
             if(!lease)
             {
                 break;
@@ -232,6 +240,11 @@ class BulkTestClass : public Tango::DeviceClass
         // precisely so a collision would be found here rather than by whichever
         // one cppTango happened to look up first.
         install_bulk_commands(*this);
+    }
+
+    void attribute_factory(std::vector<Tango::Attr *> &attributes) override
+    {
+        install_bulk_attributes(attributes);
     }
 
     void device_factory(const Tango::DevVarStringArray *devices) override

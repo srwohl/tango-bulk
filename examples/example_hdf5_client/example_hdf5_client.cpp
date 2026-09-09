@@ -194,7 +194,7 @@ struct Geometry
     std::uint64_t slot_bytes{0};
 };
 
-Geometry geometry_from_publisher(const TangoBulk::BulkQueryResult &publisher)
+Geometry geometry_from_publisher(const TangoBulk::Geometry &publisher)
 {
     if(publisher.rank == 0 || publisher.rank > TangoBulk::k_max_rank ||
        publisher.element_size == 0 || publisher.element_type == ElementType::Unknown)
@@ -1299,17 +1299,17 @@ void prepare_outputs(const Options &options)
     }
 }
 
-void validate_frame(const FrameView &frame, const TangoBulk::BulkQueryResult &publisher,
+void validate_frame(const FrameView &frame, const TangoBulk::Geometry &publisher,
                     const Geometry &geometry, std::optional<Endian> &endian)
 {
     if(frame.memory_kind() != MemoryKind::Host || frame.element_type() != geometry.element_type ||
        frame.element_size() != geometry.element_size || frame.rank() != publisher.rank ||
        frame.size() != geometry.frame_bytes)
-        throw std::runtime_error("stream geometry changed or does not match BulkQuery");
+        throw std::runtime_error("stream geometry changed or does not match the subscription");
     for(std::size_t i = 0; i < publisher.rank; ++i)
     {
         if(frame.shape()[i] != publisher.shape[i] || frame.strides()[i] != publisher.strides[i])
-            throw std::runtime_error("stream geometry changed after BulkQuery");
+            throw std::runtime_error("stream geometry changed after subscription");
     }
     if(endian && *endian != frame.endian())
         throw std::runtime_error("stream byte order changed during acquisition");
@@ -1354,37 +1354,18 @@ int main(int argc, char *argv[])
     {
         prepare_outputs(options);
         Tango::DeviceProxy proxy(options.device);
-        const TangoBulk::BulkQueryResult publisher = TangoBulk::bulk_query(proxy);
-        if(publisher.status != TangoBulk::Status::Ok)
-            throw TangoBulk::BulkException(
-                {publisher.status, "publisher is not ready", "BulkQuery"});
-        const Geometry geometry = geometry_from_publisher(publisher);
-
-        const std::uint64_t block_bytes = geometry.frame_bytes * options.frames_per_block;
-        if(geometry.frame_bytes != 0 &&
-           block_bytes / geometry.frame_bytes != options.frames_per_block)
-            throw std::runtime_error("block byte size overflows");
-        if(publisher.max_frame_bytes % geometry.element_size != 0)
-            throw std::runtime_error("publisher slot size is not an exact number of elements");
-
         TangoBulk::SubscriberConfig config;
         config.stream_name = options.stream;
-        config.max_frame_bytes = publisher.max_frame_bytes;
-        config.delivery_mode = TangoBulk::DeliveryMode::Manual;
+        // Discovery supplies the safe upper bound inside subscribe(). The
+        // caller-owned ring is sized from this conservative library limit;
+        // OpenReply and Subscription::plan() remain authoritative.
+        config.max_frame_bytes = 8ull << 20;
+        config.delivery_mode = TangoBulk::DeliveryMode::Pull;
         config.drop_policy = TangoBulk::DropPolicy::DropNewest;
         config.reconnect_policy = TangoBulk::ReconnectPolicy::BoundedRetry;
-        const std::uint64_t slots_in_budget =
-            config.pinned_memory_limit_bytes / config.max_frame_bytes;
-        const std::uint64_t available_slots =
-            std::min<std::uint64_t>(publisher.ring_depth, slots_in_budget);
-        if(options.ring_depth > available_slots)
-            throw std::runtime_error(
-                "requested receive ring exceeds publisher or pinned-memory limit");
         config.ring_depth = static_cast<std::uint32_t>(options.ring_depth);
-        config.credit_window = std::min(publisher.credit_window, config.ring_depth);
+        config.credit_window = std::min<std::uint32_t>(16, config.ring_depth);
         config.delivery_queue_depth = config.ring_depth;
-        if(options.frames_per_block > config.credit_window)
-            throw std::runtime_error("--frames-per-block exceeds the available credit window");
         if(config.max_frame_bytes > std::numeric_limits<std::uint64_t>::max() / config.ring_depth)
             throw std::runtime_error("receive-ring byte size overflows");
         const std::uint64_t receive_bytes = config.max_frame_bytes * config.ring_depth;
@@ -1392,6 +1373,19 @@ int main(int argc, char *argv[])
         config.receive_buffer = receive_ring.memory();
         config.receive_buffer_bytes = receive_bytes;
         config.receive_memory_kind = MemoryKind::Host;
+
+        auto subscription = TangoBulk::subscribe(proxy, config, {});
+        const TangoBulk::Geometry publisher = subscription->geometry();
+        const Geometry geometry = geometry_from_publisher(publisher);
+        const TangoBulk::ReceivePlan plan = subscription->plan();
+        const std::uint64_t block_bytes = geometry.frame_bytes * options.frames_per_block;
+        if(geometry.frame_bytes != 0 &&
+           block_bytes / geometry.frame_bytes != options.frames_per_block)
+            throw std::runtime_error("block byte size overflows");
+        if(publisher.max_frame_bytes % geometry.element_size != 0)
+            throw std::runtime_error("publisher slot size is not an exact number of elements");
+        if(options.ring_depth > plan.ring_depth || options.frames_per_block > plan.credit_window)
+            throw std::runtime_error("requested receive ring exceeds the established plan");
 
         std::cout << "publisher geometry: type=" << TangoBulk::to_string(geometry.element_type)
                   << " rank=" << publisher.rank << " shape=";
@@ -1403,42 +1397,28 @@ int main(int argc, char *argv[])
 
         ParallelShardWriter writer(options, geometry, receive_ring.fd(), receive_ring.data(),
                                    receive_ring.bytes());
-        TangoBulk::BulkSubscriber subscriber(proxy, config);
         std::uint64_t received = 0;
         std::uint64_t submitted_blocks = 0;
         std::optional<Endian> stream_endian;
         std::vector<FrameView> block;
         block.reserve(options.frames_per_block);
-
-        subscriber.set_frame_callback([&](FrameView frame) {
-            if(received >= options.frames)
-                return;
-            validate_frame(frame, publisher, geometry, stream_endian);
-            block.push_back(std::move(frame));
-            ++received;
-            if(block.size() == options.frames_per_block)
-            {
-                writer.submit(submitted_blocks++, std::move(block), *stream_endian);
-                block.clear();
-                block.reserve(options.frames_per_block);
-            }
-        });
-        subscriber.set_state_callback(
-            [](TangoBulk::SubscriberState state, const TangoBulk::BulkError &error) {
-                std::cout << "state: " << TangoBulk::to_string(state);
-                if(error.status != TangoBulk::Status::Ok)
-                    std::cout << " (" << TangoBulk::to_string(error.status) << ": " << error.message
-                              << ")";
-                std::cout << std::endl;
-            });
-
-        subscriber.start();
         const auto acquisition_started = std::chrono::steady_clock::now();
         auto progress_at = acquisition_started;
         std::uint64_t progress_bytes = 0;
         while(running.load() && received < options.frames)
         {
-            subscriber.poll(std::chrono::milliseconds{50});
+            if(auto frame = subscription->read_for(std::chrono::milliseconds{50}))
+            {
+                validate_frame(*frame, publisher, geometry, stream_endian);
+                block.push_back(std::move(*frame));
+                ++received;
+                if(block.size() == options.frames_per_block)
+                {
+                    writer.submit(submitted_blocks++, std::move(block), *stream_endian);
+                    block.clear();
+                    block.reserve(options.frames_per_block);
+                }
+            }
             const auto now = std::chrono::steady_clock::now();
             const double interval_seconds =
                 std::chrono::duration<double>(now - progress_at).count();
@@ -1463,7 +1443,7 @@ int main(int argc, char *argv[])
                 progress_bytes = completed_bytes;
             }
         }
-        subscriber.stop();
+        subscription.reset();
         writer.close();
 
         if(received != options.frames)

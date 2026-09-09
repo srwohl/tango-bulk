@@ -199,52 +199,6 @@ TEST_CASE("Close and CloseReply round trip", "[protocol][roundtrip]")
     CHECK(got_reply.frames_credited_final == reply.frames_credited_final);
 }
 
-TEST_CASE("Query and QueryReply round trip", "[protocol][roundtrip]")
-{
-    QueryRequest query;
-    query.query_flags = 0xFFFF'FFFFu;
-
-    // An all-zero session_id requests server-wide status.
-    CHECK(query.session_id.is_zero());
-
-    const auto query_bytes = encode(query, 2);
-
-    QueryRequest got_query;
-    REQUIRE(decode(query_bytes.data(), query_bytes.size(), got_query) == Status::Ok);
-    CHECK(got_query.session_id.is_zero());
-    CHECK(got_query.query_flags == query.query_flags);
-
-    QueryReply reply;
-    reply.session_id.bytes = pattern_id16(0xAA);
-    reply.status = Status::Ok;
-    reply.active_sessions = 4;
-    reply.generation = 12;
-    reply.geometry = filled_geometry();
-    reply.counters = "frames_published=1000;frames_credited=996;credits_returned=996;";
-
-    const auto reply_bytes = encode(reply, 2);
-
-    QueryReply got_reply;
-    REQUIRE(decode(reply_bytes.data(), reply_bytes.size(), got_reply) == Status::Ok);
-    CHECK(got_reply.session_id == reply.session_id);
-    CHECK(got_reply.active_sessions == reply.active_sessions);
-    CHECK(got_reply.generation == reply.generation);
-    CHECK(got_reply.geometry == reply.geometry);
-    CHECK(got_reply.counters == reply.counters);
-}
-
-TEST_CASE("an empty counter blob round trips", "[protocol][roundtrip]")
-{
-    QueryReply reply;
-    reply.geometry = filled_geometry();
-
-    const auto bytes = encode(reply, 0);
-
-    QueryReply got;
-    REQUIRE(decode(bytes.data(), bytes.size(), got) == Status::Ok);
-    CHECK(got.counters.empty());
-}
-
 TEST_CASE("Error round trip", "[protocol][roundtrip]")
 {
     const ErrorMessage sent{Status::ResourceExhausted,
@@ -411,54 +365,6 @@ TEST_CASE("Probe and ProbeAck round trip and do not alias", "[protocol][roundtri
     CHECK(got_ack.probe_token == probe.probe_token);
 }
 
-TEST_CASE("Geometry and GeometryAck round trip", "[protocol][roundtrip]")
-{
-    GeometryMessage sent;
-    sent.generation = 12;
-    sent.stream_id = 77;
-    sent.first_sequence = 100'000;
-    sent.geometry = filled_geometry();
-
-    const auto bytes = encode(sent);
-
-    GeometryMessage got;
-    REQUIRE(decode(bytes.data(), bytes.size(), got) == Status::Ok);
-
-    CHECK(got.generation == sent.generation);
-    CHECK(got.stream_id == sent.stream_id);
-    CHECK(got.first_sequence == sent.first_sequence);
-    CHECK(got.geometry == sent.geometry);
-
-    GeometryAckMessage ack;
-    ack.generation = 12;
-    ack.stream_id = 77;
-    ack.first_sequence = 100'000;
-
-    const auto ack_bytes = encode(ack);
-
-    GeometryAckMessage got_ack;
-    REQUIRE(decode(ack_bytes.data(), ack_bytes.size(), got_ack) == Status::Ok);
-    CHECK(got_ack.generation == ack.generation);
-    CHECK(got_ack.first_sequence == ack.first_sequence);
-}
-
-TEST_CASE("Geometry rejects a prefix and block that disagree", "[protocol][roundtrip]")
-{
-    // Both halves carry the new epoch.  Adopting either value when they disagree
-    // would be guessing which one the sender meant.
-    GeometryMessage sent;
-    sent.generation = 12;
-    sent.stream_id = 77;
-    sent.first_sequence = 0;
-    sent.geometry = filled_geometry();
-    sent.geometry.generation = 11;
-
-    const auto bytes = encode(sent);
-
-    GeometryMessage got;
-    CHECK(decode(bytes.data(), bytes.size(), got) == Status::GeometryMismatch);
-}
-
 TEST_CASE("decode_data_prefix classifies every data message", "[protocol][roundtrip]")
 {
     const auto check = [](const auto &bytes, DataType expected, std::uint32_t generation)
@@ -480,5 +386,4 @@ TEST_CASE("decode_data_prefix classifies every data message", "[protocol][roundt
     check(encode(CreditMessage{5, 1, 0}), DataType::Credit, 5);
     check(encode(ProbeMessage{6, 1, 2}), DataType::Probe, 6);
     check(encode(ProbeAckMessage{7, 1, 2}), DataType::ProbeAck, 7);
-    check(encode(GeometryAckMessage{8, 1, 0}), DataType::GeometryAck, 8);
 }

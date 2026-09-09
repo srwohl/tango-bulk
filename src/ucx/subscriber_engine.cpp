@@ -4,6 +4,7 @@
 
 #include <ucx/subscriber_engine.h>
 
+
 #include <ucx/locality.h>
 
 #include <core/cpu_topology.h>
@@ -90,8 +91,14 @@ ReceiveArena::ReceiveArena(std::shared_ptr<UcxContext> context,
                                           depth,
                                           std::move(receive_buffer),
                                           receive_buffer_bytes,
-                                          memory_kind)
-                         : RegisteredRing(*context_, slot_bytes, depth, false, pinned_limit)),
+                                          memory_kind,
+                                          pinned_limit)
+                         : RegisteredRing(*context_,
+                                          slot_bytes,
+                                          depth,
+                                          false,
+                                          pinned_limit,
+                                          "subscriber")),
     slots_(depth),
     credit_returns_(static_cast<std::size_t>(depth) * 2),
     lease_pool_(std::make_shared<LeasePool>(static_cast<std::size_t>(depth) + 8))
@@ -144,10 +151,11 @@ struct SubscriberEngine::Pending
     void *request{nullptr};
 };
 
-SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
+SubscriberEngine::SubscriberEngine(SubscriberConfig config,
+                                   std::shared_ptr<DeliveryIngress> delivery) :
     config_(std::move(config)),
     tracker_(config_.ring_depth),
-    delivery_(config_.delivery_queue_depth),
+    delivery_(std::move(delivery)),
     pending_(config_.ring_depth)
 {
     const Status status = config_.validate();
@@ -157,12 +165,12 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
             status, std::string("invalid SubscriberConfig: ") + to_string(status), "subscriber"});
     }
 
-    // `delivery_mode` is deliberately not inspected here.  This class delivers
-    // by `poll()` and nothing else; whether a library-owned thread calls it or
-    // the application does is `BulkSubscriber`'s business, one layer up, which
-    // is also the layer that owns the `std::function` 5.2 keeps away from the
-    // engine.  A check here would only be able to refuse a mode this class has
-    // no opinion about.
+    if(!delivery_)
+    {
+        throw BulkException(BulkError{
+            Status::Internal, "a subscriber transport needs a delivery queue", "subscriber"});
+    }
+
 
     context_ = std::make_shared<UcxContext>(config_.ucx_tls);
     worker_ = std::make_unique<UcxWorker>(*context_);
@@ -202,6 +210,8 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config) :
 SubscriberEngine::~SubscriberEngine()
 {
     running_.store(false, std::memory_order_release);
+
+
     if(engine_.joinable())
     {
         engine_.join();
@@ -262,34 +272,28 @@ void SubscriberEngine::register_am_handlers()
 //
 // What is left here is the transport's share of it: the worker address to put
 // in the request, the endpoint to create from the reply, and the state this
-// class publishes to the layer above.  `SessionClient` owns the rest, and owns
-// it in `core/` where it can be tested without a NIC.
+// class publishes to the Subscription layer. Session request ordering and
+// reply validation live in Subscription-owned state, where they can be tested
+// without a NIC.
 
-std::vector<std::byte> SubscriberEngine::make_open_request(std::uint64_t correlation_id) const
+Status SubscriberEngine::activate(Protocol::StreamId stream_id,
+                                  const Protocol::GeometryBlock &granted,
+                                  const std::vector<std::byte> &server_address)
 {
-    return session_.make_open_request(config_, worker_->address(), correlation_id);
-}
-
-Status SubscriberEngine::adopt_open_reply(const std::byte *data, std::size_t size)
-{
-    const Status status = session_.adopt_open_reply(data, size, config_);
-    if(status != Status::Ok)
-    {
-        state_.store(SubscriberState::Failed, std::memory_order_release);
-        return status;
-    }
+    stream_id_ = stream_id;
+    granted_ = granted;
 
     tracker_.reset(0);
 
     // Still the only thread touching this worker: the engine has not started.
     try
     {
-        endpoint_ = worker_->create_endpoint(session_.server_address().data(),
-                                             session_.server_address().size());
+        endpoint_ = worker_->create_endpoint(server_address.data(), server_address.size());
     }
     catch(const BulkException &)
     {
-        state_.store(SubscriberState::Failed, std::memory_order_release);
+        fail(Status::TransportFailure,
+             "could not create a UCX endpoint to the address the publisher returned");
         return Status::TransportFailure;
     }
 
@@ -302,39 +306,6 @@ Status SubscriberEngine::adopt_open_reply(const std::byte *data, std::size_t siz
     engine_ = std::thread([this] { engine_loop(); });
     return Status::Ok;
 }
-
-std::vector<std::byte> SubscriberEngine::make_renew_request(std::uint64_t correlation_id)
-{
-    renewals_sent_.fetch_add(1, std::memory_order_relaxed);
-    return session_.make_renew_request(
-        correlation_id,
-        frames_delivered_.load(std::memory_order_relaxed),
-        arena_ ? arena_->credits_returned() : 0,
-        static_cast<std::uint32_t>(state_.load(std::memory_order_acquire)));
-}
-
-Status SubscriberEngine::adopt_renew_reply(const std::byte *data, std::size_t size)
-{
-    const SessionClient::RenewOutcome outcome = session_.adopt_renew_reply(data, size);
-
-    if(outcome.status != Status::Ok)
-    {
-        renewals_failed_.fetch_add(1, std::memory_order_relaxed);
-    }
-    if(outcome.session_lost)
-    {
-        state_.store(SubscriberState::Failed, std::memory_order_release);
-    }
-
-    return outcome.status;
-}
-
-std::vector<std::byte> SubscriberEngine::make_close_request(std::uint64_t correlation_id) const
-{
-    return session_.make_close_request(correlation_id);
-}
-
-// -- engine thread ----------------------------------------------------------
 
 void SubscriberEngine::engine_loop()
 {
@@ -362,6 +333,10 @@ void SubscriberEngine::engine_loop()
         {
             worked = true;
         }
+
+        // AM callbacks enqueue through DeliveryQueue. That ingress owns both
+        // the bounded insertion and the conditional readiness signal, so this
+        // engine never needs a second notification path.
 
         if(worked)
         {
@@ -509,7 +484,7 @@ bool SubscriberEngine::drain_credit_returns()
         // The slot is free the moment its credit is on its way back.  Clearing
         // the flag here, on the engine thread, is what keeps `occupied` a purely
         // engine-thread quantity despite releases happening anywhere.
-        const std::uint32_t depth = session_.granted_ring_depth();
+        const std::uint32_t depth = granted_.ring_depth;
         if(depth != 0)
         {
             arena_->slot(static_cast<std::size_t>(sequence % depth)).occupied = false;
@@ -536,8 +511,8 @@ bool SubscriberEngine::send_pending_credit()
     }
 
     Protocol::CreditMessage credit;
-    credit.generation = session_.generation();
-    credit.stream_id = session_.stream_id();
+    credit.generation = granted_.generation;
+    credit.stream_id = stream_id_;
     // 3.12: cumulative.  Every sequence at or below this has been released, and
     // 5.5 advances it only across the contiguous prefix -- one message per
     // progress iteration however many views were let go, which is what makes
@@ -592,7 +567,7 @@ ucs_status_t SubscriberEngine::on_probe_am(void *arg,
     Protocol::ProbeMessage probe;
     const auto *bytes = static_cast<const std::byte *>(header);
     if(Protocol::decode(bytes, header_length, probe) != Status::Ok ||
-       probe.stream_id != self->session_.stream_id())
+       probe.stream_id != self->stream_id_)
     {
         self->dropped_bad_header_.fetch_add(1, std::memory_order_relaxed);
         return UCS_OK;
@@ -614,8 +589,8 @@ bool SubscriberEngine::send_pending_probe_ack()
     }
 
     Protocol::ProbeAckMessage ack;
-    ack.generation = session_.generation();
-    ack.stream_id = session_.stream_id();
+    ack.generation = granted_.generation;
+    ack.stream_id = stream_id_;
     ack.probe_token = pending_probe_token_;
 
     const std::array<std::byte, Protocol::k_probe_ack_bytes> bytes = Protocol::encode(ack);
@@ -717,7 +692,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         return UCS_OK;
     }
 
-    if(frame.stream_id != session_.stream_id())
+    if(frame.stream_id != stream_id_)
     {
         // 4.4: a frame for an unknown stream_id is dropped, never treated as a
         // request to create a session.
@@ -728,10 +703,27 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
     // Ahead of the size checks, deviating from 3.11's written order, because the
     // releases below depend on it: a sequence only means something inside its
     // own epoch, since sequences restart at a re-arm.
-    if(frame.generation != session_.generation())
+    if(frame.generation != granted_.generation)
     {
         dropped_stale_epoch_.fetch_add(1, std::memory_order_relaxed);
         return UCS_OK;
+    }
+
+    const Protocol::GeometryBlock &granted = granted_;
+    if(granted.rank != 0)
+    {
+        if(frame.element_type != granted.element_type ||
+           frame.element_size != granted.element_size || frame.rank != granted.rank ||
+           frame.shape != granted.shape || frame.strides != granted.strides)
+        {
+            dropped_geometry_mismatch_.fetch_add(1, std::memory_order_relaxed);
+            tracker_.release(frame.sequence);
+
+            fail(Status::GeometryMismatch,
+                 "a frame described a different array from the one this session "
+                 "granted; the publisher changed a contract term without reopening");
+            return UCS_OK;
+        }
     }
 
     // Past here the sequence is in *this* window, so dropping the frame has to
@@ -746,7 +738,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         return UCS_OK;
     }
 
-    if(frame.payload_bytes > session_.granted_frame_bytes())
+    if(frame.payload_bytes > granted_.max_frame_bytes)
     {
         dropped_oversize_.fetch_add(1, std::memory_order_relaxed);
         tracker_.release(frame.sequence);
@@ -754,7 +746,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
     }
 
     const auto slot_index =
-        static_cast<std::size_t>(frame.sequence % session_.granted_ring_depth());
+        static_cast<std::size_t>(frame.sequence % granted_.ring_depth);
     ReceiveSlot &slot = arena_->slot(slot_index);
 
     if(slot.occupied || frame.sequence < tracker_.released_end())
@@ -815,7 +807,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         {
             slot.occupied = false;
             transport_errors_.fetch_add(1, std::memory_order_relaxed);
-            state_.store(SubscriberState::Failed, std::memory_order_release);
+            fail(Status::TransportFailure, "a rendezvous receive could not be started");
             return UCS_OK;
         }
 
@@ -843,7 +835,9 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         slot.occupied = false;
         tracker_.release(frame.sequence);
         transport_errors_.fetch_add(1, std::memory_order_relaxed);
-        state_.store(SubscriberState::Failed, std::memory_order_release);
+        fail(Status::GeometryMismatch,
+             "the publisher sent an eager frame into a device ring, which it must "
+             "not: the two sides disagree about the memory kind");
         return UCS_OK;
     }
 
@@ -885,7 +879,9 @@ void SubscriberEngine::on_rndv_complete(void *request,
         // usable data path.  Tell the Tango control loop so BoundedRetry can
         // retire this session and reconnect instead of reporting Active while
         // no further frame or credit can move.
-        self->state_.store(SubscriberState::Failed, std::memory_order_release);
+        self->fail(Status::TransportFailure,
+                   "a rendezvous receive failed; the endpoint is no longer a usable "
+                   "data path");
     }
     else
     {
@@ -896,6 +892,28 @@ void SubscriberEngine::on_rndv_complete(void *request,
     {
         ucp_request_free(request);
     }
+}
+
+void SubscriberEngine::fail(Status status, const char *reason) noexcept
+{
+    const char *expected = nullptr;
+    if(failure_reason_.compare_exchange_strong(expected, reason, std::memory_order_acq_rel))
+    {
+        failure_status_.store(status, std::memory_order_release);
+    }
+
+    state_.store(SubscriberState::Failed, std::memory_order_release);
+}
+
+BulkError SubscriberEngine::last_error() const noexcept
+{
+    const char *reason = failure_reason_.load(std::memory_order_acquire);
+    if(reason == nullptr)
+    {
+        return BulkError{};
+    }
+
+    return BulkError{failure_status_.load(std::memory_order_acquire), reason, "transport"};
 }
 
 void SubscriberEngine::commit(std::size_t slot_index) noexcept
@@ -911,76 +929,10 @@ void SubscriberEngine::commit(std::size_t slot_index) noexcept
     arena_->note_view_issued();
     FrameView view = ReceiveSlotLease::make_view(std::move(lease), slot.data, &slot.fields);
 
-    if(delivery_.try_push(std::move(view)))
-    {
-        const std::uint64_t depth = delivery_.size();
-        if(depth > delivery_high_water_.load(std::memory_order_relaxed))
-        {
-            delivery_high_water_.store(depth, std::memory_order_relaxed);
-        }
-        return;
-    }
-
-    // 5.3: apply drop_policy, and never stall UCX progress to do it.
-    if(config_.drop_policy == DropPolicy::DropOldest)
-    {
-        FrameView oldest;
-        if(delivery_.try_pop(oldest))
-        {
-            // Destroying the oldest view releases its slot and returns its
-            // credit, which is what makes room.
-            oldest.reset();
-            if(delivery_.try_push(std::move(view)))
-            {
-                dropped_queue_full_.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-        }
-    }
-
-    // DropNewest, or DropOldest that lost a race for the space it just made:
-    // let `view` go out of scope.  Its destructor releases the slot and returns
-    // the credit immediately, which is exactly what the spec asks for and is
-    // why there is nothing else to do here.
-    dropped_queue_full_.fetch_add(1, std::memory_order_relaxed);
+    delivery_->push(std::move(view));
 }
 
 // -- application thread -----------------------------------------------------
-
-std::size_t SubscriberEngine::poll(std::chrono::milliseconds timeout, const FrameCallback &cb)
-{
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    std::size_t dispatched = 0;
-
-    for(;;)
-    {
-        FrameView view;
-        while(delivery_.try_pop(view))
-        {
-            frames_delivered_.fetch_add(1, std::memory_order_relaxed);
-            ++dispatched;
-
-            // On the CALLING thread, per 2.4.  Whether the credit returns when
-            // this returns is entirely up to the callback: keeping a copy
-            // withholds it, which is the documented backpressure semantic and
-            // not a leak.
-            if(cb)
-            {
-                cb(std::move(view));
-            }
-            view.reset();
-        }
-
-        if(dispatched != 0 || std::chrono::steady_clock::now() >= deadline)
-        {
-            break;
-        }
-
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-    }
-
-    return dispatched;
-}
 
 bool SubscriberEngine::ring_contains(const void *p) const noexcept
 {
@@ -996,31 +948,27 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
 {
     SubscriberCounters out;
     out.frames_received = frames_received_.load(std::memory_order_relaxed);
-    out.frames_delivered = frames_delivered_.load(std::memory_order_relaxed);
-    out.frames_dropped_queue_full = dropped_queue_full_.load(std::memory_order_relaxed);
     out.frames_dropped_stale_epoch = dropped_stale_epoch_.load(std::memory_order_relaxed);
     out.frames_dropped_bad_header = dropped_bad_header_.load(std::memory_order_relaxed);
     out.frames_dropped_oversize = dropped_oversize_.load(std::memory_order_relaxed);
     out.frames_dropped_duplicate_seq = dropped_duplicate_seq_.load(std::memory_order_relaxed);
+    out.frames_dropped_geometry_mismatch =
+        dropped_geometry_mismatch_.load(std::memory_order_relaxed);
     out.credits_returned = arena_->credits_returned();
     out.credit_messages_sent = credit_messages_sent_.load(std::memory_order_relaxed);
     out.views_outstanding = arena_->views_outstanding();
-    out.delivery_queue_depth = delivery_.size();
-    out.delivery_queue_high_water = delivery_high_water_.load(std::memory_order_relaxed);
-    out.sessions_opened = session_.stream_id() != 0 ? 1u : 0u;
-    out.renewals_sent = renewals_sent_.load(std::memory_order_relaxed);
-    out.renewals_failed = renewals_failed_.load(std::memory_order_relaxed);
+    out.sessions_opened = stream_id_ != 0 ? 1u : 0u;
     out.transport_errors = transport_errors_.load(std::memory_order_relaxed);
     out.pinned_bytes = arena_->ring().mapped_bytes();
     return out;
 }
 
-std::unique_ptr<SubscriberTransport> make_subscriber_transport(SubscriberConfig config)
+std::unique_ptr<SubscriberTransport> make_subscriber_transport(
+    SubscriberConfig config, std::shared_ptr<DeliveryIngress> delivery)
 {
-    // Declared in `core/subscriber_transport.h` and defined here, which is the
-    // point of the seam: `BulkSubscriber` constructs a transport without naming
+    // point of the seam: `Subscription` constructs a transport without naming
     // the concrete type, and therefore without compiling against `ucp/*`.
-    return std::make_unique<SubscriberEngine>(std::move(config));
+    return std::make_unique<SubscriberEngine>(std::move(config), std::move(delivery));
 }
 
 } // namespace TangoBulk::detail

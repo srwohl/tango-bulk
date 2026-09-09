@@ -80,7 +80,7 @@ std::string to_log_string(const SessionId &id);
 std::string to_log_string(const ClientInstanceId &id);
 std::string to_log_string(StreamId id);
 
-/// Full lowercase hex.  For BulkQuery output and tests, not for logs.
+/// Full lowercase hex. Used by protocol tests and diagnostics, not for logs.
 std::string to_hex(const SessionId &id);
 std::string to_hex(const ClientInstanceId &id);
 
@@ -108,7 +108,6 @@ inline constexpr std::size_t k_coord_envelope_bytes = 32;
 inline constexpr std::size_t k_max_coord_message_bytes = 65'536;
 inline constexpr std::uint32_t k_max_coord_body_bytes = 65'504;
 inline constexpr std::size_t k_max_error_message_bytes = 512;
-inline constexpr std::size_t k_max_counters_bytes = 8'192;
 
 enum class CoordType : std::uint16_t
 {
@@ -118,8 +117,6 @@ enum class CoordType : std::uint16_t
     RenewReply = 0x0004,
     Close = 0x0005,
     CloseReply = 0x0006,
-    Query = 0x0007,
-    QueryReply = 0x0008,
     Error = 0x00FF,
 };
 
@@ -130,10 +127,8 @@ const char *to_string(CoordType type) noexcept;
 /// Unknown bits MUST be ignored rather than rejected: that is what lets a minor
 /// version add a capability without breaking an older server.
 inline constexpr std::uint32_t k_caps_credit_coalescing = 1u << 0;
-inline constexpr std::uint32_t k_caps_geometry_rearm = 1u << 1;
 inline constexpr std::uint32_t k_caps_probe = 1u << 2;
-inline constexpr std::uint32_t k_caps_all = k_caps_credit_coalescing |
-                                            k_caps_geometry_rearm | k_caps_probe;
+inline constexpr std::uint32_t k_caps_all = k_caps_credit_coalescing | k_caps_probe;
 
 enum class Transport : std::uint32_t
 {
@@ -186,7 +181,7 @@ Status decode_envelope(const std::byte *data, std::size_t size, Envelope &out) n
 // ---------------------------------------------------------------------------
 
 /// One layout, one validator, one set of bounds checks, reused verbatim by
-/// OpenReply, RenewReply, QueryReply, and the data-plane Geometry message.
+/// OpenReply, RenewReply, and the data-plane Geometry message.
 struct GeometryBlock
 {
     std::uint32_t generation{0}; ///< epoch; starts at 1, increments, never wraps
@@ -208,6 +203,8 @@ struct GeometryBlock
 
     friend bool operator==(const GeometryBlock &a, const GeometryBlock &b) noexcept;
     friend bool operator!=(const GeometryBlock &a, const GeometryBlock &b) noexcept;
+
+    friend bool describes_same_array(const GeometryBlock &a, const GeometryBlock &b) noexcept;
 };
 
 inline constexpr std::size_t k_geometry_block_bytes = 96;
@@ -287,26 +284,6 @@ struct CloseReply
     std::uint32_t frames_credited_final{0}; ///< low 32 bits; diagnostics
 };
 
-struct QueryRequest
-{
-    SessionId session_id{}; ///< all-zero requests server-wide status
-    std::uint32_t query_flags{0};
-};
-
-struct QueryReply
-{
-    SessionId session_id{};
-    Status status{Status::Ok};
-    std::uint32_t active_sessions{0};
-    std::uint32_t generation{0};
-    GeometryBlock geometry{};
-
-    /// `key=value;` pairs.  MUST NOT contain UCX addresses, memory keys, session
-    /// identifiers beyond the truncated form, or hostnames not already known to
-    /// the caller.
-    std::string counters;
-};
-
 struct ErrorMessage
 {
     Status status{Status::Internal}; ///< never Ok
@@ -320,24 +297,19 @@ inline constexpr std::size_t k_renew_bytes = 40;
 inline constexpr std::size_t k_renew_reply_bytes = 128;
 inline constexpr std::size_t k_close_bytes = 24;
 inline constexpr std::size_t k_close_reply_bytes = 24;
-inline constexpr std::size_t k_query_bytes = 24;
-inline constexpr std::size_t k_query_reply_fixed_bytes = 128;
 inline constexpr std::size_t k_error_fixed_bytes = 8;
 
 /// Encode, envelope included.  Control path: allowed to allocate, allowed to
 /// throw BulkException if the message cannot be represented (an over-long
 /// stream name, an address blob past k_max_ucx_address_bytes).
 ///
-/// Fields the spec bounds by truncation on encode -- ErrorMessage::message and
-/// QueryReply::counters -- are truncated rather than rejected.
+/// ErrorMessage::message is truncated rather than rejected.
 std::vector<std::byte> encode(const OpenRequest &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const OpenReply &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const RenewRequest &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const RenewReply &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const CloseRequest &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const CloseReply &msg, std::uint64_t correlation_id);
-std::vector<std::byte> encode(const QueryRequest &msg, std::uint64_t correlation_id);
-std::vector<std::byte> encode(const QueryReply &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const ErrorMessage &msg, std::uint64_t correlation_id);
 
 /// Decode, envelope included.  Returns Status::MalformedMessage for anything
@@ -361,10 +333,6 @@ Status decode(const std::byte *data, std::size_t size, CloseRequest &out,
               Envelope *envelope = nullptr) noexcept;
 Status decode(const std::byte *data, std::size_t size, CloseReply &out,
               Envelope *envelope = nullptr) noexcept;
-Status decode(const std::byte *data, std::size_t size, QueryRequest &out,
-              Envelope *envelope = nullptr) noexcept;
-Status decode(const std::byte *data, std::size_t size, QueryReply &out,
-              Envelope *envelope = nullptr) noexcept;
 Status decode(const std::byte *data, std::size_t size, ErrorMessage &out,
               Envelope *envelope = nullptr) noexcept;
 
@@ -384,8 +352,6 @@ enum class DataType : std::uint16_t
     Credit = 2,
     Probe = 3,
     ProbeAck = 4,
-    Geometry = 5,
-    GeometryAck = 6,
 };
 
 const char *to_string(DataType type) noexcept;
@@ -401,21 +367,16 @@ inline constexpr unsigned k_am_id_frame = 0;
 inline constexpr unsigned k_am_id_credit = 1;
 inline constexpr unsigned k_am_id_probe = 2;
 inline constexpr unsigned k_am_id_probe_ack = 3;
-inline constexpr unsigned k_am_id_geometry = 4;
-inline constexpr unsigned k_am_id_geometry_ack = 5;
 
 inline constexpr std::size_t k_frame_header_bytes = 160;
 inline constexpr std::size_t k_credit_bytes = 32;
 inline constexpr std::size_t k_probe_bytes = 32;
 inline constexpr std::size_t k_probe_ack_bytes = 32;
-inline constexpr std::size_t k_geometry_bytes = 128;
-inline constexpr std::size_t k_geometry_ack_bytes = 32;
 
 /// The largest data-plane header, which is what the engine must confirm the
 /// transport can carry.  The engine queries ucp_worker_attr_t.max_am_header at
 /// startup and fails construction if it is below this; discovering the limit at
 /// the first frame is not acceptable.
-inline constexpr std::size_t k_max_am_header_bytes = k_frame_header_bytes;
 
 /// Common 16-byte prefix, so an AM callback can classify and version-check
 /// before touching anything type-specific.
@@ -478,29 +439,12 @@ struct ProbeAckMessage
     std::uint64_t probe_token{0}; ///< echoed exactly
 };
 
-struct GeometryMessage
-{
-    std::uint32_t generation{0}; ///< the NEW epoch
-    StreamId stream_id{0};
-    std::uint64_t first_sequence{0}; ///< first seq that will be sent in the new epoch
-    GeometryBlock geometry{};
-};
-
-struct GeometryAckMessage
-{
-    std::uint32_t generation{0}; ///< the armed epoch
-    StreamId stream_id{0};
-    std::uint64_t first_sequence{0}; ///< echoed
-};
-
 /// Data-plane encode is allocation-free by construction: the result is a
 /// fixed-size array returned by value, ready to hand to UCX as an AM header.
 std::array<std::byte, k_frame_header_bytes> encode(const FrameHeader &msg) noexcept;
 std::array<std::byte, k_credit_bytes> encode(const CreditMessage &msg) noexcept;
 std::array<std::byte, k_probe_bytes> encode(const ProbeMessage &msg) noexcept;
 std::array<std::byte, k_probe_ack_bytes> encode(const ProbeAckMessage &msg) noexcept;
-std::array<std::byte, k_geometry_bytes> encode(const GeometryMessage &msg) noexcept;
-std::array<std::byte, k_geometry_ack_bytes> encode(const GeometryAckMessage &msg) noexcept;
 
 /// Data-plane decode runs inside an AM callback: no allocation, no throw, and it
 /// must never read past `size` even when `header_bytes` claims more.
@@ -508,8 +452,6 @@ Status decode(const std::byte *data, std::size_t size, FrameHeader &out) noexcep
 Status decode(const std::byte *data, std::size_t size, CreditMessage &out) noexcept;
 Status decode(const std::byte *data, std::size_t size, ProbeMessage &out) noexcept;
 Status decode(const std::byte *data, std::size_t size, ProbeAckMessage &out) noexcept;
-Status decode(const std::byte *data, std::size_t size, GeometryMessage &out) noexcept;
-Status decode(const std::byte *data, std::size_t size, GeometryAckMessage &out) noexcept;
 
 } // namespace TangoBulk::Protocol
 

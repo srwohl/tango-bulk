@@ -555,7 +555,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
     struct PreparedFrame
     {
         std::uint64_t dataset_frame{0};
-        BulkSource::Lease lease;
+        BulkPublisher::SlotHandle lease;
     };
 
     void restart_prefetch(std::uint64_t dataset_frame)
@@ -592,10 +592,10 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
                 }
 
                 const auto lease_started = std::chrono::steady_clock::now();
-                BulkSource::Lease lease;
+                BulkPublisher::SlotHandle lease;
                 while(running_ && !lease)
                 {
-                    lease = publisher_->source().try_acquire();
+                    lease = publisher_->try_acquire();
                     if(!lease)
                         std::this_thread::yield();
                 }
@@ -884,6 +884,7 @@ class Hdf5ReplayDetectorClass : public Tango::DeviceClass
                                             ReplayAttribute::ReadyFrames, Tango::READ));
         attributes.push_back(new ReplayAttr("frameRate", Tango::DEV_DOUBLE,
                                             ReplayAttribute::FrameRate, Tango::READ_WRITE));
+        install_bulk_attributes(attributes);
     }
 
     void device_factory(const Tango::DevVarStringArray *devices) override

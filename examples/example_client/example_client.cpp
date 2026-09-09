@@ -6,7 +6,6 @@
 
 #include <tango/tango.h>
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -21,7 +20,8 @@
 ///     tango-bulk-example-client bulk/example/1 [stream]
 ///     tango-bulk-example-client "localhost:10000/bulk/example/1#dbase=no"
 ///
-/// The whole client API is six calls: construct, two callbacks, start, stop.
+/// The client-facing lifecycle is one Subscription: construct it, consume
+/// frames through its callback, and let close/destruction release the session.
 /// Everything else here is printing.
 namespace
 {
@@ -57,54 +57,30 @@ int main(int argc, char *argv[])
         Tango::DeviceProxy proxy(device);
 
         // BulkOpen can clamp a request downward, but it cannot make an
-        // undersized receive slot larger.  Discover the publisher geometry
-        // instead of relying on SubscriberConfig's 8 MiB default.  Detector
-        // frames such as 2208 x 3216 x uint16 are already about 13.5 MiB.
-        const TangoBulk::BulkQueryResult publisher = TangoBulk::bulk_query(proxy);
-        if(publisher.status != TangoBulk::Status::Ok)
-        {
-            throw TangoBulk::BulkException(
-                {publisher.status, "publisher is not ready", "BulkQuery"});
-        }
-
+        // undersized receive slot larger. Until StreamOffer discovery is
+        // available, use an explicit complete upper plan rather than relying on discovery
+        // shaped preflight. This is conservative but safe for any valid peer.
         TangoBulk::SubscriberConfig config;
         config.stream_name = stream;
-        config.max_frame_bytes = publisher.max_frame_bytes;
+        config.receive_plan = TangoBulk::ReceivePlan::from_limits(
+            TangoBulk::k_max_frame_bytes_hard_cap, TangoBulk::k_min_ring_depth, 2);
 
-        // Keep the receive ring within the default 1 GiB pinned-memory budget.
-        // Two slots is the protocol minimum; the 256 MiB frame hard cap means
-        // that the minimum always fits.
-        const std::uint64_t slots_in_budget =
-            config.pinned_memory_limit_bytes / config.max_frame_bytes;
-        config.ring_depth = std::min<std::uint32_t>(
-            publisher.ring_depth,
-            static_cast<std::uint32_t>(std::max<std::uint64_t>(2, slots_in_budget)));
-        config.credit_window = std::min(publisher.credit_window, config.ring_depth);
-
-        std::cout << "publisher geometry: max_frame_bytes=" << config.max_frame_bytes
-                  << " ring_depth=" << config.ring_depth
-                  << " credit_window=" << config.credit_window << std::endl;
-
-        // The default.  A library-owned dispatch thread invokes the callback, so
+        // The default Push mode. A library-owned dispatch thread invokes the callback, so
         // it never runs on the UCX engine thread (5.2) -- which is what lets a
         // slow consumer be slow without stalling the transport.  Swap in
-        // DeliveryMode::Manual and call poll() to own the thread yourself.
-        config.delivery_mode = TangoBulk::DeliveryMode::DispatchThread;
+        // Pull mode and call read_for() to own frame reads yourself.
+        config.delivery_mode = TangoBulk::DeliveryMode::Push;
 
         // 4.1: keep trying when the link drops, up to ten times with an
         // exponential backoff capped at the lease TTL.
         config.reconnect_policy = TangoBulk::ReconnectPolicy::BoundedRetry;
 
-        TangoBulk::BulkSubscriber subscriber(proxy, config);
-
-        // If the device's commands carry a prefix, say so before start():
-        //
-        //     set_command_names(subscriber, TangoBulk::CommandNames::with_prefix("Xyz"));
-
         std::atomic<std::uint64_t> frames{0};
         std::atomic<std::uint64_t> bytes{0};
 
-        subscriber.set_frame_callback(
+        TangoBulk::SubscriptionCallbacks callbacks;
+
+        callbacks.on_frame =
             [&frames, &bytes](TangoBulk::FrameView view)
             {
                 // `view.data()` points into the registered receive ring.  It is
@@ -114,21 +90,13 @@ int main(int argc, char *argv[])
                 // and expect the stream to keep flowing.
                 frames.fetch_add(1, std::memory_order_relaxed);
                 bytes.fetch_add(view.size(), std::memory_order_relaxed);
-            });
+            };
 
-        subscriber.set_state_callback(
-            [](TangoBulk::SubscriberState state, const TangoBulk::BulkError &error)
-            {
-                std::cout << "state: " << TangoBulk::to_string(state);
-                if(error.status != TangoBulk::Status::Ok)
-                {
-                    std::cout << " (" << TangoBulk::to_string(error.status) << ": "
-                              << error.message << ")";
-                }
-                std::cout << std::endl;
-            });
-
-        subscriber.start();
+        auto subscription = TangoBulk::subscribe(proxy, config, std::move(callbacks));
+        const TangoBulk::ReceivePlan actual = subscription->plan();
+        std::cout << "granted receive plan: max_frame_bytes=" << actual.max_frame_bytes
+                  << " ring_depth=" << actual.ring_depth
+                  << " credit_window=" << actual.credit_window << std::endl;
 
         auto last = std::chrono::steady_clock::now();
         std::uint64_t last_frames = 0;
@@ -155,13 +123,9 @@ int main(int argc, char *argv[])
             last_bytes = total_bytes;
         }
 
-        // Sends BulkClose, joins the threads, and releases the ring.  Idempotent,
-        // and the destructor would do it anyway -- but a client that closes
-        // explicitly gives the publisher its slots back now rather than one
-        // lease TTL from now.
-        subscriber.stop();
+        const TangoBulk::SubscriberCounters counters = subscription->counters();
 
-        const TangoBulk::SubscriberCounters counters = subscriber.counters();
+        subscription.reset();
         std::cout << "received=" << counters.frames_received
                   << " delivered=" << counters.frames_delivered
                   << " dropped_queue_full=" << counters.frames_dropped_queue_full

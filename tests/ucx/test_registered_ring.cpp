@@ -5,7 +5,10 @@
 #include <ucx/registered_ring.h>
 #include <ucx/ucx_context.h>
 
+#include <core/pinned_ledger.h>
+
 #include <tango-bulk/frame.h>
+#include <tango-bulk/errors.h>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -40,4 +43,50 @@ TEST_CASE("caller-owned receive rings use the documented packed layout", "[ucx][
     CHECK(ring.stride() == slot_bytes);
     CHECK(ring.slot(depth - 1) + slot_bytes ==
           static_cast<std::byte *>(arena.get()) + arena_bytes);
+}
+
+TEST_CASE("caller-owned registered memory participates in the pinned budget",
+          "[ucx][registered-memory]")
+{
+    constexpr std::uint64_t budget = 16ull << 20;
+    constexpr std::uint64_t first_bytes = budget;
+    constexpr std::uint64_t second_bytes = 4096;
+
+    UcxContext context("");
+    const std::uint64_t baseline = PinnedLedger::current();
+    const std::uint64_t process_limit = baseline + budget;
+
+    auto first_owner = std::shared_ptr<void>(
+        ::operator new(static_cast<std::size_t>(first_bytes)),
+        [](void *pointer) { ::operator delete(pointer); });
+    auto second_owner = std::shared_ptr<void>(
+        ::operator new(static_cast<std::size_t>(second_bytes)),
+        [](void *pointer) { ::operator delete(pointer); });
+
+    {
+        RegisteredMemory first = RegisteredMemory::adopted(
+            context, std::move(first_owner), first_bytes, MemoryKind::Host, process_limit);
+        CHECK(PinnedLedger::current() == baseline + first_bytes);
+
+        RegisteredMemory moved = std::move(first);
+        CHECK_THROWS_AS(RegisteredMemory::adopted(context,
+                                                  std::move(second_owner),
+                                                  second_bytes,
+                                                  MemoryKind::Host,
+                                                  process_limit),
+                        BulkException);
+        CHECK(PinnedLedger::current() == baseline + first_bytes);
+    }
+
+    CHECK(PinnedLedger::current() == baseline);
+
+    auto released_owner = std::shared_ptr<void>(
+        ::operator new(static_cast<std::size_t>(second_bytes)),
+        [](void *pointer) { ::operator delete(pointer); });
+    {
+        RegisteredMemory released = RegisteredMemory::adopted(
+            context, std::move(released_owner), second_bytes, MemoryKind::Host, process_limit);
+        CHECK(PinnedLedger::current() == baseline + second_bytes);
+    }
+    CHECK(PinnedLedger::current() == baseline);
 }

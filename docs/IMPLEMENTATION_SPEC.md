@@ -37,9 +37,9 @@ decision is deferred into code review.
 
 | Open choice | Decision | Rationale |
 |---|---|---|
-| Command prefix | `BulkOpen` / `BulkRenew` / `BulkClose` / `BulkQuery`, unprefixed by default; a `CommandNames` struct allows a per-device prefix | Unprefixed names are discoverable and match the docs already written; the override exists for devices with a name collision, not as the normal path |
+| Command prefix | `BulkOpen` / `BulkRenew` / `BulkClose`, unprefixed by default; a `CommandNames` struct allows a per-device prefix | Unprefixed names are discoverable and match the docs already written; the override exists for devices with a name collision, not as the normal path |
 | Default lease timings | TTL 10 000 ms, renew interval 3 333 ms (TTL/3), both negotiated per session | Three renewal attempts fit inside one TTL, so a single lost Tango command never expires a healthy session |
-| Callback executor default | One library-owned dispatch thread per subscriber; `DeliveryMode::Manual` + `poll()` for deterministic tests | Structurally guarantees §5's "callbacks never run on the engine thread" without forcing an executor dependency on applications |
+| Callback executor default | One library-owned dispatch thread per subscriber; `DeliveryMode::Pull` + `read_for()` for caller-owned reads | Structurally guarantees §5's "callbacks never run on the engine thread" while keeping delivery ownership immutable per subscription |
 | Wire codec | Hand-written fixed-offset little-endian encode/decode, with a `header_bytes` trailing-extension rule | Already validated in the prototype ([bulk_wire.h](../../src/include/tango/internal/ucx/bulk_wire.h)); adds no dependency, decodes in a few ns inside an AM callback, and keeps the protocol independent of Tango IDL and of any third-party schema compiler |
 | Relay in MVP? | **No.** Relay is M6, post-MVP | The MVP objective is one line-rate consumer; fan-out is a capacity problem, not a semantics problem, and shipping it early would not be exercised |
 
@@ -91,7 +91,7 @@ tango-bulk/
 │   ├── publisher_impl.cpp
 │   └── subscriber_impl.cpp
 ├── src/tango/                      # tango/* allowed; NO ucp/* includes
-│   ├── commands.cpp                # BulkOpen/Renew/Close/Query command classes
+│   ├── commands.cpp                # BulkOpen/Renew/Close command classes
 │   ├── registration.cpp            # install_bulk_commands
 │   └── proxy_client.cpp            # DeviceProxy-driven coordination client
 ├── tests/
@@ -459,13 +459,13 @@ const char *to_string(SubscriberState) noexcept;
 
 enum class DeliveryMode : std::uint32_t
 {
-    DispatchThread = 0,   // library-owned thread invokes the callback (default)
-    Manual         = 1,   // application calls poll(); no dispatch thread is created
+    Push = 0,              // library-owned thread invokes the callback (default)
+    Pull = 1,              // application claims frames with read_for()
 };
 
 enum class ReconnectPolicy : std::uint32_t
 {
-    FailFast = 0, BoundedRetry = 1, Manual = 2,
+    FailFast = 0, BoundedRetry = 1,
 };
 
 struct SubscriberConfig
@@ -475,7 +475,7 @@ struct SubscriberConfig
     std::uint32_t ring_depth{32};
     std::uint32_t credit_window{16};
     std::uint32_t delivery_queue_depth{64};
-    DeliveryMode  delivery_mode{DeliveryMode::DispatchThread};
+    DeliveryMode  delivery_mode{DeliveryMode::Push};
     DropPolicy    drop_policy{DropPolicy::DropNewest};
     ReconnectPolicy reconnect_policy{ReconnectPolicy::BoundedRetry};
     std::uint32_t reconnect_max_attempts{10};
@@ -509,9 +509,8 @@ class BulkSubscriber
     void start();       // throws BulkException on open failure under FailFast
     void stop() noexcept;   // idempotent; sends BulkClose best-effort, joins threads
 
-    // Manual mode only. Returns the number of frames dispatched. Invokes the frame
-    // callback on the CALLING thread. Throws if delivery_mode != Manual.
-    std::size_t poll(std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+    // Pull mode only. The application claims frames directly with try_read()
+    // or read_for(); Push mode invokes the callback on the library thread.
 
     SubscriberState state() const noexcept;
     std::uint32_t   generation() const noexcept;
@@ -659,7 +658,7 @@ Rules:
 - Both are unique among live sessions on a server instance and **MUST NOT** be reused within the
   lifetime of the publisher process, even after the session closes. Reuse is what makes a late frame
   from a dead session indistinguishable from a live one.
-- Text form (logs, `BulkQuery`): lowercase hex. Logs **MUST** print only the first 8 hex characters
+- Text form (logs, `BulkStreams`): lowercase hex. Logs **MUST** print only the first 8 hex characters
   followed by `…`. Full identifiers, UCX worker addresses, and memory keys **MUST NOT** be logged at
   any level below debug.
 
@@ -691,8 +690,7 @@ offset  size  field              notes
 | `0x0004` | `RenewReply` | server → client |
 | `0x0005` | `Close` | client → server |
 | `0x0006` | `CloseReply` | server → client |
-| `0x0007` | `Query` | client → server |
-| `0x0008` | `QueryReply` | server → client |
+| `0x0008` | `RenewReply` | server → client |
 | `0x00FF` | `Error` | server → client |
 
 A server **MAY** reply `Error` to any request. A client **MUST** accept `Error` in place of any
@@ -700,7 +698,7 @@ expected reply type.
 
 ### 3.4 `GeometryBlock` (96 bytes, embedded)
 
-Reused verbatim by `OpenReply`, `RenewReply`, `QueryReply`, and the data-plane `Geometry` message.
+Reused verbatim by `OpenReply`, `RenewReply`, `RenewReply`, and the data-plane `Geometry` message.
 One layout, one validator, one set of bounds checks.
 
 ```text
@@ -838,7 +836,7 @@ Renew rules:
   `RenewReply{RenewTooFrequent}`. The lease is **not** shortened as a penalty; the reply is simply
   refused, and `renewals_rejected` is incremented.
 
-### 3.8 `Close` / `CloseReply` / `Query` / `QueryReply` / `Error`
+### 3.8 `Close` / `CloseReply` / `Error`
 
 `Close` body — 24 bytes:
 
@@ -865,28 +863,6 @@ offset  size  field                 notes
 `CloseReply{UnknownSession}` and performs no work. It is never an `Error`, and it never throws on
 the client side — a client tearing down after a fault must not be punished for closing twice.
 
-`Query` body — 24 bytes: `session_id` (16), `u32 query_flags`, `u32 reserved`. `session_id` MAY be
-all-zero to request server-wide (non-session) status.
-
-`QueryReply` body — 32 bytes fixed + `GeometryBlock` + a variable JSON-ish counter blob:
-
-```text
-offset  size  field              notes
-------  ----  -----------------  --------------------------------------------------
-     0    16  session_id         echoed
-    16     2  status
-    18     2  reserved
-    20     4  active_sessions
-    24     4  generation
-    28     4  reserved
-    32    96  geometry           GeometryBlock
-------  ----  -----------------  --------------------------------------------------
-   128        counters           u32 length + UTF-8 bytes (0..8192), `key=value;` pairs
-```
-
-`QueryReply.counters` **MUST NOT** contain UCX addresses, memory keys, session identifiers beyond the
-truncated form, or hostnames not already known to the caller.
-
 `Error` body — 8 bytes fixed + message:
 
 ```text
@@ -908,7 +884,6 @@ offset  size  field       notes
 | `stream_name` | 1..64 bytes, `[A-Za-z0-9_.-]` only | `MalformedMessage` |
 | `client_ucx_address` / `server_ucx_address` | 1..4096 bytes | `MalformedMessage` |
 | `Error.message` | 0..512 bytes | truncate on encode; reject on decode |
-| `QueryReply.counters` | 0..8192 bytes | truncate on encode; reject on decode |
 
 A decoder **MUST** verify that the sum of the envelope, the fixed body, and every declared
 variable-length field exactly equals the delivered length. Trailing unexplained bytes are
@@ -1085,12 +1060,12 @@ Closed ──start()──► Opening ──OpenReply{Ok}──► Probing ─�
 | `Reconnecting` | drop endpoint, keep ring, back off, retry `Open` | `Opening`, `Failed`, `Closed` |
 | `Failed` | terminal until `stop()`/`start()`; state callback fired with `BulkError` | `Closed` |
 
-The state callback fires on **every** transition, on the dispatch thread (or from `poll()` in manual
-mode), never on the engine thread.
+The frame callback fires on the dedicated Push thread and Pull callers claim frames directly;
+neither delivery path runs application code on the engine thread.
 
 Reconnect policy: `FailFast` → any transition to `Reconnecting` becomes `Failed`. `BoundedRetry` →
 up to `reconnect_max_attempts` with exponential backoff from `reconnect_backoff_ms`, capped at the
-last known lease TTL. `Manual` → enter `Failed` and let the application call `start()` again.
+last known lease TTL.
 
 ### 4.2 Server (per session)
 
@@ -1193,7 +1168,7 @@ geometry.
 |---|---|---|---|
 | **Application / acquisition** | N (caller's) | `BulkSource::Lease` between `try_acquire()` and `publish()` | enter UCX; take a UCX lock; block |
 | **Engine** | 1 per worker/rail | the `ucp_worker` **exclusively**; all `ucp_*` calls | invoke a user callback; call Tango; allocate on the frame path |
-| **Dispatch** | 1 per subscriber (`DispatchThread` mode) | invoking `FrameCallback` and `StateCallback` | touch UCX; hold a lease longer than the callback |
+| **Dispatch** | 1 per Push subscription | invoking `FrameCallback` | touch UCX; hold a lease longer than the callback |
 | **Control** | 1 per publisher and per subscriber | lease timers, `Renew` commands, expiry sweeps, `DeviceProxy` calls | touch UCX; invoke user frame callbacks |
 
 The `ucp_worker` is created with `UCS_THREAD_MODE_SINGLE` and is touched **only** by its engine
@@ -1355,9 +1330,9 @@ selection.
 | `BulkOpen` | `DevVarCharArray → DevVarCharArray` | `Tango::EXPERT` | no — each call creates a session |
 | `BulkRenew` | `DevVarCharArray → DevVarCharArray` | `Tango::EXPERT` | yes |
 | `BulkClose` | `DevVarCharArray → DevVarCharArray` | `Tango::EXPERT` | yes |
-| `BulkQuery` | `DevVarCharArray → DevVarCharArray` | `Tango::OPERATOR` | yes |
+| `BulkStreams` | `DevVarCharArray → DevVarCharArray` | `Tango::OPERATOR` | yes |
 
-All four take an encoded coordination message (§3.3) and return an encoded reply. `DevVarCharArray`
+All three take an encoded coordination message (§3.3) and return an encoded reply. `DevVarCharArray`
 is used rather than `DevString` because the payload is binary and must not be subject to encoding or
 NUL-termination semantics.
 
@@ -1376,12 +1351,11 @@ struct CommandNames
     std::string open{"BulkOpen"};
     std::string renew{"BulkRenew"};
     std::string close{"BulkClose"};
-    std::string query{"BulkQuery"};
 
     static CommandNames with_prefix(const std::string &prefix);  // "Xyz" -> "XyzBulkOpen"
 };
 
-// Called from DeviceClass::command_factory(). Appends four commands that
+// Called from DeviceClass::command_factory(). Appends three commands that
 // dispatch to the BulkPublisher attached to the receiving device.
 void install_bulk_commands(Tango::DeviceClass &device_class,
                            const CommandNames &names = {});
@@ -1413,8 +1387,7 @@ fault.
   causes pinned-memory allocation and `BulkClose` terminates a data stream. Registering them at
   operator level where Tango access control distinguishes read from write is a misconfiguration, and
   the documentation MUST say so.
-- `BulkQuery` is read-only and MAY be operator level.
-- The UCX data plane itself is **unauthenticated and unencrypted**. A client that obtains a valid
+- - The UCX data plane itself is **unauthenticated and unencrypted**. A client that obtains a valid
   `stream_id` can send credits for that stream. This is acceptable only on a trusted facility network,
   and §3.12's "credit above highest submitted sequence" check is a robustness measure, not a
   security control. Encryption and authenticated endpoints require an explicit threat model that this
@@ -1566,7 +1539,7 @@ registered receive ring; `FrameView` with the shared-ptr lease; cumulative credi
 
 - no Tango process, no `DeviceProxy`, no commands (the coordination plane is driven directly through
   `handle_coordination`, or by `oob.hpp` in the UCX tests);
-- no user callbacks and no dispatch thread — `DeliveryMode::Manual` and `poll()` only;
+- no user callbacks and no dispatch thread — `DeliveryMode::Pull` reads only;
 - no geometry changes;
 - no probe;
 - no session leases, renewal, or expiry;

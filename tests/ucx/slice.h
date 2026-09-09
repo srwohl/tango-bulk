@@ -5,25 +5,25 @@
 #ifndef TANGO_BULK_TESTS_UCX_SLICE_H
 #define TANGO_BULK_TESTS_UCX_SLICE_H
 
-#include <ucx/subscriber_engine.h>
-
-#include <core/cpu_topology.h>
+#include <core/publisher_internal.h>
+#include <core/subscription_internal.h>
 
 #include <tango-bulk/publisher.h>
+#include <tango-bulk/subscription.h>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <functional>
+#include <memory>
+#include <optional>
 #include <thread>
 #include <utility>
 #include <vector>
 
-/// Scaffolding shared by the UCX tests: configuration, the `Open` handshake,
-/// and the two waits every case needs.
-///
-/// It lives in a header rather than being copied because both test files drive
-/// the same handshake, and a second copy of it would be a second thing to keep
-/// in step with 4.1 and 4.2.
+/// Shared UCX integration-test scaffolding. The subscriber crosses the same
+/// Subscription seam as production; only coordination is short-circuited to
+/// the in-process publisher.
 namespace TangoBulkTests
 {
 
@@ -53,13 +53,10 @@ inline SubscriberConfig subscriber_config()
     config.ring_depth = k_ring_depth;
     config.credit_window = k_credit_window;
     config.delivery_queue_depth = 32;
-    // No dispatch thread yet, so asking for one is a construction error rather
-    // than a silent upgrade.
-    config.delivery_mode = DeliveryMode::Manual;
+    config.delivery_mode = DeliveryMode::Pull;
     return config;
 }
 
-/// Spin until `predicate` holds or the budget runs out; returns whether it held.
 template <typename Predicate>
 bool eventually(Predicate predicate, std::chrono::milliseconds budget = 5s)
 {
@@ -75,40 +72,63 @@ bool eventually(Predicate predicate, std::chrono::milliseconds budget = 5s)
     return predicate();
 }
 
-/// Run the `Open` exchange, straight through `handle_coordination`.
-///
-/// No Tango process, no DeviceProxy, no commands -- the bytes are the real
-/// protocol bytes and only the transport carrying them is short-circuited.
-/// Returns the reply so a caller can inspect the grant.
-inline std::vector<std::byte> exchange_open(BulkPublisher &publisher,
-                                            detail::SubscriberEngine &subscriber,
-                                            std::uint64_t correlation_id = 1)
+using CoordinationObserver =
+    std::function<void(Protocol::CoordType, const std::vector<std::byte> &)>;
+using CoordinationReplyTransform =
+    std::function<void(Protocol::CoordType, std::vector<std::byte> &)>;
+
+inline std::unique_ptr<Subscription> open_subscription(
+    BulkPublisher &publisher,
+    SubscriberConfig config = subscriber_config(),
+    CoordinationObserver observer = {},
+    CoordinationReplyTransform transform = {})
 {
-    const std::vector<std::byte> request = subscriber.make_open_request(correlation_id);
-    return publisher.handle_coordination(request.data(), request.size());
+    config.delivery_mode = DeliveryMode::Pull;
+    return detail::SubscriptionFactory::open_default(
+        std::move(config),
+        [&publisher, observer = std::move(observer), transform = std::move(transform)](
+            Protocol::CoordType type,
+            const std::vector<std::byte> &request,
+            std::chrono::steady_clock::time_point /*deadline*/) mutable
+        {
+            std::vector<std::byte> reply = detail::PublisherAccess::coordination(
+                publisher, request.data(), request.size(), type);
+            if(transform)
+            {
+                transform(type, reply);
+            }
+            if(observer)
+            {
+                observer(type, reply);
+            }
+            return reply;
+        },
+        SubscriptionCallbacks{});
 }
 
-/// Wait out the `Probe`/`ProbeAck` round trip on both sides.
-///
-/// 4.2 arms a session on `ProbeAck`, not on `Open`, so a session is granted a
-/// moment before it is eligible for a frame.  `armed_target` is how many armed
-/// sessions the publisher should end up with.
-inline bool await_armed(BulkPublisher &publisher,
-                        detail::SubscriberEngine &subscriber,
-                        std::size_t armed_target = 1)
+inline std::size_t drain(Subscription &subscription,
+                         std::chrono::milliseconds timeout,
+                         const FrameCallback &callback,
+                         std::size_t max_frames = 0)
 {
-    return eventually([&] { return publisher.session_count() == armed_target; }) &&
-           eventually([&] { return subscriber.state() == SubscriberState::Active; });
-}
+    std::size_t drained = 0;
+    while(max_frames == 0 || drained < max_frames)
+    {
+        std::optional<FrameView> frame = drained == 0 ? subscription.read_for(timeout)
+                                                       : subscription.try_read();
+        if(!frame)
+        {
+            break;
+        }
 
-/// Open a session and wait until frames may flow.
-inline void open_session(BulkPublisher &publisher,
-                         detail::SubscriberEngine &subscriber,
-                         std::size_t armed_target = 1)
-{
-    const std::vector<std::byte> reply = exchange_open(publisher, subscriber);
-    REQUIRE(subscriber.adopt_open_reply(reply.data(), reply.size()) == Status::Ok);
-    REQUIRE(await_armed(publisher, subscriber, armed_target));
+        ++drained;
+        if(callback)
+        {
+            callback(std::move(*frame));
+        }
+    }
+
+    return drained;
 }
 
 inline FrameMetadata meta_for(std::uint64_t payload_bytes, std::uint64_t counter)
@@ -124,7 +144,7 @@ inline FrameMetadata meta_for(std::uint64_t payload_bytes, std::uint64_t counter
 
 /// A pattern that depends on both the seed and the offset, so a frame delivered
 /// from the wrong slot or truncated mid-payload does not accidentally match.
-inline void fill(const BulkSource::Lease &lease, std::uint64_t bytes, unsigned seed)
+inline void fill(const BulkPublisher::SlotHandle &lease, std::uint64_t bytes, unsigned seed)
 {
     auto *p = static_cast<unsigned char *>(lease.data());
     for(std::uint64_t i = 0; i < bytes; ++i)
@@ -148,17 +168,13 @@ inline bool payload_matches(const FrameView &view, unsigned seed)
 
 inline PublishResult publish_one(BulkPublisher &publisher, std::uint64_t bytes, unsigned seed)
 {
-    BulkSource::Lease lease = publisher.source().try_acquire();
+    BulkPublisher::SlotHandle lease = publisher.try_acquire();
     REQUIRE(lease);
     fill(lease, bytes, seed);
     return publisher.publish(std::move(lease), meta_for(bytes, seed));
 }
 
-/// Poll until `want` frames have been delivered, or the budget runs out.
-///
-/// The returned views are *retained*, which means their credits are withheld.
-/// That is the point in most cases; where it is not, the caller clears them.
-inline std::vector<FrameView> collect(detail::SubscriberEngine &subscriber,
+inline std::vector<FrameView> collect(Subscription &subscription,
                                       std::size_t want,
                                       std::chrono::milliseconds budget = 5s)
 {
@@ -167,38 +183,24 @@ inline std::vector<FrameView> collect(detail::SubscriberEngine &subscriber,
 
     while(views.size() < want && std::chrono::steady_clock::now() < deadline)
     {
-        subscriber.poll(10ms, [&views](FrameView view) { views.push_back(std::move(view)); });
+        drain(subscription, 10ms, [&views](FrameView view) { views.push_back(std::move(view)); });
     }
 
     return views;
 }
 
-/// One publisher and one subscriber, opened and armed, in this process.
+/// One publisher and one Pull Subscription, established through the real UCX
+/// transport and closed by Subscription destruction.
 struct Slice
 {
     BulkPublisher publisher;
-    detail::SubscriberEngine subscriber;
+    std::unique_ptr<Subscription> subscription;
 
     explicit Slice(PublisherConfig pub = publisher_config(),
                    SubscriberConfig sub = subscriber_config()) :
         publisher(std::move(pub)),
-        subscriber(std::move(sub))
+        subscription(open_subscription(publisher, std::move(sub)))
     {
-        open_session(publisher, subscriber);
-    }
-
-    /// Close the session before either side is destroyed.
-    ///
-    /// Not tidiness.  Members die in reverse declaration order, so without this
-    /// the subscriber's worker and receive ring would go away while the
-    /// publisher still had frames in flight to them.  `Close` runs 4.2's
-    /// teardown in its mandated order: stop submitting, drain outstanding
-    /// operations, close the endpoint, and only then release the slots those
-    /// operations were reading from.
-    ~Slice()
-    {
-        const std::vector<std::byte> request = subscriber.make_close_request(2);
-        publisher.handle_coordination(request.data(), request.size());
     }
 
     Slice(const Slice &) = delete;

@@ -11,9 +11,9 @@
 
 #include <core/bounded_queue.h>
 #include <core/credit_window.h>
+#include <core/delivery_queue.h>
 #include <core/lease_pool.h>
 #include <core/receive_slot.h>
-#include <core/session_client.h>
 #include <core/subscriber_transport.h>
 
 #include <tango-bulk/protocol.h>
@@ -25,20 +25,9 @@
 #include <thread>
 #include <vector>
 
-/// The receiving half of the transport, below `BulkSubscriber`.
-///
-/// This is deliberately **not** `BulkSubscriber`.  2.4 gives that class a
-/// `Tango::DeviceProxy &` constructor parameter, and 1.1 forbids `src/ucx/` from
-/// seeing `tango/*`; docs/EXTRACTION.md deviation 2 resolves the pair by putting
-/// the transport engine in this layer and `BulkSubscriber` in the Tango layer,
-/// meeting at an interface.  This is that engine, and the interface it meets is
-/// `detail::SubscriberTransport` in `core/subscriber_transport.h`.
-///
-/// M4 built the other half: `BulkSubscriber` in `src/tango/proxy_client.cpp` is
-/// a shell over this class, reached through that interface and constructed
-/// through `make_subscriber_transport()`.  The UCX tests keep driving the
-/// coordination bytes by hand -- which is what 9.3 asks for, and what keeps this
-/// layer testable on a machine with no Tango database.
+/// The UCX receive engine behind the internal SubscriberTransport seam.
+/// Coordination remains outside this layer, so the engine can be tested with
+/// protocol bytes without a Tango device proxy.
 namespace TangoBulk::detail
 {
 
@@ -126,65 +115,23 @@ class ReceiveArena : public CreditSink
 class SubscriberEngine final : public SubscriberTransport
 {
   public:
-    explicit SubscriberEngine(SubscriberConfig config);
+    SubscriberEngine(SubscriberConfig config, std::shared_ptr<DeliveryIngress> delivery);
     ~SubscriberEngine() override;
 
-    /// Encoded `Open`, to be carried to the publisher by whatever the caller
-    /// has -- a Tango command from `BulkSubscriber`, a direct
-    /// `handle_coordination` call in the tests here.
-    ///
-    /// By the time this returns, the receive ring is allocated, registered and
-    /// armed: 4.1's `Opening` entry action, in that order, because the publisher
-    /// may send the first frame the instant it replies.
-    std::vector<std::byte> make_open_request(std::uint64_t correlation_id) const override;
-
-    /// Adopt an `OpenReply`: stream id, granted geometry, endpoint to the
-    /// server.  Starts the engine thread and leaves the state in `Probing`; the
-    /// publisher's `Probe` moves it to `Active` (4.1).
-    Status adopt_open_reply(const std::byte *data, std::size_t size) override;
-
-    /// 3.7's lease renewal, as a pair of byte-level steps.
-    ///
-    /// There is no renew *timer* here.  5.1 puts one on the subscriber's control
-    /// thread, and that thread's other job is calling `DeviceProxy` -- so the
-    /// timer lives with the proxy, in `BulkSubscriber`, and this layer exposes
-    /// the two ends exactly as it does for `Open` and `Close`.
-    std::vector<std::byte> make_renew_request(std::uint64_t correlation_id) override;
-
-    /// Adopt a `RenewReply`.  `SessionExpired` and `UnknownSession` are terminal
-    /// for this session (3.7: "There is no resurrection"); the state goes to
-    /// `Failed` and the caller must open a new one.
-    Status adopt_renew_reply(const std::byte *data, std::size_t size) override;
-
-    std::vector<std::byte> make_close_request(std::uint64_t correlation_id) const override;
-
-    /// The lease terms the server granted, as they stand after the last reply.
-    /// M4's renew timer reads these; 3.7 lets the server change them at any
-    /// renewal and requires the client to adopt the new values.
-    std::uint32_t lease_ttl_ms() const noexcept override
+    const std::vector<std::byte> &local_address() const noexcept override
     {
-        return session_.lease_ttl_ms();
+        return worker_->address();
     }
 
-    std::uint32_t renew_interval_ms() const noexcept override
-    {
-        return session_.renew_interval_ms();
-    }
+    Status activate(Protocol::StreamId stream_id,
+                    const Protocol::GeometryBlock &granted,
+                    const std::vector<std::byte> &server_address) override;
 
-    /// Invokes `cb` on the CALLING thread and returns how many frames it
-    /// dispatched.  Which thread that is belongs to the layer above: a test
-    /// calls this directly, and `BulkSubscriber` calls it from its dispatch
-    /// thread.  Either way it is never the engine thread (5.2).
-    std::size_t poll(std::chrono::milliseconds timeout, const FrameCallback &cb) override;
+    BulkError last_error() const noexcept override;
 
     SubscriberState state() const noexcept override
     {
         return state_.load(std::memory_order_acquire);
-    }
-
-    std::uint32_t generation() const noexcept override
-    {
-        return session_.generation();
     }
 
     SubscriberCounters counters() const noexcept override;
@@ -206,7 +153,7 @@ class SubscriberEngine final : public SubscriberTransport
 
     std::uint32_t granted_ring_depth() const noexcept
     {
-        return session_.granted_ring_depth();
+        return granted_.ring_depth;
     }
 
     std::uint64_t bytes_copied() const noexcept
@@ -273,6 +220,8 @@ class SubscriberEngine final : public SubscriberTransport
 
     void commit(std::size_t slot_index) noexcept;
 
+    void fail(Status status, const char *reason) noexcept;
+
     SubscriberConfig config_;
     std::shared_ptr<UcxContext> context_;
     std::unique_ptr<UcxWorker> worker_;
@@ -280,7 +229,8 @@ class SubscriberEngine final : public SubscriberTransport
     std::shared_ptr<CreditSink> sink_; ///< arena_, as the leases see it
 
     ReleaseTracker tracker_;
-    BoundedQueue<FrameView> delivery_;
+
+    std::shared_ptr<DeliveryIngress> delivery_;
 
     std::vector<Pending> pending_; ///< engine thread only; indexed by slot
 
@@ -312,30 +262,26 @@ class SubscriberEngine final : public SubscriberTransport
     std::atomic<bool> quiesced_{false};
     std::atomic<SubscriberState> state_{SubscriberState::Closed};
 
+    std::atomic<const char *> failure_reason_{nullptr};
+    std::atomic<Status> failure_status_{Status::Ok};
+
     ucp_ep_h endpoint_{nullptr};
 
-    /// Identifiers, granted geometry and lease terms -- everything `Open` and
-    /// `Renew` settle.  Written by the thread that adopts a reply, and read on
-    /// the data path afterwards; the engine thread does not exist until
-    /// `adopt_open_reply` starts it, which is what publishes those writes.
-    SessionClient session_;
+    Protocol::StreamId stream_id_{0};
+    Protocol::GeometryBlock granted_{};
 
     /// Where this subscriber's ring, NIC and engine landed.  Engine thread
     /// writes it when the probe is answered; read for diagnostics only.
     Locality locality_;
 
-    std::atomic<std::uint64_t> renewals_sent_{0};
-    std::atomic<std::uint64_t> renewals_failed_{0};
 
     std::atomic<std::uint64_t> frames_received_{0};
-    std::atomic<std::uint64_t> frames_delivered_{0};
-    std::atomic<std::uint64_t> dropped_queue_full_{0};
     std::atomic<std::uint64_t> dropped_bad_header_{0};
     std::atomic<std::uint64_t> dropped_oversize_{0};
     std::atomic<std::uint64_t> dropped_stale_epoch_{0};
     std::atomic<std::uint64_t> dropped_duplicate_seq_{0};
+    std::atomic<std::uint64_t> dropped_geometry_mismatch_{0};
     std::atomic<std::uint64_t> credit_messages_sent_{0};
-    std::atomic<std::uint64_t> delivery_high_water_{0};
     std::atomic<std::uint64_t> transport_errors_{0};
     std::atomic<std::uint64_t> bytes_copied_{0};
 };

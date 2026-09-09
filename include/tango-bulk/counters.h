@@ -57,6 +57,8 @@ struct SubscriberCounters
     std::uint64_t frames_dropped_bad_header{0};
     std::uint64_t frames_dropped_oversize{0};
     std::uint64_t frames_dropped_duplicate_seq{0};
+
+    std::uint64_t frames_dropped_geometry_mismatch{0};
     std::uint64_t credits_returned{0};
     std::uint64_t credit_messages_sent{0};
     std::uint64_t views_outstanding{0};    ///< gauge

@@ -111,7 +111,7 @@ Server:
 - provide reusable ordinary-command implementations/codecs for `BulkOpen`, `BulkRenew`, and
   `BulkClose`;
 - provide a small registration helper suitable for a normal device class;
-- expose optional `BulkQuery` status and a separate low-rate preview attribute example;
+- expose `PublisherSnapshot` through a separate low-rate preview attribute example;
 - source `FrameMetadata` directly from device state and the acquired lease;
 - never construct `AttributeValue_5` or call `push_change_event()` on the bulk-only path.
 

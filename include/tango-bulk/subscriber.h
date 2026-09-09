@@ -8,34 +8,17 @@
 #include <tango-bulk/counters.h>
 #include <tango-bulk/errors.h>
 #include <tango-bulk/frame.h>
-#include <tango-bulk/limits.h>
-#include <tango-bulk/publisher.h> // DropPolicy
+#include <tango-bulk/geometry.h>
 
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
-
-// Forward declaration, deliberately not an include.
-//
-// BulkSubscriber names a Tango type in its constructor, but this header is
-// consumed by translation units in the UCX layer, which MUST NOT see tango/*
-// (IMPLEMENTATION_SPEC.md 1.1).  A forward declaration is enough for a
-// reference parameter and keeps the header on the clean side of the boundary.
-namespace Tango
-{
-class DeviceProxy;
-} // namespace Tango
 
 namespace TangoBulk
 {
-
-/// Declared in <tango-bulk/tango.h>, which this header deliberately does not
-/// include.  A forward declaration is all `set_command_names()` needs, and it
-/// keeps the Tango-only knob out of the header the UCX layer compiles.
-struct CommandNames;
 
 enum class SubscriberState : std::uint32_t
 {
@@ -49,17 +32,54 @@ enum class SubscriberState : std::uint32_t
 
 const char *to_string(SubscriberState state) noexcept;
 
+/// The receive dimensions selected for a subscription.
+///
+/// A value supplied in SubscriberConfig is a complete upper limit. A value
+/// returned by Subscription::plan() is the actual grant-backed plan. In both
+/// cases the byte count is derived here so every storage adapter shares one
+/// interpretation of the ring.
+struct ReceivePlan
+{
+    std::uint64_t max_frame_bytes{0};
+    std::uint32_t ring_depth{0};
+    std::uint32_t credit_window{0};
+    std::uint64_t pinned_bytes{0};
+
+    Status validate() const noexcept;
+
+    static ReceivePlan from_limits(std::uint64_t max_frame_bytes,
+                                   std::uint32_t ring_depth,
+                                   std::uint32_t credit_window) noexcept;
+
+    static ReceivePlan intersect(const ReceivePlan &upper,
+                                 const Geometry &grant) noexcept;
+
+    static ReceivePlan intersect(const ReceivePlan &upper,
+                                 const ReceivePlan &grant) noexcept;
+
+    static ReceivePlan intersect(const ReceivePlan &upper,
+                                 const StreamOffer &offer) noexcept;
+
+    static ReceivePlan derive(const Geometry &geometry,
+                              std::uint64_t pinned_memory_limit_bytes) noexcept;
+
+    static ReceivePlan derive(const StreamOffer &offer,
+                              std::uint64_t pinned_memory_limit_bytes) noexcept;
+};
+
+bool operator==(const ReceivePlan &left, const ReceivePlan &right) noexcept;
+bool operator!=(const ReceivePlan &left, const ReceivePlan &right) noexcept;
+
 enum class DeliveryMode : std::uint32_t
 {
-    DispatchThread = 0, ///< library-owned thread invokes the callback (default)
-    Manual = 1,         ///< application calls poll(); no dispatch thread created
+    Push = 0, ///< a dedicated library thread invokes the callback (default)
+    Pull = 1, ///< the application claims frames with Subscription::read_for()
 };
 
 enum class ReconnectPolicy : std::uint32_t
 {
     FailFast = 0,
     BoundedRetry = 1,
-    Manual = 2,
 };
 
 struct SubscriberConfig
@@ -69,12 +89,23 @@ struct SubscriberConfig
     std::uint32_t ring_depth{32};
     std::uint32_t credit_window{16};
     std::uint32_t delivery_queue_depth{64};
-    DeliveryMode delivery_mode{DeliveryMode::DispatchThread};
+    DeliveryMode delivery_mode{DeliveryMode::Push};
     DropPolicy drop_policy{DropPolicy::DropNewest};
     ReconnectPolicy reconnect_policy{ReconnectPolicy::BoundedRetry};
     std::uint32_t reconnect_max_attempts{10};
     std::uint32_t reconnect_backoff_ms{500}; ///< exponential, capped at lease TTL
-    std::uint32_t command_timeout_ms{5'000};
+    std::uint32_t command_timeout_ms{5'000}; ///< one Tango command round trip
+    std::uint32_t establishment_timeout_ms{30'000}; ///< total initial subscribe budget
+
+    /// How long to wait for the publisher's `Probe` after `Open` is granted.
+    ///
+    /// Split from `command_timeout_ms`, which it used to share: one bounds a
+    /// Tango call, the other bounds a UCX round trip that the publisher
+    /// initiates, and they are only alike in having had the same default. A
+    /// client whose UCX endpoint the publisher cannot reach spends this budget
+    /// once per reconnect attempt before it is told, so lowering it is what
+    /// makes an unreachable fabric quick to diagnose rather than slow.
+    std::uint32_t probe_timeout_ms{5'000};
     std::uint64_t pinned_memory_limit_bytes{1ull << 30};
     std::string ucx_tls;
     int engine_cpu_affinity{-1};
@@ -88,47 +119,21 @@ struct SubscriberConfig
     std::uint64_t receive_buffer_bytes{0};
     MemoryKind receive_memory_kind{MemoryKind::Host};
 
+    /// Optional complete upper plan. When present it replaces the individual
+    /// sizing fields for preparation and Open, and is still intersected with
+    /// discovery and the pinned budget.
+    std::optional<ReceivePlan> receive_plan;
+
+    /// Optional conservative pre-Open discovery. The offer is only used to
+    /// choose a safe upper request; OpenReply remains authoritative for the
+    /// actual geometry and lease.
+    std::optional<StreamOffer> discovery_offer;
+
+    ReceivePlan upper_receive_plan() const noexcept;
     Status validate() const noexcept;
 };
 
 using FrameCallback = std::function<void(FrameView)>;
-using StateCallback = std::function<void(SubscriberState, const BulkError &)>;
-
-class BulkSubscriber
-{
-  public:
-    /// `proxy` is BORROWED.  The caller MUST keep it alive until the subscriber
-    /// is destroyed.  The subscriber never takes a Tango lock and never calls
-    /// the proxy from the engine or dispatch thread.
-    BulkSubscriber(Tango::DeviceProxy &proxy, SubscriberConfig config);
-    ~BulkSubscriber();
-    BulkSubscriber(const BulkSubscriber &) = delete;
-    BulkSubscriber &operator=(const BulkSubscriber &) = delete;
-
-    /// Both MUST be called before start().
-    void set_frame_callback(FrameCallback cb);
-    void set_state_callback(StateCallback cb);
-
-    void start();         ///< throws BulkException on open failure under FailFast
-    void stop() noexcept; ///< idempotent; sends BulkClose best-effort, joins threads
-
-    /// Manual mode only.  Returns the number of frames dispatched, invoking the
-    /// frame callback on the CALLING thread.  Throws if delivery_mode != Manual.
-    std::size_t poll(std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
-
-    SubscriberState state() const noexcept;
-    std::uint32_t generation() const noexcept;
-    SubscriberCounters counters() const noexcept;
-
-  private:
-    /// The one thing outside this class that reaches into it: the command-name
-    /// override, which is a Tango concept and so is declared in
-    /// <tango-bulk/tango.h> and defined next to this class's implementation.
-    friend void set_command_names(BulkSubscriber &subscriber, const CommandNames &names);
-
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
 
 } // namespace TangoBulk
 

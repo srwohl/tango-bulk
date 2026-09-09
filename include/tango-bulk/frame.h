@@ -48,12 +48,6 @@ enum class Endian : std::uint32_t
 };
 
 /// What to discard when a bounded queue or ring is full.
-///
-/// IMPLEMENTATION_SPEC.md declares this in publisher.h.  It lives here with the
-/// other vocabulary types because the coordination plane carries it in `Open`,
-/// so protocol.h needs it too, and protocol.h has no business including the
-/// publisher API.  The declaration a consumer sees is unchanged: publisher.h and
-/// subscriber.h both include this header.
 enum class DropPolicy : std::uint32_t
 {
     DropNewest = 0, ///< reject the frame being published (producer default)
@@ -102,9 +96,13 @@ struct FrameMetadata
     Status validate(std::uint64_t max_frame_bytes) const noexcept;
 };
 
+bool describes_same_array(const FrameMetadata &a, const FrameMetadata &b) noexcept;
+
 namespace detail
 {
 class ReceiveSlotLease;
+struct FrameFields;
+class DetachedFrameFactory;
 } // namespace detail
 
 /// Read-only, reference-counted view of one delivered frame.
@@ -151,78 +149,17 @@ class FrameView
     long use_count() const noexcept; ///< diagnostics/tests only
     void reset() noexcept;           ///< release early; returns the credit
 
-    /// POD carried by value inside the receive slot.  Public so the receive
-    /// path can populate one; there is no reason for it to be otherwise, and
-    /// hiding it would only force a friend declaration per implementation file.
-    struct Fields
-    {
-        std::array<std::uint64_t, k_max_rank> shape{};
-        std::array<std::uint64_t, k_max_rank> strides{};
-        std::uint64_t sequence{0};
-        std::uint64_t event_counter{0};
-        std::uint64_t timestamp_ns{0};
-        std::uint64_t dropped_before{0};
-        std::uint64_t payload_bytes{0};
-        ElementType element_type{ElementType::Unknown};
-        std::uint32_t element_size{0};
-        std::uint32_t rank{0};
-        std::uint32_t quality{0};
-        std::uint32_t generation{0};
-        MemoryKind memory_kind{MemoryKind::Host};
-        Endian endian{Endian::Little};
-    };
-
-    /// A view over caller-owned memory that references no receive slot.
-    ///
-    /// Every other FrameView comes out of the receive path, whose constructor is
-    /// private -- which left an application unable to build one at all, and so
-    /// unable to unit-test any function that takes a FrameView.  Since the
-    /// callback signature is `void(FrameView)`, that is most of what an
-    /// application writes against this library: the geometry checks, the
-    /// retention policy, the fan-out to a consumer.  Those were testable only
-    /// against a live publisher, which is not a unit test and does not run in
-    /// CI.  This factory is the fix.
-    ///
-    /// The view it returns is observationally identical to a delivered one.  It
-    /// holds a real lease, so `operator bool` is true, `use_count()` counts
-    /// copies, and `reset()` drops the reference -- the credit simply goes to a
-    /// sink that discards it.  That equivalence is the point: it is what makes
-    /// "does my code hold the view longer than it should?" a question a test can
-    /// ask, and holding a view too long is the mistake this API is easiest to
-    /// make.
-    ///
-    /// `owner` shares ownership of whatever keeps `data` alive and may be null
-    /// when the caller guarantees that lifetime by other means.  `data` is not
-    /// dereferenced here and may point at device memory.  `fields` is copied,
-    /// so the caller need not keep it alive; note that `size()` reports
-    /// `fields.payload_bytes` and nothing cross-checks it against the
-    /// allocation behind `data`.
-    ///
-    ///     const auto pixels = std::make_shared<std::vector<std::uint16_t>>(w * h);
-    ///     FrameView::Fields fields;
-    ///     fields.rank = 2;
-    ///     fields.shape = {h, w, 0, 0};
-    ///     fields.strides = {w * 2, 2, 0, 0};
-    ///     fields.element_type = ElementType::UInt16;
-    ///     fields.element_size = 2;
-    ///     fields.payload_bytes = w * h * 2;
-    ///
-    ///     const FrameView frame = FrameView::detached(
-    ///         pixels, reinterpret_cast<const std::byte *>(pixels->data()), fields);
-    static FrameView detached(std::shared_ptr<const void> owner,
-                              const std::byte *data,
-                              const Fields &fields);
-
   private:
     friend class detail::ReceiveSlotLease;
+    friend class detail::DetachedFrameFactory;
 
     FrameView(std::shared_ptr<detail::ReceiveSlotLease> lease,
               const std::byte *data,
-              const Fields *fields) noexcept;
+              const detail::FrameFields *fields) noexcept;
 
     std::shared_ptr<detail::ReceiveSlotLease> lease_;
     const std::byte *data_{nullptr};
-    const Fields *fields_{nullptr};
+    const detail::FrameFields *fields_{nullptr};
 };
 
 } // namespace TangoBulk

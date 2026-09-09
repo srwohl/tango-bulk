@@ -7,7 +7,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 # benchmarks
 
 `tango-bulk-bench` moves frames between two processes using the same
-`BulkPublisher` and `SubscriberEngine` a device server links. Nothing in the data
+`BulkPublisher` and `Subscription` a device server links. Nothing in the data
 path is reimplemented for the benchmark's convenience, which is the property that
 makes a number from it worth recording.
 
@@ -72,7 +72,7 @@ to any verification claim, so it is wired in here from the start.
 ## Coordination
 
 `oob.h` is a length-prefixed blob channel over TCP, standing in for a Tango
-command. `handle_coordination()` takes encoded bytes and returns encoded bytes,
+command. The internal coordination adapter takes encoded bytes and returns encoded bytes,
 which is the whole of §7.1's contract, so this is what the M4 adapter will do over
 a `DevVarCharArray`. It is deliberately not a transport: no framing beyond a u32
 length, no retries, no concurrency.

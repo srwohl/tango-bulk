@@ -85,7 +85,7 @@ struct Locality
     /// What this placement amounts to.  `Split` is the one worth acting on.
     Placement placement() const noexcept;
 
-    /// One line, safe to log and safe to put in `QueryReply.counters`.
+    /// One line, safe to log as an operator diagnostic.
     ///
     /// 3.8 forbids that blob from carrying addresses, memory keys or session
     /// identifiers; a device name and a node number are none of those.
@@ -105,8 +105,8 @@ Locality observe(ucp_ep_h endpoint, const void *ring) noexcept;
 ///
 /// Rate-limited because it is called per session and a fan-out publisher would
 /// otherwise repeat itself; the incoherent case is what matters and it is
-/// reported the first time it appears. Matches how `PinnedBudget::check_memlock`
-/// warns, for want of a logger this library is not going to invent.
+/// reported the first time it appears. Matches how RegisteredMemory's pinned
+/// ledger check warns, for want of a logger this library is not going to invent.
 void report(const Locality &locality, const char *origin) noexcept;
 
 } // namespace TangoBulk::detail

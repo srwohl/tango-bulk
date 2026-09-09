@@ -3,13 +3,16 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include <ucx/locality.h>
+#include <ucx/producer_slots.h>
 #include <ucx/registered_ring.h>
 #include <ucx/ucx_context.h>
 
 #include <core/bounded_queue.h>
+#include <core/byte_order.h>
 #include <core/cpu_topology.h>
 #include <core/credit_window.h>
-#include <core/lease_pool.h>
+#include <core/geometry_conversion.h>
+#include <core/publisher_internal.h>
 
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/publisher.h>
@@ -24,7 +27,10 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
+#include <type_traits>
+#include <variant>
 #include <vector>
 
 /// The publisher: registered producer ring, engine thread, and the session
@@ -49,25 +55,45 @@ using detail::BoundedQueue;
 using detail::CreditWindow;
 using detail::Locality;
 using detail::observe;
-using detail::LeasePool;
+using detail::ProducerSlots;
 using detail::RegisteredRing;
 using detail::UcxContext;
 using detail::UcxWorker;
 using Protocol::SessionState;
 
-/// Blocks for `Lease::Impl`, so `try_acquire()` does not malloc.
-///
-/// 2.3 fixes `Lease` as a pimpl over `std::unique_ptr<Impl>` and 2.1 forbids the
-/// data path from allocating.  A class-level `operator new` is the language's
-/// answer to exactly that: the declared type stays what the spec says it is, and
-/// the storage comes from somewhere bounded.
-///
-/// Sized for many rings at the maximum depth; the fallback to the global
-/// allocator is a safety net that is counted, not a design assumption.
-LeasePool &lease_impl_pool()
+/// Typed coordination values deliberately carry no envelope or correlation.
+/// The encoded adapter recovers those at the ingress boundary; the publisher
+/// only decides what a request means and returns one typed outcome.
+using CoordinationRequest =
+    std::variant<Protocol::OpenRequest,
+                 Protocol::RenewRequest,
+                 Protocol::CloseRequest>;
+using CoordinationReply =
+    std::variant<Protocol::OpenReply,
+                 Protocol::RenewReply,
+                 Protocol::CloseReply,
+                 Protocol::ErrorMessage>;
+
+template <typename Message>
+CoordinationReply typed_reply(Message message)
 {
-    static LeasePool pool{4096};
-    return pool;
+    return CoordinationReply{std::move(message)};
+}
+
+/// The protocol decoder can reject an envelope after its correlation field is
+/// readable. Preserve that field for failure replies; zero is reserved for
+/// inputs too short to contain the complete correlation value.
+std::uint64_t recover_coordination_correlation(const std::byte *data,
+                                               std::size_t size) noexcept
+{
+    constexpr std::size_t correlation_offset = 16;
+    constexpr std::size_t correlation_bytes = sizeof(std::uint64_t);
+    if(data == nullptr || size < correlation_offset + correlation_bytes)
+    {
+        return 0;
+    }
+
+    return wire::get64(data + correlation_offset);
 }
 
 std::uint64_t now_realtime_ns() noexcept
@@ -112,7 +138,6 @@ struct AtomicPublisherCounters
     std::atomic<std::uint64_t> dropped_credit_stalled{0};
     std::atomic<std::uint64_t> dropped_bad_metadata{0};
     std::atomic<std::uint64_t> acquire_failed{0};
-    std::atomic<std::uint64_t> leases_retained{0};
     std::atomic<std::uint64_t> credits_outstanding{0};
     std::atomic<std::uint64_t> publish_queue_depth{0};
     std::atomic<std::uint64_t> publish_queue_high_water{0};
@@ -148,180 +173,68 @@ void await_request(ucp_worker_h worker, void *request) noexcept
 } // namespace
 
 // ---------------------------------------------------------------------------
-// BulkSource
 // ---------------------------------------------------------------------------
 
-struct BulkSource::Lease::Impl
+BulkPublisher::SlotHandle::SlotHandle() noexcept = default;
+
+BulkPublisher::SlotHandle::SlotHandle(SlotHandle &&other) noexcept :
+    slots_(std::move(other.slots_)),
+    data_(other.data_),
+    capacity_(other.capacity_),
+    index_(other.index_)
 {
-    static void *operator new(std::size_t bytes)
-    {
-        if(void *p = lease_impl_pool().allocate(bytes))
-        {
-            return p;
-        }
-        return ::operator new(bytes);
-    }
+    other.data_ = nullptr;
+    other.capacity_ = 0;
+    other.index_ = 0;
+}
 
-    static void operator delete(void *p) noexcept
-    {
-        if(lease_impl_pool().owns(p))
-        {
-            lease_impl_pool().deallocate(p);
-            return;
-        }
-        ::operator delete(p);
-    }
-
-    BulkSource::Impl *owner{nullptr};
-    std::size_t index{0};
-    std::byte *data{nullptr};
-    std::size_t capacity{0};
-};
-
-struct BulkSource::Impl
-{
-    Impl(RegisteredRing &ring_in, AtomicPublisherCounters &counters_in) :
-        ring(&ring_in),
-        counters(&counters_in),
-        free_slots(ring_in.depth())
-    {
-        for(std::size_t i = 0; i < ring_in.depth(); ++i)
-        {
-            auto index = static_cast<std::uint32_t>(i);
-            free_slots.try_push(std::move(index));
-        }
-    }
-
-    /// Return a slot to the free list.
-    ///
-    /// Called from three places, and it matters which: an unpublished lease
-    /// being destroyed, a publish() that dropped the frame, and the engine
-    /// dropping the last session reference to a slot.  All three are the same
-    /// operation, and 5.4 is the rule about *when* each is allowed to happen --
-    /// not about doing anything different once it does.
-    void release(std::size_t index) noexcept
-    {
-        auto value = static_cast<std::uint32_t>(index);
-        const bool pushed = free_slots.try_push(std::move(value));
-        // The free list is exactly ring_depth deep and a slot is in it or in a
-        // lease, never both.  A failure here means a slot was released twice,
-        // which would go on to corrupt a frame in flight.
-        (void) pushed;
-        assert(pushed);
-        retained.fetch_sub(1, std::memory_order_relaxed);
-        counters->leases_retained.store(retained.load(std::memory_order_relaxed),
-                                        std::memory_order_relaxed);
-    }
-
-    RegisteredRing *ring{nullptr};
-    AtomicPublisherCounters *counters{nullptr};
-    BoundedQueue<std::uint32_t> free_slots;
-    std::atomic<std::uint64_t> retained{0};
-};
-
-BulkSource::BulkSource() = default;
-BulkSource::~BulkSource() = default;
-
-BulkSource::Lease::Lease() noexcept = default;
-BulkSource::Lease::Lease(Lease &&) noexcept = default;
-BulkSource::Lease &BulkSource::Lease::operator=(Lease &&other) noexcept
+BulkPublisher::SlotHandle &BulkPublisher::SlotHandle::operator=(SlotHandle &&other) noexcept
 {
     if(this != &other)
     {
         reset();
-        impl_ = std::move(other.impl_);
+        slots_ = std::move(other.slots_);
+        data_ = other.data_;
+        capacity_ = other.capacity_;
+        index_ = other.index_;
+        other.data_ = nullptr;
+        other.capacity_ = 0;
+        other.index_ = 0;
     }
     return *this;
 }
 
-BulkSource::Lease::~Lease()
+BulkPublisher::SlotHandle::~SlotHandle()
 {
     reset();
 }
 
-void BulkSource::Lease::reset() noexcept
+void BulkPublisher::SlotHandle::reset() noexcept
 {
-    // 5.4: "A lease that is destroyed without being published returns its slot
-    // immediately."  Publishing moves the Impl out, so by the time this runs on
-    // a published lease there is nothing left to return.
-    if(impl_ && impl_->owner != nullptr)
+    if(slots_)
     {
-        impl_->owner->release(impl_->index);
-    }
-    impl_.reset();
-}
-
-BulkSource::Lease::operator bool() const noexcept
-{
-    return impl_ != nullptr;
-}
-
-void *BulkSource::Lease::data() const noexcept
-{
-    return impl_ ? static_cast<void *>(impl_->data) : nullptr;
-}
-
-std::size_t BulkSource::Lease::capacity() const noexcept
-{
-    return impl_ ? impl_->capacity : 0;
-}
-
-std::size_t BulkSource::Lease::index() const noexcept
-{
-    return impl_ ? impl_->index : 0;
-}
-
-MemoryKind BulkSource::Lease::memory_kind() const noexcept
-{
-    // Host only in the MVP.  Cuda/Rocm are in the protocol so the field does not
-    // have to be retrofitted later (spec section 10), not because they work.
-    return MemoryKind::Host;
-}
-
-BulkSource::Lease BulkSource::try_acquire() noexcept
-{
-    Lease lease;
-
-    std::uint32_t index = 0;
-    if(!impl_->free_slots.try_pop(index))
-    {
-        // 5.3: never blocks.  An acquisition thread must be able to drop rather
-        // than wait while slots are retained by a slow or dead consumer -- a
-        // detector does not stop producing because a client stopped reading.
-        impl_->counters->acquire_failed.fetch_add(1, std::memory_order_relaxed);
-        return lease;
+        slots_->release(index_);
+        slots_.reset();
     }
 
-    lease.impl_ = std::unique_ptr<Lease::Impl>(new Lease::Impl);
-    lease.impl_->owner = impl_.get();
-    lease.impl_->index = index;
-    lease.impl_->data = impl_->ring->slot(index);
-    lease.impl_->capacity = impl_->ring->slot_bytes();
-
-    const std::uint64_t held = impl_->retained.fetch_add(1, std::memory_order_relaxed) + 1;
-    impl_->counters->leases_retained.store(held, std::memory_order_relaxed);
-
-    return lease;
+    data_ = nullptr;
+    capacity_ = 0;
+    index_ = 0;
 }
 
-std::size_t BulkSource::slot_count() const noexcept
+BulkPublisher::SlotHandle::operator bool() const noexcept
 {
-    return impl_->ring->depth();
+    return static_cast<bool>(slots_);
 }
 
-std::size_t BulkSource::slot_bytes() const noexcept
+void *BulkPublisher::SlotHandle::data() const noexcept
 {
-    return impl_->ring->slot_bytes();
+    return data_;
 }
 
-std::size_t BulkSource::slot_stride() const noexcept
+std::size_t BulkPublisher::SlotHandle::capacity() const noexcept
 {
-    return impl_->ring->stride();
-}
-
-std::size_t BulkSource::retained() const noexcept
-{
-    return static_cast<std::size_t>(impl_->retained.load(std::memory_order_relaxed));
+    return capacity_;
 }
 
 // ---------------------------------------------------------------------------
@@ -417,11 +330,13 @@ struct BulkPublisher::Impl
         std::uint64_t dropped_for_session{0};
         std::uint64_t processed_ordinal{0};
         std::size_t sends_inflight{0};
+        std::atomic<std::uint64_t> observed_lag_frames{0};
     };
 
     /// Endpoint creation is a `ucp_*` call, so it belongs to the engine thread
-    /// (5.1).  `handle_coordination` runs on the caller's thread -- a Tango
-    /// command thread in production -- and therefore asks rather than acts.
+    /// (5.1).  The encoded coordination adapter runs on the caller's thread --
+    /// a Tango command thread in production -- and therefore asks rather than
+    /// acts.
     struct ConnectTask
     {
         const std::byte *address{nullptr};
@@ -433,19 +348,17 @@ struct BulkPublisher::Impl
 
     explicit Impl(PublisherConfig cfg) :
         config(std::move(cfg)),
-        context(config.ucx_tls),
-        worker(std::make_unique<UcxWorker>(context)),
-        ring(context,
-             config.max_frame_bytes,
-             config.ring_depth,
-             config.pad_slot_stride,
-             config.pinned_memory_limit_bytes),
+        context(std::make_shared<UcxContext>(config.ucx_tls)),
+        worker(std::make_unique<UcxWorker>(*context)),
+        slots(std::make_shared<ProducerSlots>(context,
+                                              config.max_frame_bytes,
+                                              config.ring_depth,
+                                              config.pad_slot_stride,
+                                              config.pinned_memory_limit_bytes)),
         publish_queue(config.publish_queue_depth),
         slot_refs(config.ring_depth, 0)
     {
-        counters.pinned_bytes.store(ring.mapped_bytes(), std::memory_order_relaxed);
-
-        source.impl_ = std::make_unique<BulkSource::Impl>(ring, counters);
+        counters.pinned_bytes.store(slots->ring().mapped_bytes(), std::memory_order_relaxed);
 
         // 6.1 bounds sessions per publisher, so the table is allocated once here
         // and never grows.  `unique_ptr` because a Session holds atomics and so
@@ -764,7 +677,7 @@ struct BulkPublisher::Impl
         // never assigned a sequence, so an uncreditable hole in the window is
         // impossible rather than merely unlikely.
         const std::uint64_t sequence = session.window.next_sequence();
-        const auto index = static_cast<std::size_t>(sequence % ring.depth());
+        const auto index = static_cast<std::size_t>(sequence % slots->ring().depth());
 
         InFlight &slot = session.inflight[index];
         Protocol::FrameHeader header = item.header;
@@ -796,7 +709,7 @@ struct BulkPublisher::Impl
                                         Protocol::k_am_id_frame,
                                         slot.header.data(),
                                         slot.header.size(),
-                                        ring.slot(item.slot_index),
+                                        slots->ring().slot(item.slot_index),
                                         static_cast<std::size_t>(item.payload_bytes),
                                         &param);
 
@@ -850,7 +763,7 @@ struct BulkPublisher::Impl
         assert(slot_refs[slot_index] > 0);
         if(--slot_refs[slot_index] == 0)
         {
-            source.impl_->release(slot_index);
+            slots->release(slot_index);
         }
     }
 
@@ -949,7 +862,7 @@ struct BulkPublisher::Impl
 
         for(std::uint64_t seq = first; seq < first + outcome.released; ++seq)
         {
-            const InFlight &slot = session->inflight[static_cast<std::size_t>(seq % ring.depth())];
+            const InFlight &slot = session->inflight[static_cast<std::size_t>(seq % slots->ring().depth())];
             const std::size_t slot_index = slot.slot_index;
             const bool last = slot_refs[slot_index] == 1;
             release_slot_ref(slot_index);
@@ -1018,7 +931,7 @@ struct BulkPublisher::Impl
             // Armed is the first moment the endpoint has settled on a transport
             // and device, so it is the earliest this can be asked.  On the engine
             // thread, which is the only thread whose CPU is worth sampling.
-            locality = observe(session->ep, ring.memory().base());
+            locality = observe(session->ep, slots->ring().memory().base());
             detail::report(locality, "publisher");
         }
     }
@@ -1054,7 +967,7 @@ struct BulkPublisher::Impl
                     ? session.processed_ordinal
                     : session
                           .inflight[static_cast<std::size_t>(session.window.credited_end() %
-                                                             ring.depth())]
+                                                             slots->ring().depth())]
                           .ordinal;
             best = std::max(best, retired);
             worst = std::min(worst, retired);
@@ -1064,7 +977,9 @@ struct BulkPublisher::Impl
 
             // The laggard, not the last one to speak: under fan-out the useful
             // reading is how far behind the slowest consumer has fallen.
-            worst_outstanding = std::max(worst_outstanding, session.window.outstanding());
+            const std::uint64_t outstanding = session.window.outstanding();
+            session.observed_lag_frames.store(outstanding, std::memory_order_release);
+            worst_outstanding = std::max(worst_outstanding, outstanding);
         }
 
         const std::uint64_t admission_credit =
@@ -1197,7 +1112,7 @@ struct BulkPublisher::Impl
         const std::uint64_t to = session.window.next_sequence();
         for(std::uint64_t seq = from; seq < to; ++seq)
         {
-            const InFlight &slot = session.inflight[static_cast<std::size_t>(seq % ring.depth())];
+            const InFlight &slot = session.inflight[static_cast<std::size_t>(seq % slots->ring().depth())];
             release_slot_ref(slot.slot_index);
         }
 
@@ -1299,23 +1214,23 @@ struct BulkPublisher::Impl
         return nullptr;
     }
 
-    std::vector<std::byte> handle_open(const std::byte *data,
-                                       std::size_t size,
-                                       std::uint64_t correlation_id);
-    std::vector<std::byte> handle_renew(const std::byte *data,
-                                        std::size_t size,
-                                        std::uint64_t correlation_id);
-    std::vector<std::byte> handle_close(const std::byte *data,
-                                        std::size_t size,
-                                        std::uint64_t correlation_id);
-    std::vector<std::byte> handle_query(const std::byte *data,
-                                        std::size_t size,
-                                        std::uint64_t correlation_id);
+    /// The typed target.  Request classification and envelope handling stay
+    /// at the encoded boundary below; these handlers never see caller-owned
+    /// bytes or correlation identifiers.
+    CoordinationReply handle_coordination(const CoordinationRequest &request);
+
+    std::vector<std::byte> handle_encoded_coordination(
+        const std::byte *data,
+        std::size_t size,
+        std::optional<Protocol::CoordType> expected = std::nullopt) noexcept;
+
+    CoordinationReply handle_open(const Protocol::OpenRequest &request);
+    CoordinationReply handle_renew(const Protocol::RenewRequest &request);
+    CoordinationReply handle_close(const Protocol::CloseRequest &request);
 
     /// The geometry this publisher grants, at the current epoch.
     ///
-    /// `Open` clamps it downward per client (3.5 step 5); `Query` reports it
-    /// unclamped, because a server-wide question has no client to clamp to.
+    /// `Open` clamps it downward per client (3.5 step 5).
     Protocol::GeometryBlock current_geometry() const noexcept
     {
         Protocol::GeometryBlock geometry;
@@ -1332,13 +1247,13 @@ struct BulkPublisher::Impl
     }
 
     PublisherConfig config;
-    UcxContext context;
+    std::shared_ptr<UcxContext> context;
 
     /// By pointer so ~Impl can destroy it before any other member.
     std::unique_ptr<UcxWorker> worker;
-    RegisteredRing ring;
 
-    BulkSource source;
+    std::shared_ptr<ProducerSlots> slots;
+
     BoundedQueue<PublishItem> publish_queue;
 
     /// How many sessions still owe a credit for each producer slot.  Engine
@@ -1361,6 +1276,7 @@ struct BulkPublisher::Impl
     std::atomic<std::uint64_t> all_active_admission_limit{
         std::numeric_limits<std::uint64_t>::max()};
     std::atomic<std::uint64_t> dropped_before_all{0};
+    std::atomic_flag publish_reservation = ATOMIC_FLAG_INIT;
 
     /// Sessions a frame could go to.  A gauge rather than a walk of the table,
     /// because publish() reads it once per frame on an application thread.
@@ -1421,14 +1337,27 @@ BulkPublisher::~BulkPublisher() = default;
 BulkPublisher::BulkPublisher(BulkPublisher &&) noexcept = default;
 BulkPublisher &BulkPublisher::operator=(BulkPublisher &&) noexcept = default;
 
-BulkSource &BulkPublisher::source() noexcept
+BulkPublisher::SlotHandle BulkPublisher::try_acquire() noexcept
 {
-    return impl_->source;
+    SlotHandle handle;
+
+    std::uint32_t index = 0;
+    if(!impl_->slots->try_acquire(index))
+    {
+        impl_->counters.acquire_failed.fetch_add(1, std::memory_order_relaxed);
+        return handle;
+    }
+
+    handle.slots_ = impl_->slots;
+    handle.index_ = index;
+    handle.data_ = impl_->slots->ring().slot(index);
+    handle.capacity_ = impl_->slots->ring().slot_bytes();
+
+    return handle;
 }
 
-PublishResult BulkPublisher::publish(BulkSource::Lease &&lease, const FrameMetadata &meta) noexcept
+PublishResult BulkPublisher::publish(SlotHandle &&lease, const FrameMetadata &meta) noexcept
 {
-    // Every early return below either consumes the lease deliberately or leaves
     // it with the caller; 5.4 spells out which is which, and QueueFull is the
     // only one that gives it back.
     if(!lease)
@@ -1451,6 +1380,14 @@ PublishResult BulkPublisher::publish(BulkSource::Lease &&lease, const FrameMetad
         return PublishResult::BadMetadata;
     }
 
+    if(impl_->config.frame_metadata.rank > 0 &&
+       !describes_same_array(resolved, impl_->config.frame_metadata))
+    {
+        impl_->counters.dropped_bad_metadata.fetch_add(1, std::memory_order_relaxed);
+        lease.reset();
+        return PublishResult::BadMetadata;
+    }
+
     if(impl_->armed_sessions.load(std::memory_order_acquire) == 0)
     {
         // 4.2: arm-before-send.  A frame submitted to a session that is not
@@ -1460,6 +1397,25 @@ PublishResult BulkPublisher::publish(BulkSource::Lease &&lease, const FrameMetad
         lease.reset();
         return PublishResult::NoSession;
     }
+
+    // Queue reservation and ordinal assignment are one linearization point.
+    // A try-lock keeps publish nonblocking while preventing two application
+    // threads from assigning the same ordinal or observing the same admission
+    // headroom.
+    if(impl_->publish_reservation.test_and_set(std::memory_order_acquire))
+    {
+        impl_->counters.dropped_queue_full.fetch_add(1, std::memory_order_relaxed);
+        return PublishResult::QueueFull;
+    }
+
+    struct ReservationGuard
+    {
+        std::atomic_flag &flag;
+        ~ReservationGuard()
+        {
+            flag.clear(std::memory_order_release);
+        }
+    } reservation_guard{impl_->publish_reservation};
 
     const std::uint64_t admitted = impl_->admitted.load(std::memory_order_acquire);
     const std::uint64_t credited = impl_->credited.load(std::memory_order_acquire);
@@ -1481,7 +1437,7 @@ PublishResult BulkPublisher::publish(BulkSource::Lease &&lease, const FrameMetad
     }
 
     Impl::PublishItem item;
-    item.slot_index = lease.index();
+    item.slot_index = lease.index_;
     item.payload_bytes = resolved.payload_bytes;
     item.header.generation = impl_->generation;
     item.header.payload_bytes = resolved.payload_bytes;
@@ -1508,10 +1464,8 @@ PublishResult BulkPublisher::publish(BulkSource::Lease &&lease, const FrameMetad
         return PublishResult::QueueFull;
     }
 
-    // Past this point the publisher owns the slot.  Releasing the lease's Impl
-    // without returning the slot is what transfers it.
     impl_->admitted.fetch_add(1, std::memory_order_release);
-    lease.impl_->owner = nullptr;
+    lease.slots_.reset();
     lease.reset();
 
     const std::size_t depth = impl_->publish_queue.size();
@@ -1523,15 +1477,6 @@ PublishResult BulkPublisher::publish(BulkSource::Lease &&lease, const FrameMetad
     impl_->counters.frames_published.fetch_add(1, std::memory_order_relaxed);
 
     return PublishResult::Accepted;
-}
-
-Status BulkPublisher::declare_geometry(const FrameMetadata &, std::uint64_t, std::uint32_t)
-{
-    // 4.3's interlock is not something to approximate: it has to hold both rings
-    // registered, route by generation, and free the old ring only when both the
-    // ack has arrived and the old epoch has drained.  Returning a status beats a
-    // partial version.  M5 in MVP_PLAN.md is where it lands.
-    return Status::Internal;
 }
 
 std::uint32_t BulkPublisher::generation() const noexcept
@@ -1560,7 +1505,7 @@ PublisherCounters BulkPublisher::counters() const noexcept
     out.dropped_credit_stalled = c.dropped_credit_stalled.load(std::memory_order_relaxed);
     out.dropped_bad_metadata = c.dropped_bad_metadata.load(std::memory_order_relaxed);
     out.acquire_failed = c.acquire_failed.load(std::memory_order_relaxed);
-    out.leases_retained = c.leases_retained.load(std::memory_order_relaxed);
+    out.leases_retained = impl_->slots->retained();
     out.credits_outstanding = c.credits_outstanding.load(std::memory_order_relaxed);
     out.publish_queue_depth = c.publish_queue_depth.load(std::memory_order_relaxed);
     out.publish_queue_high_water = c.publish_queue_high_water.load(std::memory_order_relaxed);
@@ -1577,87 +1522,251 @@ PublisherCounters BulkPublisher::counters() const noexcept
     return out;
 }
 
-std::vector<std::byte> BulkPublisher::handle_coordination(const std::byte *data,
-                                                          std::size_t size) noexcept
+PublisherSnapshot BulkPublisher::snapshot() const
 {
-    // The seam that keeps Tango out of the core: encoded bytes in, encoded bytes
-    // out.  The Tango adapter (M4) is a DevVarCharArray wrapper over this, and
-    // the tests drive the whole session lifecycle through it with no Tango
-    // process at all.
-    //
-    // noexcept, and it means it: this is reached from a Tango command
-    // implementation, where an escaping C++ exception is a device server crash
-    // rather than a DevFailed.
+    PublisherSnapshot out;
+    out.stream_name = impl_->config.stream_name;
+    out.geometry = detail::to_geometry(impl_->current_geometry());
+    out.counters = counters();
+    out.transport = "ActiveMessage";
+    out.worst_lag_frames = out.counters.credits_outstanding;
+    out.sampled_at_steady_ns = now_steady_ms() * 1'000'000ull;
+    out.accepting = impl_->running.load(std::memory_order_acquire);
+
+    // Session identity and state are publisher-owned observation. Copy them
+    // while the coordination table is protected; the Tango adapter never
+    // reaches into this table or waits on a remote operation.
+    const std::lock_guard<std::mutex> lock(impl_->session_mutex);
+    for(const std::unique_ptr<Impl::Session> &held : impl_->sessions)
+    {
+        const Impl::Session &session = *held;
+        const Protocol::SessionState state = session.state.load(std::memory_order_acquire);
+        if(state != Protocol::SessionState::Open && state != Protocol::SessionState::Armed &&
+           state != Protocol::SessionState::Active)
+        {
+            continue;
+        }
+
+        PublisherSnapshot::SessionObservation observation;
+        observation.session_id = Protocol::to_hex(session.id);
+        observation.state = Protocol::to_string(state);
+        observation.lag_frames =
+            session.observed_lag_frames.load(std::memory_order_acquire);
+        out.sessions.push_back(std::move(observation));
+        if(state == Protocol::SessionState::Armed || state == Protocol::SessionState::Active)
+        {
+            ++out.active_sessions;
+        }
+    }
+    return out;
+}
+
+StreamOffer PublisherSnapshot::stream_offer() const
+{
+    StreamOffer out;
+    out.stream_name = stream_name;
+    out.geometry = geometry;
+    out.status = accepting ? Status::Ok : Status::UnknownStream;
+    if(!accepting)
+    {
+        out.message = "publisher is not accepting sessions";
+    }
+    return out;
+}
+
+std::vector<std::byte> encode_coordination_error(Status status,
+                                                  const std::string &message,
+                                                  std::uint64_t correlation_id) noexcept
+{
+    try
+    {
+        return Protocol::encode(Protocol::ErrorMessage{status, message}, correlation_id);
+    }
+    catch(...)
+    {
+        // There is no allocation-free Error representation. The byte carrier
+        // treats an empty result as a failed/no-reply command.
+        return {};
+    }
+}
+
+std::vector<std::byte> encode_coordination_reply(const CoordinationReply &reply,
+                                                 std::uint64_t correlation_id) noexcept
+{
+    try
+    {
+        return std::visit(
+            [correlation_id](const auto &message)
+            { return Protocol::encode(message, correlation_id); },
+            reply);
+    }
+    catch(...)
+    {
+        return encode_coordination_error(Status::Internal,
+                                         "could not encode coordination reply",
+                                         correlation_id);
+    }
+}
+
+CoordinationReply BulkPublisher::Impl::handle_coordination(const CoordinationRequest &request)
+{
+    return std::visit(
+        [this](const auto &typed_request) -> CoordinationReply
+        {
+            using Request = std::decay_t<decltype(typed_request)>;
+            if constexpr(std::is_same_v<Request, Protocol::OpenRequest>)
+            {
+                return handle_open(typed_request);
+            }
+            else if constexpr(std::is_same_v<Request, Protocol::RenewRequest>)
+            {
+                return handle_renew(typed_request);
+            }
+            else
+            {
+                return handle_close(typed_request);
+            }
+        },
+        request);
+}
+
+std::vector<std::byte> BulkPublisher::Impl::handle_encoded_coordination(
+    const std::byte *data,
+    std::size_t size,
+    std::optional<Protocol::CoordType> expected) noexcept
+{
+    std::uint64_t correlation_id = recover_coordination_correlation(data, size);
+
+    // The encoded ingress boundary is shared by Tango and in-process adapters.
     try
     {
         Protocol::Envelope envelope;
-        if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
+        const Status envelope_status = Protocol::decode_envelope(data, size, envelope);
+        if(envelope_status != Status::Ok)
         {
-            impl_->counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-            return Protocol::encode(
-                Protocol::ErrorMessage{Status::MalformedMessage, "undecodable envelope"}, 0);
+            counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+            const char *message = envelope_status == Status::UnsupportedVersion
+                                      ? "unsupported coordination protocol version"
+                                      : "undecodable envelope";
+            return encode_coordination_error(envelope_status, message, correlation_id);
         }
 
+        correlation_id = envelope.correlation_id;
+        if(expected && envelope.msg_type != *expected)
+        {
+            counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+            return encode_coordination_error(
+                Status::MalformedMessage,
+                std::string("this command carries ") + Protocol::to_string(*expected) +
+                    ", not " + Protocol::to_string(envelope.msg_type),
+                correlation_id);
+        }
+
+        CoordinationRequest request{Protocol::OpenRequest{}};
+        Status decode_status = Status::MalformedMessage;
         switch(envelope.msg_type)
         {
         case Protocol::CoordType::Open:
-            return impl_->handle_open(data, size, envelope.correlation_id);
+        {
+            Protocol::OpenRequest decoded;
+            decode_status = Protocol::decode(data, size, decoded);
+            if(decode_status == Status::Ok)
+            {
+                request = std::move(decoded);
+            }
+            break;
+        }
         case Protocol::CoordType::Renew:
-            return impl_->handle_renew(data, size, envelope.correlation_id);
+        {
+            Protocol::RenewRequest decoded;
+            decode_status = Protocol::decode(data, size, decoded);
+            if(decode_status == Status::Ok)
+            {
+                request = std::move(decoded);
+            }
+            break;
+        }
         case Protocol::CoordType::Close:
-            return impl_->handle_close(data, size, envelope.correlation_id);
-        case Protocol::CoordType::Query:
-            return impl_->handle_query(data, size, envelope.correlation_id);
+        {
+            Protocol::CloseRequest decoded;
+            decode_status = Protocol::decode(data, size, decoded);
+            if(decode_status == Status::Ok)
+            {
+                request = std::move(decoded);
+            }
+            break;
+        }
         default:
             // Everything left is a *reply* type, which a publisher never
             // receives.  Naming it beats a stub that answers Ok and quietly does
             // nothing.
-            impl_->counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-            return Protocol::encode(
-                Protocol::ErrorMessage{Status::MalformedMessage,
-                                       std::string(Protocol::to_string(envelope.msg_type)) +
-                                           " is not a request a publisher answers"},
-                envelope.correlation_id);
+            counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+            return encode_coordination_error(
+                Status::MalformedMessage,
+                std::string(Protocol::to_string(envelope.msg_type)) +
+                    " is not a request a publisher answers",
+                correlation_id);
         }
+
+        if(decode_status != Status::Ok)
+        {
+            counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
+            return encode_coordination_error(
+                decode_status,
+                std::string("undecodable ") + Protocol::to_string(envelope.msg_type),
+                correlation_id);
+        }
+
+        return encode_coordination_reply(handle_coordination(request), correlation_id);
     }
     catch(const BulkException &e)
     {
-        return Protocol::encode(Protocol::ErrorMessage{e.error().status, e.error().message},
-                                0);
+        return encode_coordination_error(e.error().status, e.error().message, correlation_id);
     }
     catch(const std::exception &e)
     {
-        return Protocol::encode(Protocol::ErrorMessage{Status::Internal, e.what()}, 0);
+        return encode_coordination_error(Status::Internal, e.what(), correlation_id);
+    }
+    catch(...)
+    {
+        return encode_coordination_error(Status::Internal,
+                                         "unknown coordination failure",
+                                         correlation_id);
     }
 }
 
-std::vector<std::byte> BulkPublisher::Impl::handle_open(const std::byte *data,
-                                                        std::size_t size,
-                                                        std::uint64_t correlation_id)
+CoordinationReply BulkPublisher::Impl::handle_open(const Protocol::OpenRequest &request)
 {
-    Protocol::OpenRequest request;
-    if(Protocol::decode(data, size, request) != Status::Ok)
+    if(request.requested_transport != Protocol::Transport::Any &&
+       request.requested_transport != Protocol::Transport::ActiveMessage)
     {
-        counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::MalformedMessage, "undecodable Open"}, correlation_id);
+        throw BulkException(BulkError{Status::MalformedMessage,
+                                      "Open requested an unsupported transport",
+                                      "publisher"});
+    }
+
+    if(request.requested_memory_kind != MemoryKind::Host &&
+       request.requested_memory_kind != MemoryKind::Cuda &&
+       request.requested_memory_kind != MemoryKind::Rocm)
+    {
+        throw BulkException(BulkError{Status::MalformedMessage,
+                                      "Open requested an unsupported memory kind",
+                                      "publisher"});
     }
 
     // 3.5 step 2: version intersect.
     if(request.version_min > Protocol::k_version_major ||
        request.version_max < Protocol::k_version_major)
     {
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::UnsupportedVersion, "no common protocol major"},
-            correlation_id);
+        return typed_reply(
+            Protocol::ErrorMessage{Status::UnsupportedVersion, "no common protocol major"});
     }
 
     // 3.5 step 3: resolve stream_name.
     if(request.stream_name != config.stream_name)
     {
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::UnknownStream, "no such stream on this publisher"},
-            correlation_id);
+        return typed_reply(
+            Protocol::ErrorMessage{Status::UnknownStream, "no such stream on this publisher"});
     }
 
     // 3.5 step 5: clamp downward.  A grant is never larger than requested and
@@ -1670,9 +1779,8 @@ std::vector<std::byte> BulkPublisher::Impl::handle_open(const std::byte *data,
 
     if(geometry.max_frame_bytes == 0 || geometry.ring_depth == 0 || geometry.credit_window == 0)
     {
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::MalformedMessage, "Open requested a zero geometry"},
-            correlation_id);
+        return typed_reply(
+            Protocol::ErrorMessage{Status::MalformedMessage, "Open requested a zero geometry"});
     }
 
     // 3.5 step 4.  4.4: a duplicate Open -- same client_instance_id or not --
@@ -1712,9 +1820,8 @@ std::vector<std::byte> BulkPublisher::Impl::handle_open(const std::byte *data,
     if(session == nullptr)
     {
         counters.sessions_rejected.fetch_add(1, std::memory_order_relaxed);
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::TooManySessions, "no free session on this publisher"},
-            correlation_id);
+        return typed_reply(
+            Protocol::ErrorMessage{Status::TooManySessions, "no free session on this publisher"});
     }
 
     // 3.5 step 7.  The endpoint has to exist before a probe can go out, and
@@ -1770,21 +1877,11 @@ std::vector<std::byte> BulkPublisher::Impl::handle_open(const std::byte *data,
     reply.geometry = geometry;
     reply.server_ucx_address = worker->address();
 
-    return Protocol::encode(reply, correlation_id);
+    return typed_reply(std::move(reply));
 }
 
-std::vector<std::byte> BulkPublisher::Impl::handle_renew(const std::byte *data,
-                                                         std::size_t size,
-                                                         std::uint64_t correlation_id)
+CoordinationReply BulkPublisher::Impl::handle_renew(const Protocol::RenewRequest &request)
 {
-    Protocol::RenewRequest request;
-    if(Protocol::decode(data, size, request) != Status::Ok)
-    {
-        counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::MalformedMessage, "undecodable Renew"}, correlation_id);
-    }
-
     Protocol::RenewReply reply;
     reply.session_id = request.session_id;
     reply.lease_ttl_ms = config.lease_ttl_ms;
@@ -1799,7 +1896,7 @@ std::vector<std::byte> BulkPublisher::Impl::handle_renew(const std::byte *data,
         // gone, reopen" from "your message was garbage".
         reply.status = Status::UnknownSession;
         reply.server_state = SessionState::Unknown;
-        return Protocol::encode(reply, correlation_id);
+        return typed_reply(std::move(reply));
     }
 
     reply.geometry = session->geometry;
@@ -1817,7 +1914,7 @@ std::vector<std::byte> BulkPublisher::Impl::handle_renew(const std::byte *data,
                 ? Status::UnknownSession
                 : Status::SessionExpired;
         reply.server_state = state;
-        return Protocol::encode(reply, correlation_id);
+        return typed_reply(std::move(reply));
     }
 
     const std::uint64_t now = now_steady_ms();
@@ -1836,7 +1933,7 @@ std::vector<std::byte> BulkPublisher::Impl::handle_renew(const std::byte *data,
         counters.renewals_rejected.fetch_add(1, std::memory_order_relaxed);
         reply.status = Status::RenewTooFrequent;
         reply.server_state = state;
-        return Protocol::encode(reply, correlation_id);
+        return typed_reply(std::move(reply));
     }
 
     // 4.4: a late Renew that is still inside the TTL is accepted and counted,
@@ -1856,21 +1953,11 @@ std::vector<std::byte> BulkPublisher::Impl::handle_renew(const std::byte *data,
 
     reply.status = Status::Ok;
     reply.server_state = state;
-    return Protocol::encode(reply, correlation_id);
+    return typed_reply(std::move(reply));
 }
 
-std::vector<std::byte> BulkPublisher::Impl::handle_close(const std::byte *data,
-                                                         std::size_t size,
-                                                         std::uint64_t correlation_id)
+CoordinationReply BulkPublisher::Impl::handle_close(const Protocol::CloseRequest &request)
 {
-    Protocol::CloseRequest request;
-    if(Protocol::decode(data, size, request) != Status::Ok)
-    {
-        counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::MalformedMessage, "undecodable Close"}, correlation_id);
-    }
-
     Protocol::CloseReply reply;
     reply.session_id = request.session_id;
     reply.frames_credited_final =
@@ -1887,138 +1974,33 @@ std::vector<std::byte> BulkPublisher::Impl::handle_close(const std::byte *data,
     if(session == nullptr)
     {
         reply.status = Status::UnknownSession;
-        return Protocol::encode(reply, correlation_id);
+        return typed_reply(std::move(reply));
     }
 
     if(!begin_expiry(*session, EndReason::Close))
     {
         reply.status = Status::UnknownSession;
-        return Protocol::encode(reply, correlation_id);
+        return typed_reply(std::move(reply));
     }
 
     // Teardown itself belongs to the engine: steps 2 and 3 of 4.2 are ucp_*
     // calls on the worker.  The reply does not wait for it -- the counters it
     // carries are diagnostics, and 3.8 asks for idempotence, not synchrony.
     reply.status = Status::Ok;
-    return Protocol::encode(reply, correlation_id);
-}
-
-std::vector<std::byte> BulkPublisher::Impl::handle_query(const std::byte *data,
-                                                         std::size_t size,
-                                                         std::uint64_t correlation_id)
-{
-    Protocol::QueryRequest request;
-    if(Protocol::decode(data, size, request) != Status::Ok)
-    {
-        counters.malformed_messages.fetch_add(1, std::memory_order_relaxed);
-        return Protocol::encode(
-            Protocol::ErrorMessage{Status::MalformedMessage, "undecodable Query"}, correlation_id);
-    }
-
-    Protocol::QueryReply reply;
-    reply.session_id = request.session_id;
-    reply.generation = generation;
-    reply.geometry = current_geometry();
-
-    std::string blob;
-    const auto add = [&blob](const char *key, std::uint64_t value)
-    {
-        blob += key;
-        blob += '=';
-        blob += std::to_string(value);
-        blob += ';';
-    };
-    const auto add_text = [&blob](const char *key, const std::string &value)
-    {
-        blob += key;
-        blob += '=';
-        blob += value;
-        blob += ';';
-    };
-
-    // 3.8: the blob MUST NOT carry UCX addresses, memory keys, untruncated
-    // session identifiers, or hostnames the caller does not already know.  Every
-    // value below is either a counter, a configured bound, or an identifier in
-    // the truncated form 3.2 mandates for logs.  The stream name is safe
-    // unescaped because 3.9 restricts it to [A-Za-z0-9_.-].
-    add_text("stream", config.stream_name);
-    add_text("transport", "am");
-    add_text("memory_kind", "host");
-    add_text("fanout_mode", to_string(config.fanout_mode));
-
-    const AtomicPublisherCounters &c = counters;
-    add("frames_published", c.frames_published.load(std::memory_order_relaxed));
-    add("frames_submitted", c.frames_submitted.load(std::memory_order_relaxed));
-    add("frames_completed", c.frames_completed.load(std::memory_order_relaxed));
-    add("frames_credited", c.frames_credited.load(std::memory_order_relaxed));
-    add("dropped_no_session", c.dropped_no_session.load(std::memory_order_relaxed));
-    add("dropped_queue_full", c.dropped_queue_full.load(std::memory_order_relaxed));
-    add("dropped_credit_stalled", c.dropped_credit_stalled.load(std::memory_order_relaxed));
-    add("dropped_bad_metadata", c.dropped_bad_metadata.load(std::memory_order_relaxed));
-    add("acquire_failed", c.acquire_failed.load(std::memory_order_relaxed));
-    add("leases_retained", c.leases_retained.load(std::memory_order_relaxed));
-    add("credits_outstanding", c.credits_outstanding.load(std::memory_order_relaxed));
-    add("publish_queue_depth", c.publish_queue_depth.load(std::memory_order_relaxed));
-    add("publish_queue_high_water", c.publish_queue_high_water.load(std::memory_order_relaxed));
-    add("sessions_opened", c.sessions_opened.load(std::memory_order_relaxed));
-    add("sessions_closed", c.sessions_closed.load(std::memory_order_relaxed));
-    add("sessions_expired", c.sessions_expired.load(std::memory_order_relaxed));
-    add("sessions_rejected", c.sessions_rejected.load(std::memory_order_relaxed));
-    add("renewals_accepted", c.renewals_accepted.load(std::memory_order_relaxed));
-    add("renewals_late", c.renewals_late.load(std::memory_order_relaxed));
-    add("renewals_rejected", c.renewals_rejected.load(std::memory_order_relaxed));
-    add("malformed_messages", c.malformed_messages.load(std::memory_order_relaxed));
-    add("transport_errors", c.transport_errors.load(std::memory_order_relaxed));
-    add("pinned_bytes", c.pinned_bytes.load(std::memory_order_relaxed));
-    add("max_sessions", config.max_sessions);
-    add("lease_ttl_ms", config.lease_ttl_ms);
-    add("renew_interval_ms", config.renew_interval_ms);
-
-    const std::uint64_t now = now_steady_ms();
-
-    {
-        std::lock_guard<std::mutex> lock(session_mutex);
-
-        std::uint32_t live = 0;
-        for(const std::unique_ptr<Session> &held : sessions)
-        {
-            const SessionState state = held->state.load(std::memory_order_acquire);
-            if(state != SessionState::Unknown && state != SessionState::Closed)
-            {
-                ++live;
-            }
-        }
-        reply.active_sessions = live;
-        add("sessions_live", live);
-        add("sessions_armed", armed_sessions.load(std::memory_order_relaxed));
-
-        // 3.8 allows an all-zero session_id to ask for server-wide status.  A
-        // quoted identifier asks about one session, and an identifier this
-        // publisher does not hold is `UnknownSession` -- the same answer 3.7
-        // gives a `Renew`, so an operator's Query and a client's Renew cannot
-        // disagree about whether a session still exists.
-        if(!request.session_id.is_zero())
-        {
-            const Session *session = session_for_id(request.session_id);
-            if(session == nullptr)
-            {
-                reply.status = Status::UnknownSession;
-            }
-            else
-            {
-                const SessionState state = session->state.load(std::memory_order_acquire);
-                const std::uint64_t deadline = session->deadline_ms.load(std::memory_order_relaxed);
-
-                add_text("session", Protocol::to_log_string(session->id));
-                add_text("session_state", Protocol::to_string(state));
-                add("session_lease_ms_remaining", deadline > now ? deadline - now : 0);
-                add("session_geometry_generation", session->geometry.generation);
-            }
-        }
-    }
-
-    reply.counters = std::move(blob);
-    return Protocol::encode(reply, correlation_id);
+    return typed_reply(std::move(reply));
 }
 
 } // namespace TangoBulk
+
+namespace TangoBulk::detail
+{
+
+std::vector<std::byte> PublisherAccess::coordination(BulkPublisher &publisher,
+                                                     const std::byte *data,
+                                                     std::size_t size,
+                                                     std::optional<Protocol::CoordType> expected) noexcept
+{
+    return publisher.impl_->handle_encoded_coordination(data, size, expected);
+}
+
+} // namespace TangoBulk::detail

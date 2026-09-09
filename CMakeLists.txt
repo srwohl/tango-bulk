@@ -4,19 +4,20 @@
 
 cmake_minimum_required(VERSION 3.18)
 
-# 0.2.0 because FrameView::detached() added public API.
+# 0.3.0 because the subscription interface now exposes Geometry/ReceivePlan
+# values and no longer exposes the protocol codec or test-only frame factories.
 #
-# The bump is not bookkeeping.  A consumer that needs detached() has no other way
-# to say so: find_package(tango-bulk 0.1) is satisfied by a package that predates
-# it, so the mismatch surfaces as "'detached' is not a member of
-# 'TangoBulk::FrameView'" partway through compiling the consumer's tests --
+# The bump is not bookkeeping.  A consumer that needs the new subscription
+# surface has no other way to say so: find_package(tango-bulk 0.2) is satisfied
+# by a package that predates it, so the mismatch surfaces partway through
+# compiling the consumer's tests --
 # minutes in, in a file that has nothing to do with the cause.  A version a
 # consumer can require is what turns that into a configure-time error naming the
 # two versions.  Every later addition to the public API bumps the minor
 # component for the same reason.
 project(
     tango-bulk
-    VERSION 0.2.0
+    VERSION 0.3.0
     DESCRIPTION "UCX bulk-data plane for Tango device servers"
     LANGUAGES CXX)
 
@@ -258,8 +259,17 @@ install(
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
-install(DIRECTORY include/tango-bulk
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(
+    FILES include/tango-bulk/counters.h
+          include/tango-bulk/errors.h
+          include/tango-bulk/frame.h
+          include/tango-bulk/geometry.h
+          include/tango-bulk/limits.h
+          include/tango-bulk/publisher.h
+          include/tango-bulk/subscriber.h
+          include/tango-bulk/subscription.h
+          include/tango-bulk/tango.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/tango-bulk)
 
 install(
     EXPORT tango-bulk-targets

@@ -20,10 +20,10 @@
 #include <vector>
 
 /// M4 end to end: a stock device server, a stock `Tango::DeviceProxy`, and a
-/// `BulkSubscriber` that carries its coordination plane over ordinary commands.
+/// `Subscription` that carries its coordination plane over ordinary commands.
 ///
 /// Everything here goes through the same door an application would use.  There
-/// is no `handle_coordination()` call in this file and no `SubscriberEngine`:
+/// is no encoded-adapter call in this file and no `SubscriberEngine`:
 /// if the adapter is wrong, these tests are how it shows.
 namespace
 {
@@ -72,33 +72,22 @@ struct Sink
 {
     std::mutex mutex;
     std::vector<FrameView> frames;
-    std::vector<SubscriberState> states;
     std::vector<std::thread::id> callback_threads;
     std::atomic<std::size_t> frame_count{0};
 
-    void attach(BulkSubscriber &subscriber)
+    SubscriptionCallbacks callbacks()
     {
-        subscriber.set_frame_callback(
-            [this](FrameView view)
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                callback_threads.push_back(std::this_thread::get_id());
-                frames.push_back(std::move(view));
-                frame_count.fetch_add(1, std::memory_order_relaxed);
-            });
+        SubscriptionCallbacks out;
 
-        subscriber.set_state_callback(
-            [this](SubscriberState state, const BulkError &)
-            {
-                std::lock_guard<std::mutex> lock(mutex);
-                states.push_back(state);
-            });
-    }
+        out.on_frame = [this](FrameView view)
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            callback_threads.push_back(std::this_thread::get_id());
+            frames.push_back(std::move(view));
+            frame_count.fetch_add(1, std::memory_order_relaxed);
+        };
 
-    bool saw(SubscriberState state)
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        return std::find(states.begin(), states.end(), state) != states.end();
+        return out;
     }
 };
 
@@ -133,7 +122,7 @@ std::vector<std::byte> raw_command(Tango::DeviceProxy &proxy,
 
 } // namespace
 
-TEST_CASE("The four bulk commands are ordinary commands on a stock device", "[tango][m4]")
+TEST_CASE("The three bulk commands are ordinary commands on a stock device", "[tango][m4]")
 {
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
@@ -152,7 +141,7 @@ TEST_CASE("The four bulk commands are ordinary commands on a stock device", "[ta
         return nullptr;
     };
 
-    for(const std::string name : {"BulkOpen", "BulkRenew", "BulkClose", "BulkQuery"})
+    for(const std::string name : {"BulkOpen", "BulkRenew", "BulkClose"})
     {
         const Tango::CommandInfo *info = find(name);
         INFO("command " << name);
@@ -165,34 +154,78 @@ TEST_CASE("The four bulk commands are ordinary commands on a stock device", "[ta
     }
 
     // 7.3: BulkOpen allocates pinned memory and BulkClose terminates a stream,
-    // so both are write-level; BulkQuery only reads.
+    // so all three are write-level.
     CHECK(find("BulkOpen")->disp_level == Tango::EXPERT);
     CHECK(find("BulkRenew")->disp_level == Tango::EXPERT);
     CHECK(find("BulkClose")->disp_level == Tango::EXPERT);
-    CHECK(find("BulkQuery")->disp_level == Tango::OPERATOR);
 
     delete commands;
 }
 
-TEST_CASE("BulkQuery reports the publisher an operator can see", "[tango][m4]")
+TEST_CASE("BulkStreams reports the fixed conservative offer row", "[tango][discovery]")
 {
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
-    const BulkQueryResult status = bulk_query(proxy);
+    Tango::DeviceAttribute attribute = proxy.read_attribute("BulkStreams");
+    CHECK(attribute.get_type() == Tango::DEV_STRING);
+    CHECK(attribute.get_data_format() == Tango::SPECTRUM);
+    CHECK_FALSE(attribute.has_failed());
+    CHECK_FALSE(attribute.is_empty());
+    std::vector<std::string> rows;
+    REQUIRE(attribute.extract_read(rows));
+    REQUIRE(rows.size() == 1);
 
-    CHECK(status.status == Status::Ok);
-    CHECK(status.generation == 1);
-    CHECK(status.max_frame_bytes == k_frame_bytes);
-    CHECK(status.ring_depth == 8);
-    CHECK(status.credit_window == 4);
-    CHECK(status.counters.find("stream=bulk.tango;") != std::string::npos);
-    CHECK(status.counters.find("frames_published=") != std::string::npos);
+    const StreamOffer offer = StreamOffer::from_bulk_stream_row(rows.front());
+    CHECK(offer.stream_name == "bulk.tango");
+    CHECK(offer.outcome() == StreamOffer::Outcome::Available);
+    CHECK(offer.geometry.max_frame_bytes == k_frame_bytes);
+    CHECK(offer.geometry.ring_depth == 8);
+    CHECK(offer.geometry.credit_window == 4);
+}
 
-    // 3.8: no UCX address, no memory key, no untruncated identifier.  The
-    // address blob is the one that would be easy to leak and impossible to
-    // notice, so it is asserted rather than assumed.
-    CHECK(status.counters.find("address") == std::string::npos);
-    CHECK(status.counters.find("rkey") == std::string::npos);
+TEST_CASE("Publisher observation attributes are fixed and read-only", "[tango][observation]")
+{
+    Tango::DeviceProxy proxy(DeviceServer::instance().device());
+    Tango::AttributeInfoList *attributes = proxy.attribute_list_query();
+    REQUIRE(attributes != nullptr);
+
+    const auto find = [attributes](const std::string &name) -> const Tango::AttributeInfo *
+    {
+        for(const Tango::AttributeInfo &info : *attributes)
+        {
+            if(info.name == name)
+            {
+                return &info;
+            }
+        }
+        return nullptr;
+    };
+
+    for(const std::string name : {"BulkStreams", "BulkSessions", "BulkTransport"})
+    {
+        const Tango::AttributeInfo *info = find(name);
+        REQUIRE(info != nullptr);
+        CHECK(info->data_type == Tango::DEV_STRING);
+        CHECK(info->writable == Tango::READ);
+        CHECK(info->disp_level == Tango::OPERATOR);
+        CHECK(info->data_format ==
+              (name == "BulkTransport" ? Tango::SCALAR : Tango::SPECTRUM));
+        CHECK_FALSE(proxy.read_attribute(name).has_failed());
+    }
+
+    for(const std::string name : {"BulkFramesPublished", "BulkFramesDropped",
+                                  "BulkWorstLagFrames"})
+    {
+        const Tango::AttributeInfo *info = find(name);
+        REQUIRE(info != nullptr);
+        CHECK(info->data_type == Tango::DEV_ULONG64);
+        CHECK(info->writable == Tango::READ);
+        CHECK(info->disp_level == Tango::OPERATOR);
+        CHECK(info->data_format == Tango::SCALAR);
+        CHECK_FALSE(proxy.read_attribute(name).has_failed());
+    }
+
+    delete attributes;
 }
 
 TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tango][m4]")
@@ -200,17 +233,10 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
     Sink sink;
-    BulkSubscriber subscriber(proxy, subscriber_config());
-    sink.attach(subscriber);
+    auto subscriber = subscribe(proxy, subscriber_config(), sink.callbacks());
 
-    subscriber.start();
-
-    // 4.1: `Active` means frames can flow, and the state callback fires on every
-    // transition on the way there.
-    REQUIRE(subscriber.state() == SubscriberState::Active);
-    REQUIRE(eventually([&sink] { return sink.saw(SubscriberState::Active); }));
-    CHECK(sink.saw(SubscriberState::Opening));
-    CHECK(sink.saw(SubscriberState::Probing));
+    // `Active` means the bounded initial establishment is complete and frames can flow.
+    REQUIRE(subscriber->state() == SubscriberState::Active);
 
     Tango::DeviceData accepted = publish(proxy, 4);
     Tango::DevLong count = 0;
@@ -219,11 +245,27 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
 
     REQUIRE(eventually([&sink] { return sink.frame_count.load() >= 4; }));
 
+    Tango::DeviceAttribute sessions_attribute = proxy.read_attribute("BulkSessions");
+    std::vector<std::string> sessions;
+    REQUIRE(sessions_attribute.extract_read(sessions));
+    REQUIRE(sessions.size() == 1);
+    CHECK(sessions.front().find("|Active|") != std::string::npos);
+
+    std::string transport;
+    Tango::DeviceAttribute transport_attribute = proxy.read_attribute("BulkTransport");
+    REQUIRE(transport_attribute >> transport);
+    CHECK(transport == "ActiveMessage");
+
+    Tango::DevULong64 published = 0;
+    Tango::DeviceAttribute published_attribute = proxy.read_attribute("BulkFramesPublished");
+    REQUIRE(published_attribute >> published);
+    CHECK(published >= 4);
+
     {
         std::lock_guard<std::mutex> lock(sink.mutex);
 
         // 5.2: user callbacks never run on the UCX engine thread, and in
-        // DispatchThread mode they do not run on the caller's either.
+        // Push callbacks do not run on the caller's thread either.
         for(const std::thread::id &id : sink.callback_threads)
         {
             CHECK(id != std::this_thread::get_id());
@@ -268,19 +310,46 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
         sink.frames.clear();
     }
 
-    const SubscriberCounters counters = subscriber.counters();
-    CHECK(counters.frames_received >= 4);
-    CHECK(counters.frames_delivered >= 4);
+    CHECK(subscriber->counters().frames_delivered >= 4);
+
+    REQUIRE(eventually([&subscriber] { return subscriber->counters().frames_received >= 4; }));
+
+    const SubscriberCounters counters = subscriber->counters();
     CHECK(counters.frames_dropped_bad_header == 0);
     CHECK(counters.frames_dropped_oversize == 0);
 
-    subscriber.stop();
-    CHECK(subscriber.state() == SubscriberState::Closed);
-    CHECK(sink.saw(SubscriberState::Closed));
+    subscriber->close();
+    CHECK(subscriber->state() == SubscriberState::Closed);
+    subscriber.reset();
 
-    // 3.8: `Close` releases the session, so the publisher is back where it
-    // started and did not have to wait out a lease to get there.
-    REQUIRE(eventually([&proxy] { return bulk_query(proxy).active_sessions == 0; }));
+    // `Close` releases the session without waiting out its lease.
+}
+
+TEST_CASE("The granted geometry reaches the application", "[tango][m4]")
+{
+    Tango::DeviceProxy proxy(DeviceServer::instance().device());
+
+    Sink sink;
+    auto subscriber = subscribe(proxy, subscriber_config(), sink.callbacks());
+
+    REQUIRE(subscriber->state() == SubscriberState::Active);
+
+    const Geometry granted = subscriber->geometry();
+
+    CHECK(granted.generation != 0);
+    CHECK(granted.element_type == ElementType::UInt8);
+    CHECK(granted.element_size == 1);
+    CHECK(granted.rank == 1);
+    CHECK(granted.shape[0] == k_frame_bytes);
+    CHECK(granted.strides[0] == 1);
+
+    CHECK(granted.max_frame_bytes <= subscriber_config().max_frame_bytes);
+    CHECK(granted.ring_depth <= subscriber_config().ring_depth);
+    CHECK(granted.credit_window <= granted.ring_depth);
+
+    CHECK(granted.validate() == Status::Ok);
+
+    subscriber.reset();
 }
 
 TEST_CASE("The renew timer keeps a session past its lease", "[tango][m4]")
@@ -288,28 +357,25 @@ TEST_CASE("The renew timer keeps a session past its lease", "[tango][m4]")
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
     Sink sink;
-    BulkSubscriber subscriber(proxy, subscriber_config());
-    sink.attach(subscriber);
-    subscriber.start();
+    auto subscriber = subscribe(proxy, subscriber_config(), sink.callbacks());
 
-    REQUIRE(subscriber.state() == SubscriberState::Active);
+    REQUIRE(subscriber->state() == SubscriberState::Active);
 
     // The fixture's lease is 6.1's 1 000 ms floor, so this is two full TTLs of
     // real time rather than a mocked clock.  A subscriber with no renew timer
     // would be expired and gone well before it elapses.
     std::this_thread::sleep_for(2'200ms);
 
-    CHECK(subscriber.state() == SubscriberState::Active);
-    CHECK(subscriber.counters().renewals_sent >= 3);
-    CHECK(subscriber.counters().renewals_failed == 0);
+    CHECK(subscriber->state() == SubscriberState::Active);
+    CHECK(subscriber->counters().renewals_sent >= 3);
+    CHECK(subscriber->counters().renewals_failed == 0);
 
     // Asserted about *this* session rather than about the device's counters: the
     // fixture is shared by every case in the executable, so `sessions_expired`
     // is whatever the cases before this one left behind.  A test that reads a
     // global counter to make a local claim passes for the wrong reason exactly
     // when the suite is run in one process.
-    CHECK_FALSE(sink.saw(SubscriberState::Reconnecting));
-    CHECK(bulk_query(proxy).active_sessions >= 1);
+    CHECK(subscriber->state() != SubscriberState::Reconnecting);
 
     // A session that is still alive can still carry data, which is the thing the
     // renewal is for.
@@ -324,46 +390,38 @@ TEST_CASE("The renew timer keeps a session past its lease", "[tango][m4]")
         sink.frames.clear();
     }
 
-    subscriber.stop();
+    subscriber.reset();
 }
 
-TEST_CASE("Manual delivery runs the callback on the polling thread", "[tango][m4]")
+TEST_CASE("Push delivery runs callbacks on the library thread", "[tango][m4]")
 {
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
     SubscriberConfig config = subscriber_config();
-    config.delivery_mode = DeliveryMode::Manual;
+    config.delivery_mode = DeliveryMode::Push;
 
     Sink sink;
-    BulkSubscriber subscriber(proxy, config);
-    sink.attach(subscriber);
-    subscriber.start();
+    auto subscriber = subscribe(proxy, config, sink.callbacks());
 
-    REQUIRE(subscriber.state() == SubscriberState::Active);
+    REQUIRE(subscriber->state() == SubscriberState::Active);
 
     Tango::DeviceData accepted = publish(proxy, 2);
     Tango::DevLong count = 0;
     accepted >> count;
     REQUIRE(count == 2);
 
-    std::size_t delivered = 0;
-    REQUIRE(eventually(
-        [&]
-        {
-            delivered += subscriber.poll(20ms);
-            return delivered >= 2;
-        }));
+    REQUIRE(eventually([&sink] { return sink.frame_count.load() >= 2; }));
 
     {
         std::lock_guard<std::mutex> lock(sink.mutex);
         for(const std::thread::id &id : sink.callback_threads)
         {
-            CHECK(id == std::this_thread::get_id());
+            CHECK(id != std::this_thread::get_id());
         }
         sink.frames.clear();
     }
 
-    subscriber.stop();
+    subscriber.reset();
 }
 
 TEST_CASE("A device with no publisher answers, and does not throw", "[tango][m4]")
@@ -372,29 +430,27 @@ TEST_CASE("A device with no publisher answers, and does not throw", "[tango][m4]
 
     proxy.command_inout("Detach");
 
-    // 7.2: a device server that has not finished init_device() is a normal
-    // transient state, not a fault.  So this is an encoded Error carrying a
-    // Status -- not a DevFailed, which is what would make a client handle the
-    // same condition in two places.
-    const BulkQueryResult status = bulk_query(proxy);
-    CHECK(status.status == Status::UnknownStream);
+    // A device server that has not finished init_device() is a normal transient
+    // state. The command returns an encoded Error rather than throwing.
+    const std::vector<std::byte> open(16, std::byte{0});
+    const std::vector<std::byte> detached =
+        raw_command(proxy, "BulkOpen", open);
+    Protocol::ErrorMessage detached_error;
+    REQUIRE(Protocol::decode(detached.data(), detached.size(), detached_error) == Status::Ok);
+    CHECK(detached_error.status == Status::UnknownStream);
 
     SubscriberConfig config = subscriber_config();
     config.reconnect_policy = ReconnectPolicy::FailFast;
 
     Sink sink;
-    BulkSubscriber subscriber(proxy, config);
-    sink.attach(subscriber);
 
-    // 2.4: start() throws on open failure under FailFast.
-    CHECK_THROWS_AS(subscriber.start(), BulkException);
-    CHECK(subscriber.state() == SubscriberState::Failed);
+    CHECK_THROWS_AS(subscribe(proxy, config, sink.callbacks()), BulkException);
 
     proxy.command_inout("Attach");
 
-    // And the device recovers without a restart, which is what makes the
-    // transient reading of UnknownStream honest.
-    CHECK(bulk_query(proxy).status == Status::Ok);
+    // The device recovers without a restart.
+    auto recovered = subscribe(proxy, config, sink.callbacks());
+    REQUIRE(recovered->state() == SubscriberState::Active);
 }
 
 TEST_CASE("A command answers only for the message it is the door for", "[tango][m4]")
@@ -419,7 +475,7 @@ TEST_CASE("A command answers only for the message it is the door for", "[tango][
 
     // Garbage, to the same command.  Neither is a DevFailed.
     const std::vector<std::byte> garbage(16, std::byte{0xAB});
-    const std::vector<std::byte> answer = raw_command(proxy, "BulkQuery", garbage);
+    const std::vector<std::byte> answer = raw_command(proxy, "BulkOpen", garbage);
     REQUIRE(Protocol::decode_envelope(answer.data(), answer.size(), envelope) == Status::Ok);
     CHECK(envelope.msg_type == Protocol::CoordType::Error);
 }
@@ -434,11 +490,9 @@ TEST_CASE("A subscriber reopens its session after the stream comes back", "[tang
     config.reconnect_max_attempts = 20;
 
     Sink sink;
-    BulkSubscriber subscriber(proxy, config);
-    sink.attach(subscriber);
-    subscriber.start();
+    auto subscriber = subscribe(proxy, config, sink.callbacks());
 
-    REQUIRE(subscriber.state() == SubscriberState::Active);
+    REQUIRE(subscriber->state() == SubscriberState::Active);
 
     // Detaching the publisher is the cheapest honest way to break a live
     // session: the device stays up and its commands stay callable, but they
@@ -447,15 +501,17 @@ TEST_CASE("A subscriber reopens its session after the stream comes back", "[tang
     // the client must not treat it as authority to release anything.
     proxy.command_inout("Detach");
 
-    REQUIRE(eventually([&sink] { return sink.saw(SubscriberState::Reconnecting); }));
-    CHECK(subscriber.state() != SubscriberState::Closed);
+    REQUIRE(eventually([&subscriber] {
+        return subscriber->state() == SubscriberState::Reconnecting;
+    }));
+    CHECK(subscriber->state() != SubscriberState::Closed);
 
     proxy.command_inout("Attach");
 
     // 4.1's BoundedRetry: back off, try again, and stop being broken when the
     // world stops being broken.  Nothing had to restart.
-    REQUIRE(eventually([&subscriber] { return subscriber.state() == SubscriberState::Active; }));
-    CHECK(subscriber.counters().reconnects >= 1);
+    REQUIRE(eventually([&subscriber] { return subscriber->state() == SubscriberState::Active; }));
+    CHECK(subscriber->counters().reconnects >= 1);
 
     // And the reopened session is a working one, not merely a connected one.
     Tango::DeviceData accepted = publish(proxy, 1);
@@ -471,30 +527,23 @@ TEST_CASE("A subscriber reopens its session after the stream comes back", "[tang
         sink.frames.clear();
     }
 
-    subscriber.stop();
+    subscriber.reset();
 }
 
-TEST_CASE("Command names cannot change under a running session", "[tango][m4]")
+TEST_CASE("The command names given at subscribe are the ones used", "[tango][m4]")
 {
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
-    Sink sink;
-    BulkSubscriber subscriber(proxy, subscriber_config());
-    sink.attach(subscriber);
+    SubscriberConfig config = subscriber_config();
+    config.reconnect_policy = ReconnectPolicy::FailFast;
 
-    // Before start(): legal, and the default names are what this device has.
-    CHECK_NOTHROW(set_command_names(subscriber, CommandNames{}));
+    Sink wrong;
+    CHECK_THROWS_AS(
+        subscribe(proxy, config, wrong.callbacks(), CommandNames::with_prefix("Xyz")),
+        BulkException);
 
-    subscriber.start();
-    REQUIRE(subscriber.state() == SubscriberState::Active);
-
-    // After start(): refused, because the session was opened with the old names
-    // and there would be no way left to renew or close it.
-    CHECK_THROWS_AS(set_command_names(subscriber, CommandNames::with_prefix("Xyz")),
-                    BulkException);
-
-    // Callbacks are equally fixed once a stream is running.
-    CHECK_THROWS_AS(subscriber.set_frame_callback([](FrameView) {}), BulkException);
-
-    subscriber.stop();
+    Sink right;
+    auto subscriber = subscribe(proxy, config, right.callbacks(), CommandNames{});
+    REQUIRE(subscriber->state() == SubscriberState::Active);
+    subscriber.reset();
 }

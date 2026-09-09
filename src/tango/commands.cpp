@@ -14,14 +14,14 @@
 #include <string>
 #include <vector>
 
-/// `BulkOpen`, `BulkRenew`, `BulkClose` and `BulkQuery` as ordinary Tango
+/// `BulkOpen`, `BulkRenew`, and `BulkClose` as ordinary Tango
 /// commands (7.1).
 ///
 /// Each is `DevVarCharArray -> DevVarCharArray` carrying an encoded coordination
 /// message (3.3), and each is a thin wrapper over
-/// `BulkPublisher::handle_coordination()`.  There is no bulk-specific IDL, no
-/// DServer command, and nothing here that a stock device server does not already
-/// know how to expose.
+/// the internal encoded coordination adapter.  There is no bulk-specific IDL,
+/// no DServer command, and nothing here that a stock device server does not
+/// already know how to expose.
 ///
 /// The rule that shapes this file: **a command MUST NOT throw `DevFailed` for a
 /// protocol-level failure.**  Protocol failures come back as an encoded `Error`
@@ -51,7 +51,7 @@ Tango::DevVarCharArray *to_char_array(const std::vector<std::byte> &bytes)
 
 /// One command, parameterised by the message it is the door for.
 ///
-/// The four commands do the same thing, which is why there is one class -- but
+/// The three commands do the same thing, which is why there is one class -- but
 /// they are not interchangeable: a `Close` body arriving at `BulkOpen` is a
 /// client bug, and saying so beats quietly doing what the body asked for.  The
 /// name a client called is then always the name of the thing that happened,
@@ -96,24 +96,7 @@ class CoordinationCommand : public Tango::Command
                                const std::byte *data,
                                std::size_t size) const noexcept
     {
-        Protocol::Envelope envelope;
-        if(Protocol::decode_envelope(data, size, envelope) != Status::Ok)
-        {
-            return Protocol::encode(
-                Protocol::ErrorMessage{Status::MalformedMessage, "undecodable envelope"}, 0);
-        }
-
-        if(envelope.msg_type != expected_)
-        {
-            return Protocol::encode(
-                Protocol::ErrorMessage{Status::MalformedMessage,
-                                       std::string("this command carries ") +
-                                           Protocol::to_string(expected_) + ", not " +
-                                           Protocol::to_string(envelope.msg_type)},
-                envelope.correlation_id);
-        }
-
-        return dispatch_coordination(device, data, size);
+        return dispatch_coordination(device, data, size, expected_);
     }
 
     Protocol::CoordType expected_;
@@ -124,10 +107,9 @@ class CoordinationCommand : public Tango::Command
 std::vector<Tango::Command *> make_bulk_commands(const CommandNames &names)
 {
     // 7.3: BulkOpen allocates pinned memory and BulkClose terminates a data
-    // stream, so both are write-level operations; BulkRenew keeps a stream
-    // alive and is the same kind of thing.  EXPERT is how that intent is
-    // expressed to a facility whose access control distinguishes read from
-    // write.  BulkQuery only reads counters, so it stays at OPERATOR.
+    // stream, so all three are write-level operations. EXPERT is how that
+    // intent is expressed to a facility whose access control distinguishes read
+    // from write.
     //
     // This is not a security boundary and must not be described as one: the
     // device server's existing Tango policy is the authority, and this is the
@@ -145,10 +127,6 @@ std::vector<Tango::Command *> make_bulk_commands(const CommandNames &names)
                                 Protocol::CoordType::Close,
                                 Tango::EXPERT,
                                 "Encoded tango-bulk Close request"),
-        new CoordinationCommand(names.query,
-                                Protocol::CoordType::Query,
-                                Tango::OPERATOR,
-                                "Encoded tango-bulk Query request"),
     };
 }
 

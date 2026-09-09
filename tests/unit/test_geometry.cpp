@@ -219,6 +219,83 @@ TEST_CASE("shape and stride products are overflow-checked", "[core][geometry]")
     }
 }
 
+TEST_CASE("the reachable span is bounded, not the per-axis extent", "[core][geometry]")
+{
+    SECTION("a geometry whose last element ends past the payload is refused")
+    {
+        FrameMetadata meta;
+        meta.element_type = ElementType::UInt16;
+        meta.element_size = 2;
+        meta.rank = 2;
+        meta.shape = {2, 2, 0, 0};
+        meta.strides = {4, 4, 0, 0};
+        meta.payload_bytes = 8;
+
+        CHECK(meta.validate(8) == Status::GeometryMismatch);
+
+        meta.payload_bytes = 10;
+        CHECK(meta.validate(10) == Status::Ok);
+    }
+
+    SECTION("a C-contiguous layout fits exactly, with nothing to spare")
+    {
+        FrameMetadata meta;
+        meta.element_type = ElementType::UInt16;
+        meta.element_size = 2;
+        meta.rank = 2;
+        meta.shape = {480, 640, 0, 0};
+        meta.strides = {640 * 2, 2, 0, 0};
+        meta.payload_bytes = 480 * 640 * 2;
+
+        CHECK(meta.validate(meta.payload_bytes) == Status::Ok);
+        CHECK(meta.validate(meta.payload_bytes - 1) == Status::FrameTooLarge);
+    }
+
+    SECTION("trailing row padding is not required to fit")
+    {
+        FrameMetadata meta;
+        meta.element_type = ElementType::UInt16;
+        meta.element_size = 2;
+        meta.rank = 2;
+        meta.shape = {480, 640, 0, 0};
+        meta.strides = {700 * 2, 2, 0, 0};
+
+        const std::uint64_t span = 479 * 700 * 2 + 639 * 2 + 2;
+        meta.payload_bytes = span;
+
+        CHECK(meta.validate(span) == Status::Ok);
+        CHECK(span < 480ull * 700 * 2); // strictly less than the old requirement
+    }
+
+    SECTION("an empty axis reaches nothing and does not wrap")
+    {
+        GeometryBlock g = valid();
+        g.shape = {0, 1024, 0, 0};
+        g.strides = {2048, 2, 0, 0};
+        CHECK(g.validate() == Status::Ok);
+    }
+
+    SECTION("the span itself is overflow-checked")
+    {
+        GeometryBlock g = valid();
+        g.rank = 2;
+        g.shape = {2, 2, 0, 0};
+
+        g.strides = {1ull << 63, 1ull << 63, 0, 0};
+        CHECK(g.validate() == Status::GeometryMismatch);
+    }
+
+    SECTION("a rank-0 opaque frame still needs room for one element")
+    {
+        FrameMetadata meta;
+        meta.element_type = ElementType::Byte;
+        meta.element_size = 1;
+        meta.rank = 0;
+        meta.payload_bytes = 4096;
+        CHECK(meta.validate(4096) == Status::Ok);
+    }
+}
+
 TEST_CASE("geometry equality compares every field", "[core][geometry]")
 {
     // The epoch interlock compares geometries, so a field left out of the
@@ -248,6 +325,47 @@ TEST_CASE("geometry equality compares every field", "[core][geometry]")
 // ---------------------------------------------------------------------------
 // FrameMetadata
 // ---------------------------------------------------------------------------
+
+TEST_CASE("describes_same_array ignores the epoch and the sizing terms",
+          "[core][geometry]")
+{
+    GeometryBlock a = valid();
+    GeometryBlock b = valid();
+    CHECK(describes_same_array(a, b));
+
+    SECTION("a new epoch is not a new array")
+    {
+        b.generation = a.generation + 1;
+        CHECK(describes_same_array(a, b));
+        CHECK(a != b); // operator== is the stricter question, and still says so
+    }
+
+    SECTION("a smaller ring is not a new array")
+    {
+        b.ring_depth = a.ring_depth / 2;
+        b.credit_window = 1;
+        b.max_frame_bytes = a.max_frame_bytes / 2;
+        CHECK(describes_same_array(a, b));
+    }
+
+    SECTION("a different shape is")
+    {
+        b.shape = {512, 2048, 0, 0};
+        CHECK_FALSE(describes_same_array(a, b));
+    }
+
+    SECTION("so is a different element type")
+    {
+        b.element_type = ElementType::Int16;
+        CHECK_FALSE(describes_same_array(a, b));
+    }
+
+    SECTION("so are different strides at the same shape")
+    {
+        b.strides = {4096, 2, 0, 0};
+        CHECK_FALSE(describes_same_array(a, b));
+    }
+}
 
 TEST_CASE("resolve fills in what the producer left out", "[core][geometry]")
 {
