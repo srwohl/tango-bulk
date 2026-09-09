@@ -188,6 +188,11 @@ class ExampleDetector : public TANGO_BASE_CLASS
         }
     }
 
+    PublisherSnapshot snapshot() const
+    {
+        return publisher_->snapshot();
+    }
+
     void write_configuration(Tango::WAttribute &attribute, ConfigurationAttribute which)
     {
         if(which == ConfigurationAttribute::FrameRate)
@@ -289,8 +294,7 @@ class ExampleDetector : public TANGO_BASE_CLASS
             const PublishResult result = publisher_->publish(std::move(lease), meta);
 
             // Nothing here throws and nothing blocks. A drop is a counter; the
-            // operator can inspect it through the temporary BulkQuery adapter
-            // until Publisher snapshot attributes are deployed.
+            // operator can inspect the publisher snapshot or BulkStreams offer.
             if(result == PublishResult::Accepted)
             {
                 ++frame;
@@ -358,6 +362,23 @@ class ConfigurationAttr : public Tango::Attr
     ConfigurationAttribute which_;
 };
 
+class BulkStreamsAttr final : public Tango::SpectrumAttr
+{
+  public:
+    BulkStreamsAttr() : Tango::SpectrumAttr("BulkStreams", Tango::DEV_STRING, 8, Tango::OPERATOR)
+    {
+    }
+
+    void read(Tango::DeviceImpl *device, Tango::Attribute &attribute) override
+    {
+        const std::string row =
+            static_cast<ExampleDetector *>(device)->snapshot().stream_offer().to_bulk_stream_row();
+        auto *rows = new Tango::DevString[1];
+        rows[0] = Tango::string_dup(row.c_str());
+        attribute.set_value(rows, 1, 0, true);
+    }
+};
+
 class ExampleDetectorClass : public Tango::DeviceClass
 {
   public:
@@ -370,9 +391,8 @@ class ExampleDetectorClass : public Tango::DeviceClass
     {
         // ---- 7.2, line one of three -------------------------------------
         //
-        // Adds BulkOpen, BulkRenew, BulkClose and the temporary BulkQuery
-        // compatibility command as ordinary
-        // commands.  If this device class already had a command by one of those
+        // Adds BulkOpen, BulkRenew, and BulkClose as ordinary commands. If this
+        // device class already had a command by one of those
         // names, this throws rather than shadowing it, and
         // CommandNames::with_prefix("Xyz") is the way out.
         install_bulk_commands(*this);
@@ -389,6 +409,7 @@ class ExampleDetectorClass : public Tango::DeviceClass
             "frameRate", Tango::DEV_DOUBLE, ConfigurationAttribute::FrameRate));
         attributes.push_back(new ConfigurationAttr(
             "fillPayload", Tango::DEV_BOOLEAN, ConfigurationAttribute::FillPayload));
+        attributes.push_back(new BulkStreamsAttr());
     }
 
     void device_factory(const Tango::DevVarStringArray *devices) override

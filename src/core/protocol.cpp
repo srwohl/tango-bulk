@@ -44,8 +44,6 @@ bool is_known_coord_type(std::uint16_t raw) noexcept
     case CoordType::RenewReply:
     case CoordType::Close:
     case CoordType::CloseReply:
-    case CoordType::Query:
-    case CoordType::QueryReply:
     case CoordType::Error:
         return true;
     }
@@ -383,10 +381,6 @@ const char *to_string(CoordType type) noexcept
         return "Close";
     case CoordType::CloseReply:
         return "CloseReply";
-    case CoordType::Query:
-        return "Query";
-    case CoordType::QueryReply:
-        return "QueryReply";
     case CoordType::Error:
         return "Error";
     }
@@ -869,138 +863,6 @@ Status decode(const std::byte *data, std::size_t size, CloseReply &out,
     msg.frames_credited_final = wire::get32(body.data + 20);
 
     out = msg;
-    if(envelope != nullptr)
-    {
-        *envelope = env;
-    }
-
-    return Status::Ok;
-}
-
-// ---------------------------------------------------------------------------
-// Query / QueryReply
-// ---------------------------------------------------------------------------
-
-std::vector<std::byte> encode(const QueryRequest &msg, std::uint64_t correlation_id)
-{
-    std::vector<std::byte> out =
-        make_message(CoordType::Query, correlation_id, k_query_bytes);
-    std::byte *b = out.data() + k_coord_envelope_bytes;
-
-    put_id16(b + 0, msg.session_id.bytes);
-    wire::put32(b + 16, msg.query_flags);
-    wire::put32(b + 20, 0); // reserved
-
-    return out;
-}
-
-Status decode(const std::byte *data, std::size_t size, QueryRequest &out,
-              Envelope *envelope) noexcept
-{
-    Envelope env;
-    Body body;
-
-    if(const Status status = open_coord(data, size, CoordType::Query, env, body);
-       status != Status::Ok)
-    {
-        return status;
-    }
-
-    if(const Status status =
-           check_fixed_body(body.size, k_query_bytes, env.version_minor);
-       status != Status::Ok)
-    {
-        return status;
-    }
-
-    QueryRequest msg;
-    get_id16(body.data + 0, msg.session_id.bytes);
-    msg.query_flags = wire::get32(body.data + 16);
-
-    out = msg;
-    if(envelope != nullptr)
-    {
-        *envelope = env;
-    }
-
-    return Status::Ok;
-}
-
-std::vector<std::byte> encode(const QueryReply &msg, std::uint64_t correlation_id)
-{
-    const std::string counters = truncated(msg.counters, k_max_counters_bytes);
-
-    const std::size_t body_bytes = k_query_reply_fixed_bytes + 4 + counters.size();
-
-    std::vector<std::byte> out =
-        make_message(CoordType::QueryReply, correlation_id, body_bytes);
-    std::byte *b = out.data() + k_coord_envelope_bytes;
-
-    put_id16(b + 0, msg.session_id.bytes);
-    wire::put16(b + 16, static_cast<std::uint16_t>(msg.status));
-    wire::put16(b + 18, 0); // reserved
-    wire::put32(b + 20, msg.active_sessions);
-    wire::put32(b + 24, msg.generation);
-    wire::put32(b + 28, 0); // reserved
-    put_geometry(b + 32, msg.geometry);
-
-    // The counter blob is length-prefixed with a u32, like a blob rather than a
-    // string, because the spec sizes it that way.
-    std::byte *tail = b + k_query_reply_fixed_bytes;
-    wire::put32(tail, static_cast<std::uint32_t>(counters.size()));
-    if(!counters.empty())
-    {
-        std::memcpy(tail + 4, counters.data(), counters.size());
-    }
-
-    return out;
-}
-
-Status decode(const std::byte *data, std::size_t size, QueryReply &out,
-              Envelope *envelope) noexcept
-{
-    Envelope env;
-    Body body;
-
-    if(const Status status = open_coord(data, size, CoordType::QueryReply, env, body);
-       status != Status::Ok)
-    {
-        return status;
-    }
-
-    if(body.size < k_query_reply_fixed_bytes)
-    {
-        return Status::MalformedMessage;
-    }
-
-    QueryReply msg;
-    get_id16(body.data + 0, msg.session_id.bytes);
-    msg.status = static_cast<Status>(wire::get16(body.data + 16));
-    msg.active_sessions = wire::get32(body.data + 20);
-    msg.generation = wire::get32(body.data + 24);
-    get_geometry(body.data + 32, msg.geometry);
-
-    std::size_t offset = k_query_reply_fixed_bytes;
-    if(offset + 4 > body.size)
-    {
-        return Status::MalformedMessage;
-    }
-
-    const std::size_t len = wire::get32(body.data + offset);
-    if(len > k_max_counters_bytes || offset + 4 + len != body.size)
-    {
-        return Status::MalformedMessage;
-    }
-
-    const char *first = reinterpret_cast<const char *>(body.data + offset + 4);
-    if(std::memchr(first, 0, len) != nullptr)
-    {
-        return Status::MalformedMessage;
-    }
-
-    msg.counters.assign(first, len);
-
-    out = std::move(msg);
     if(envelope != nullptr)
     {
         *envelope = env;

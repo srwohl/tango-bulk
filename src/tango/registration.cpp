@@ -94,7 +94,7 @@ std::vector<std::byte> encode_error_noexcept(Status status,
 /// cppTango finds first.
 void reject_collisions(Tango::DeviceClass &device_class, const CommandNames &names)
 {
-    const std::vector<std::string> wanted{names.open, names.renew, names.close, names.query};
+    const std::vector<std::string> wanted{names.open, names.renew, names.close};
 
     for(std::size_t i = 0; i < wanted.size(); ++i)
     {
@@ -146,7 +146,6 @@ CommandNames CommandNames::with_prefix(const std::string &prefix)
     names.open = prefix + names.open;
     names.renew = prefix + names.renew;
     names.close = prefix + names.close;
-    names.query = prefix + names.query;
     return names;
 }
 

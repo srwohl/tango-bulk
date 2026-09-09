@@ -9,7 +9,6 @@
 #include <tango-bulk/subscriber.h>
 #include <tango-bulk/subscription.h>
 
-#include <array>
 #include <cstdint>
 #include <string>
 
@@ -38,19 +37,18 @@ struct CommandNames
     std::string open{"BulkOpen"};
     std::string renew{"BulkRenew"};
     std::string close{"BulkClose"};
-    std::string query{"BulkQuery"};
 
     /// "Xyz" -> "XyzBulkOpen", and so on.
     static CommandNames with_prefix(const std::string &prefix);
 };
 
-/// Call from DeviceClass::command_factory().  Appends four commands that
+/// Call from DeviceClass::command_factory().  Appends three commands that
 /// dispatch to the BulkPublisher attached to the receiving device.
 ///
 /// BulkOpen and BulkClose are registered at Tango::EXPERT level: BulkOpen
 /// causes pinned-memory allocation and BulkClose terminates a data stream, so
 /// both are write-level operations under any access control that distinguishes
-/// read from write.  BulkQuery is read-only and is registered at OPERATOR.
+/// read from write.  BulkRenew is registered at the same level.
 void install_bulk_commands(Tango::DeviceClass &device_class,
                            const CommandNames &names = {});
 
@@ -69,45 +67,6 @@ std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
                                         SubscriberConfig config,
                                         SubscriptionCallbacks callbacks,
                                         const CommandNames &names = {});
-
-/// Temporary compatibility projection for peers that still expose BulkQuery.
-/// New clients should establish a Subscription and use its Geometry/plan;
-/// this second state model is removed once StreamOffer discovery is deployed.
-struct BulkQueryResult
-{
-    Status status{Status::Ok};
-    std::uint32_t active_sessions{0};
-    std::uint32_t generation{0};
-    std::uint64_t max_frame_bytes{0};
-    std::uint32_t ring_depth{0};
-    std::uint32_t credit_window{0};
-
-    /// The declared frame layout.  These fields come from the publisher's
-    /// current geometry epoch; clients should not have to wait for a first
-    /// frame before sizing or laying out their destination.
-    ElementType element_type{ElementType::Unknown};
-    std::uint32_t element_size{0};
-    std::uint32_t rank{0};
-    std::array<std::uint64_t, k_max_rank> shape{};
-    std::array<std::uint64_t, k_max_rank> strides{};
-
-    /// `key=value;` pairs.  Free-form by design: an operator reads it, and the
-    /// set of counters may grow within a minor version.  It carries no UCX
-    /// address, no memory key, and no untruncated session identifier.
-    std::string counters;
-};
-
-/// Server-wide status of a device's bulk publisher, over the temporary
-/// compatibility BulkQuery command.
-///
-/// Server-wide because that is the question an operator has.  3.8 also allows a
-/// Query naming one session, which needs a `session_id` no public API hands out;
-/// that path is retained only for peers that have not yet adopted discovery.
-///
-/// Throws BulkException on a malformed reply, and lets Tango::DevFailed out of
-/// the command call itself -- a device that cannot be reached is the caller's
-/// problem to handle, not something to flatten into a status code.
-BulkQueryResult bulk_query(Tango::DeviceProxy &proxy, const CommandNames &names = {});
 
 } // namespace TangoBulk
 

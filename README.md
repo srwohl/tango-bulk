@@ -10,12 +10,12 @@ A UCX bulk-data plane for Tango device servers, built as an out-of-tree extensio
 **stock, unmodified** cppTango installation. Tango stays the control plane; UCX carries the
 frames.
 
-A device server opts in by linking a library and registering four ordinary Tango commands.
+A device server opts in by linking a library and registering three ordinary Tango commands.
 No cppTango ABI, event implementation, public class, IDL, build option, or upstream source
 file changes.
 
 > **Status: M4 — the stock-Tango adapter.** It is a Tango extension now, not a library with a
-> Tango-shaped plan. `BulkOpen` / `BulkRenew` / `BulkClose` / `BulkQuery` are ordinary commands
+> Tango-shaped plan. `BulkOpen` / `BulkRenew` / `BulkClose` are ordinary commands
 > on an ordinary device class; `TangoBulk::subscribe()` takes a stock `Tango::DeviceProxy`, opens a
 > session over it, renews on a timer, reconnects with backoff, and delivers frames on a
 > library-owned dispatch thread that never touches Tango or UCX. A device server integrates in
@@ -320,8 +320,8 @@ submit-and-progress loop; user callbacks never run on it. The subscriber receive
 registered ring and hands the application a reference-counted `FrameView` whose destruction
 *is* the credit return, so slow consumers apply backpressure by construction rather than by
 convention. Session leases over ordinary Tango commands (`BulkOpen` / `BulkRenew` /
-`BulkClose`) are the cleanup authority. `BulkQuery` remains only as a temporary compatibility
-command while StreamOffer discovery and Publisher observation are completed.
+`BulkClose`) are the cleanup authority. `BulkStreams` supplies a conservative discovery offer;
+`OpenReply` and `Subscription::plan()` remain authoritative for the established session.
 
 ## Licence
 
