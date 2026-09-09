@@ -115,7 +115,7 @@ class ReceiveArena : public CreditSink
 class SubscriberEngine final : public SubscriberTransport
 {
   public:
-    SubscriberEngine(SubscriberConfig config, std::shared_ptr<DeliveryQueue> delivery);
+    SubscriberEngine(SubscriberConfig config, std::shared_ptr<DeliveryIngress> delivery);
     ~SubscriberEngine() override;
 
     const std::vector<std::byte> &local_address() const noexcept override
@@ -230,7 +230,7 @@ class SubscriberEngine final : public SubscriberTransport
 
     ReleaseTracker tracker_;
 
-    std::shared_ptr<DeliveryQueue> delivery_;
+    std::shared_ptr<DeliveryIngress> delivery_;
 
     std::vector<Pending> pending_; ///< engine thread only; indexed by slot
 

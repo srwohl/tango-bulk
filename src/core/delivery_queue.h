@@ -17,6 +17,8 @@
 namespace TangoBulk::detail
 {
 
+class DeliveryIngress;
+
 struct DeliveryRead
 {
     enum class Kind : std::uint32_t
@@ -76,9 +78,9 @@ class DeliveryQueue
 
     std::size_t discard() noexcept;
 
-    /// Each transport receives a capability sharing this queue's storage and
-    /// descriptor. Retiring it makes late transport progress harmless.
-    std::shared_ptr<DeliveryQueue> make_ingress();
+    /// Each transport receives a capability sharing this queue's storage.
+    /// Retiring it makes late transport progress harmless.
+    std::shared_ptr<DeliveryIngress> make_ingress();
 
     void retire_ingress() noexcept;
 
@@ -93,10 +95,26 @@ class DeliveryQueue
     struct Ingress;
 
   private:
-    DeliveryQueue(std::shared_ptr<State> state, std::shared_ptr<Ingress> ingress) noexcept;
+    friend class DeliveryIngress;
+
+    bool push_from(const std::shared_ptr<Ingress> &ingress, FrameView frame) noexcept;
 
     std::shared_ptr<State> state_;
-    std::shared_ptr<Ingress> ingress_;
+};
+
+/// The only capability a transport needs: submit an accepted frame. Queue
+/// storage, wakeups, and terminal policy remain owned by DeliveryQueue.
+class DeliveryIngress
+{
+  public:
+    bool push(FrameView frame) noexcept;
+
+  private:
+    friend class DeliveryQueue;
+
+    explicit DeliveryIngress(std::shared_ptr<DeliveryQueue::Ingress> ingress) noexcept;
+
+    std::shared_ptr<DeliveryQueue::Ingress> ingress_;
 };
 
 } // namespace TangoBulk::detail

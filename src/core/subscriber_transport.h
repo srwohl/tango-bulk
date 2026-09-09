@@ -17,7 +17,7 @@
 namespace TangoBulk::detail
 {
 
-class DeliveryQueue;
+class DeliveryIngress;
 
 class SubscriberTransport
 {
@@ -43,7 +43,7 @@ class SubscriberTransport
 };
 
 std::unique_ptr<SubscriberTransport> make_subscriber_transport(
-    SubscriberConfig config, std::shared_ptr<DeliveryQueue> delivery);
+    SubscriberConfig config, std::shared_ptr<DeliveryIngress> delivery);
 
 } // namespace TangoBulk::detail
 

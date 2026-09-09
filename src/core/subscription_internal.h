@@ -32,7 +32,7 @@ using StreamDiscovery = std::function<StreamOffer(
     const std::string &, std::chrono::steady_clock::time_point)>;
 
 using TransportFactory = std::function<std::unique_ptr<SubscriberTransport>(
-    const SubscriberConfig &, std::shared_ptr<DeliveryQueue>)>;
+    const SubscriberConfig &, std::shared_ptr<DeliveryIngress>)>;
 
 /// A small test and embedding adapter for the same seam a real discovery
 /// source uses.  It owns copies of offers and never contacts coordination,
@@ -75,11 +75,17 @@ class SubscriptionFactory
     static std::unique_ptr<Subscription> open(SubscriberConfig config,
                                               CoordinationChannel channel,
                                               TransportFactory factory,
-                                              SubscriptionCallbacks callbacks);
+                                              SubscriptionCallbacks callbacks,
+                                              std::chrono::steady_clock::time_point
+                                                  establishment_deadline =
+                                                      std::chrono::steady_clock::time_point::max());
 
     static std::unique_ptr<Subscription> open_default(SubscriberConfig config,
                                                       CoordinationChannel channel,
-                                                      SubscriptionCallbacks callbacks);
+                                                      SubscriptionCallbacks callbacks,
+                                                      std::chrono::steady_clock::time_point
+                                                          establishment_deadline =
+                                                              std::chrono::steady_clock::time_point::max());
 };
 
 std::chrono::milliseconds backoff_delay(std::uint32_t attempt,

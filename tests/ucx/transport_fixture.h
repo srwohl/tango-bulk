@@ -27,13 +27,15 @@ struct TransportFixture
 {
     SubscriberConfig config;
     std::shared_ptr<detail::DeliveryQueue> delivery;
+    std::shared_ptr<detail::DeliveryIngress> ingress;
     detail::SubscriberEngine engine;
 
     explicit TransportFixture(SubscriberConfig cfg = subscriber_config()) :
         config(std::move(cfg)),
         delivery(std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
                                                          config.drop_policy)),
-        engine(config, delivery)
+        ingress(delivery->make_ingress()),
+        engine(config, ingress)
     {
     }
 

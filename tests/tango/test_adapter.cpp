@@ -204,7 +204,7 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
         std::lock_guard<std::mutex> lock(sink.mutex);
 
         // 5.2: user callbacks never run on the UCX engine thread, and in
-        // DispatchThread mode they do not run on the caller's either.
+        // Push callbacks do not run on the caller's thread either.
         for(const std::thread::id &id : sink.callback_threads)
         {
             CHECK(id != std::this_thread::get_id());
@@ -332,12 +332,12 @@ TEST_CASE("The renew timer keeps a session past its lease", "[tango][m4]")
     subscriber.reset();
 }
 
-TEST_CASE("Manual delivery runs the callback on the polling thread", "[tango][m4]")
+TEST_CASE("Push delivery runs callbacks on the library thread", "[tango][m4]")
 {
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
     SubscriberConfig config = subscriber_config();
-    config.delivery_mode = DeliveryMode::Manual;
+    config.delivery_mode = DeliveryMode::Push;
 
     Sink sink;
     auto subscriber = subscribe(proxy, config, sink.callbacks());
@@ -349,19 +349,13 @@ TEST_CASE("Manual delivery runs the callback on the polling thread", "[tango][m4
     accepted >> count;
     REQUIRE(count == 2);
 
-    std::size_t delivered = 0;
-    REQUIRE(eventually(
-        [&]
-        {
-            delivered += subscriber->poll(20ms, 8);
-            return delivered >= 2;
-        }));
+    REQUIRE(eventually([&sink] { return sink.frame_count.load() >= 2; }));
 
     {
         std::lock_guard<std::mutex> lock(sink.mutex);
         for(const std::thread::id &id : sink.callback_threads)
         {
-            CHECK(id == std::this_thread::get_id());
+            CHECK(id != std::this_thread::get_id());
         }
         sink.frames.clear();
     }

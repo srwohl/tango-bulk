@@ -189,14 +189,14 @@ struct Script
     }
 
 
-    std::shared_ptr<detail::DeliveryQueue> delivery;
+    std::shared_ptr<detail::DeliveryIngress> delivery;
 
     std::deque<ScriptedFrame> staged;
 
-    void attach(std::shared_ptr<detail::DeliveryQueue> queue)
+    void attach(std::shared_ptr<detail::DeliveryIngress> ingress)
     {
         std::lock_guard<std::mutex> lock(mutex);
-        delivery = std::move(queue);
+        delivery = std::move(ingress);
 
         for(ScriptedFrame &frame : staged)
         {
@@ -243,7 +243,7 @@ struct Script
 class FakeTransport final : public detail::SubscriberTransport
 {
   public:
-    FakeTransport(Script &script, std::shared_ptr<detail::DeliveryQueue> delivery) :
+    FakeTransport(Script &script, std::shared_ptr<detail::DeliveryIngress> delivery) :
         script_(script)
     {
         script_.transports_built.fetch_add(1, std::memory_order_relaxed);
@@ -304,7 +304,7 @@ inline detail::TransportFactory fake_factory(Script &script,
                                              std::shared_ptr<FakeTransport *> latest = nullptr)
 {
     return [&script, latest](const SubscriberConfig &,
-                             std::shared_ptr<detail::DeliveryQueue> delivery)
+                             std::shared_ptr<detail::DeliveryIngress> delivery)
         -> std::unique_ptr<detail::SubscriberTransport>
     {
         auto transport = std::make_unique<FakeTransport>(script, std::move(delivery));
@@ -387,7 +387,7 @@ inline SubscriberConfig subscription_config()
     config.ring_depth = 4;
     config.credit_window = 2;
     config.delivery_queue_depth = 8;
-    config.delivery_mode = DeliveryMode::Manual;
+    config.delivery_mode = DeliveryMode::Push;
     config.reconnect_backoff_ms = 5;
     config.reconnect_max_attempts = 3;
     config.command_timeout_ms = 500;

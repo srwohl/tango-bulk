@@ -50,6 +50,7 @@ DeliveryRead::Kind read_kind(Terminal terminal) noexcept
 
 struct DeliveryQueue::Ingress
 {
+    std::weak_ptr<State> state;
     std::atomic<bool> retired{false};
     std::atomic<std::uint64_t> active_pushes{0};
 };
@@ -87,7 +88,7 @@ struct DeliveryQueue::State
     BulkError terminal_error;
 
     std::mutex ingress_mutex;
-    std::shared_ptr<Ingress> current_ingress;
+    std::shared_ptr<DeliveryQueue::Ingress> current_ingress;
 
     std::atomic<std::uint64_t> taken{0};
     std::atomic<std::uint64_t> dropped{0};
@@ -97,12 +98,6 @@ struct DeliveryQueue::State
 
 DeliveryQueue::DeliveryQueue(std::size_t capacity, DropPolicy policy) :
     state_(std::make_shared<State>(capacity, policy))
-{
-}
-
-DeliveryQueue::DeliveryQueue(std::shared_ptr<State> state, std::shared_ptr<Ingress> ingress) noexcept :
-    state_(std::move(state)),
-    ingress_(std::move(ingress))
 {
 }
 
@@ -193,32 +188,34 @@ void update_high_water(std::shared_ptr<DeliveryQueue::State> const &state,
     }
 }
 
-bool DeliveryQueue::push(FrameView frame) noexcept
+bool push_frame(std::shared_ptr<DeliveryQueue::State> const &state,
+                std::shared_ptr<DeliveryQueue::Ingress> const &ingress,
+                FrameView frame) noexcept
 {
-    if(ingress_ != nullptr)
+    if(ingress != nullptr)
     {
-        ingress_->active_pushes.fetch_add(1, std::memory_order_acq_rel);
+        ingress->active_pushes.fetch_add(1, std::memory_order_acq_rel);
     }
-    state_->active_pushes.fetch_add(1, std::memory_order_acq_rel);
+    state->active_pushes.fetch_add(1, std::memory_order_acq_rel);
 
-    const bool current = ingress_ == nullptr || !ingress_->retired.load(std::memory_order_acquire);
-    const bool accepting = state_->accepting.load(std::memory_order_acquire);
+    const bool current = ingress == nullptr || !ingress->retired.load(std::memory_order_acquire);
+    const bool accepting = state->accepting.load(std::memory_order_acquire);
     bool queued = false;
     bool dropped = false;
 
     if(current && accepting)
     {
-        queued = state_->queue.try_push(std::move(frame));
+        queued = state->queue.try_push(std::move(frame));
 
-        if(!queued && state_->policy == DropPolicy::DropOldest)
+        if(!queued && state->policy == DropPolicy::DropOldest)
         {
             FrameView oldest;
-            if(state_->queue.try_pop(oldest))
+            if(state->queue.try_pop(oldest))
             {
                 oldest.reset();
-                consume_one(state_);
+                consume_one(state);
                 dropped = true;
-                queued = state_->queue.try_push(std::move(frame));
+                queued = state->queue.try_push(std::move(frame));
             }
         }
 
@@ -231,38 +228,71 @@ bool DeliveryQueue::push(FrameView frame) noexcept
     if(!current || !accepting)
     {
         frame.reset();
-        state_->discarded.fetch_add(1, std::memory_order_relaxed);
-        if(ingress_ != nullptr)
+        state->discarded.fetch_add(1, std::memory_order_relaxed);
+        if(ingress != nullptr)
         {
-            ingress_->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
+            ingress->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
         }
-        state_->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
+        state->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
         return false;
     }
 
     if(dropped)
     {
-        state_->dropped.fetch_add(1, std::memory_order_relaxed);
+        state->dropped.fetch_add(1, std::memory_order_relaxed);
     }
 
     if(queued)
     {
-        update_high_water(state_, state_->queue.size());
-        signal_one(state_);
+        update_high_water(state, state->queue.size());
+        signal_one(state);
     }
 
-    if(ingress_ != nullptr)
+    if(ingress != nullptr)
     {
-        ingress_->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
+        ingress->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
     }
-    state_->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
+    state->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
 
     return queued;
 }
 
-std::shared_ptr<DeliveryQueue> DeliveryQueue::make_ingress()
+bool DeliveryQueue::push_from(const std::shared_ptr<Ingress> &ingress, FrameView frame) noexcept
+{
+    return push_frame(state_, ingress, std::move(frame));
+}
+
+bool DeliveryQueue::push(FrameView frame) noexcept
+{
+    return push_from(nullptr, std::move(frame));
+}
+
+DeliveryIngress::DeliveryIngress(std::shared_ptr<DeliveryQueue::Ingress> ingress) noexcept :
+    ingress_(std::move(ingress))
+{
+}
+
+bool DeliveryIngress::push(FrameView frame) noexcept
+{
+    if(!ingress_)
+    {
+        frame.reset();
+        return false;
+    }
+
+    const std::shared_ptr<DeliveryQueue::State> state = ingress_->state.lock();
+    if(!state)
+    {
+        frame.reset();
+        return false;
+    }
+    return push_frame(state, ingress_, std::move(frame));
+}
+
+std::shared_ptr<DeliveryIngress> DeliveryQueue::make_ingress()
 {
     auto ingress = std::make_shared<Ingress>();
+    ingress->state = state_;
     std::shared_ptr<Ingress> previous;
     {
         std::lock_guard<std::mutex> lock(state_->ingress_mutex);
@@ -282,7 +312,7 @@ std::shared_ptr<DeliveryQueue> DeliveryQueue::make_ingress()
         }
     }
 
-    return std::shared_ptr<DeliveryQueue>(new DeliveryQueue(state_, std::move(ingress)));
+    return std::shared_ptr<DeliveryIngress>(new DeliveryIngress(std::move(ingress)));
 }
 
 void DeliveryQueue::retire_ingress() noexcept
@@ -326,6 +356,7 @@ std::size_t DeliveryQueue::discard() noexcept
 void set_terminal(std::shared_ptr<DeliveryQueue::State> const &state,
                   Terminal terminal,
                   BulkError error,
+                  bool wait_for_pushes,
                   bool discard) noexcept
 {
     std::lock_guard<std::mutex> transition_lock(state->transition_mutex);
@@ -335,7 +366,7 @@ void set_terminal(std::shared_ptr<DeliveryQueue::State> const &state,
     }
 
     state->accepting.store(false, std::memory_order_release);
-    while(state->active_pushes.load(std::memory_order_acquire) != 0)
+    while(wait_for_pushes && state->active_pushes.load(std::memory_order_acquire) != 0)
     {
         std::this_thread::yield();
     }
@@ -350,6 +381,13 @@ void set_terminal(std::shared_ptr<DeliveryQueue::State> const &state,
         }
         drain_wakeups(state);
     }
+    else if(terminal == Terminal::Interrupted)
+    {
+        // Interrupt is deliberately constant-time. The terminal boundary
+        // makes queued frames unclaimable; the queue storage releases them
+        // when the subscription is destroyed instead of walking it here.
+        state->discarded.fetch_add(state->queue.size(), std::memory_order_relaxed);
+    }
 
     {
         std::lock_guard<std::mutex> error_lock(state->terminal_mutex);
@@ -361,22 +399,22 @@ void set_terminal(std::shared_ptr<DeliveryQueue::State> const &state,
 
 void DeliveryQueue::fail(BulkError error) noexcept
 {
-    set_terminal(state_, Terminal::SessionFailed, std::move(error), false);
+    set_terminal(state_, Terminal::SessionFailed, std::move(error), true, false);
 }
 
 void DeliveryQueue::callback_failed(BulkError error) noexcept
 {
-    set_terminal(state_, Terminal::CallbackFailed, std::move(error), true);
+    set_terminal(state_, Terminal::CallbackFailed, std::move(error), true, true);
 }
 
 void DeliveryQueue::close() noexcept
 {
-    set_terminal(state_, Terminal::Closed, BulkError{}, true);
+    set_terminal(state_, Terminal::Closed, BulkError{}, true, true);
 }
 
 void DeliveryQueue::interrupt() noexcept
 {
-    set_terminal(state_, Terminal::Interrupted, BulkError{}, true);
+    set_terminal(state_, Terminal::Interrupted, BulkError{}, false, false);
 }
 
 DeliveryQueue::Stats DeliveryQueue::stats() const noexcept
@@ -388,6 +426,10 @@ DeliveryQueue::Stats DeliveryQueue::stats() const noexcept
     out.dropped = state_->dropped.load(std::memory_order_relaxed);
     out.discarded = state_->discarded.load(std::memory_order_relaxed);
     out.high_water = state_->high_water.load(std::memory_order_relaxed);
+    if(state_->terminal.load(std::memory_order_acquire) == Terminal::Interrupted)
+    {
+        out.depth = 0;
+    }
     return out;
 }
 
@@ -493,13 +535,19 @@ DeliveryRead terminal_result(std::shared_ptr<DeliveryQueue::State> const &state,
 DeliveryRead DeliveryQueue::try_read_result()
 {
     DeliveryRead result;
+    Terminal terminal = state_->terminal.load(std::memory_order_acquire);
+    if(terminal != Terminal::None && terminal != Terminal::SessionFailed)
+    {
+        return terminal_result(state_, terminal);
+    }
+
     if(take_one(state_, result.frame))
     {
         result.kind = DeliveryRead::Kind::Frame;
         return result;
     }
 
-    const Terminal terminal = state_->terminal.load(std::memory_order_acquire);
+    terminal = state_->terminal.load(std::memory_order_acquire);
     if(terminal != Terminal::None)
     {
         return terminal_result(state_, terminal);
@@ -514,13 +562,19 @@ DeliveryRead DeliveryQueue::read_result(std::chrono::steady_clock::time_point de
     for(;;)
     {
         DeliveryRead result;
+        Terminal terminal = state_->terminal.load(std::memory_order_acquire);
+        if(terminal != Terminal::None && terminal != Terminal::SessionFailed)
+        {
+            return terminal_result(state_, terminal);
+        }
+
         if(take_one(state_, result.frame))
         {
             result.kind = DeliveryRead::Kind::Frame;
             return result;
         }
 
-        const Terminal terminal = state_->terminal.load(std::memory_order_acquire);
+        terminal = state_->terminal.load(std::memory_order_acquire);
         if(terminal != Terminal::None)
         {
             return terminal_result(state_, terminal);

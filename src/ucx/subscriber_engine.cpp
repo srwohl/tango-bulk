@@ -152,7 +152,7 @@ struct SubscriberEngine::Pending
 };
 
 SubscriberEngine::SubscriberEngine(SubscriberConfig config,
-                                   std::shared_ptr<DeliveryQueue> delivery) :
+                                   std::shared_ptr<DeliveryIngress> delivery) :
     config_(std::move(config)),
     tracker_(config_.ring_depth),
     delivery_(std::move(delivery)),
@@ -964,7 +964,7 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
 }
 
 std::unique_ptr<SubscriberTransport> make_subscriber_transport(
-    SubscriberConfig config, std::shared_ptr<DeliveryQueue> delivery)
+    SubscriberConfig config, std::shared_ptr<DeliveryIngress> delivery)
 {
     // point of the seam: `Subscription` constructs a transport without naming
     // the concrete type, and therefore without compiling against `ucp/*`.

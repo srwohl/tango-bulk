@@ -112,7 +112,7 @@ int main(int argc, char *argv[])
         config.stream_name = stream;
         config.receive_plan = TangoBulk::ReceivePlan::from_limits(
             slot_bytes, ring_depth, credit_window);
-        config.delivery_mode = TangoBulk::DeliveryMode::DispatchThread;
+        config.delivery_mode = TangoBulk::DeliveryMode::Push;
         config.reconnect_policy = TangoBulk::ReconnectPolicy::BoundedRetry;
         config.receive_buffer = receive_buffer;
         config.receive_buffer_bytes = ring_bytes;
@@ -129,7 +129,7 @@ int main(int argc, char *argv[])
         callbacks.on_frame =
             [&frames, &bytes, gpu, buffer_begin, buffer_end](TangoBulk::FrameView view)
             {
-                // DeliveryMode::DispatchThread runs this on a library thread,
+                // DeliveryMode::Push runs this on a library thread,
                 // and the CUDA runtime's current device is per thread: the
                 // cudaSetDevice above bound main(), not this one, so a kernel
                 // launched below would go to device 0 whatever `gpu` says.

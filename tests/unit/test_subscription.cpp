@@ -65,7 +65,7 @@ TEST_CASE("a transport factory that returns nothing is refused, not dereferenced
         detail::SubscriptionFactory::open(
             config,
             fake_channel(script),
-            [](const SubscriberConfig &, std::shared_ptr<detail::DeliveryQueue>)
+            [](const SubscriberConfig &, std::shared_ptr<detail::DeliveryIngress>)
             { return std::unique_ptr<detail::SubscriberTransport>{}; },
             noop_callbacks()),
         BulkException);
@@ -205,7 +205,7 @@ TEST_CASE("reconnect gives up after the configured attempts and says so",
     SubscriberConfig config = subscription_config();
     config.reconnect_max_attempts = 3;
 
-    config.delivery_mode = DeliveryMode::DispatchThread;
+    config.delivery_mode = DeliveryMode::Push;
 
     SubscriptionCallbacks callbacks = noop_callbacks();
 
@@ -284,7 +284,7 @@ TEST_CASE("a reopened session that describes a different array is refused",
     }
 
     SubscriberConfig config = subscription_config();
-    config.delivery_mode = DeliveryMode::DispatchThread;
+    config.delivery_mode = DeliveryMode::Push;
     config.reconnect_max_attempts = 10;
 
     SubscriptionCallbacks callbacks = noop_callbacks();
@@ -392,30 +392,6 @@ TEST_CASE("no session means an all-zero geometry, not a stale one",
 }
 
 
-TEST_CASE("poll() is refused when a dispatch thread is already delivering",
-          "[core][subscription]")
-{
-    Script script;
-    SubscriberConfig config = subscription_config();
-    config.delivery_mode = DeliveryMode::DispatchThread;
-
-    auto subscription = detail::SubscriptionFactory::open(
-        config, fake_channel(script), fake_factory(script), noop_callbacks());
-
-    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{1}, 1), BulkException);
-}
-
-TEST_CASE("poll() requires an explicit positive bound", "[core][subscription]")
-{
-    Script script;
-    auto subscription = detail::SubscriptionFactory::open(
-        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
-
-    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{0}, 0), BulkException);
-    CHECK(subscription->plan().validate() == Status::Ok);
-}
-
-
 struct Delivered
 {
     std::mutex mutex;
@@ -469,7 +445,7 @@ TEST_CASE("a frame the transport received reaches the application", "[core][subs
     auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(subscription->poll(std::chrono::milliseconds{200}, 3) == 3);
+    REQUIRE(eventually([&seen] { return seen.count() == 3; }));
 
     REQUIRE(seen.count() == 3);
     CHECK(seen.sequences == std::vector<std::uint64_t>{1, 2, 3});
@@ -508,9 +484,7 @@ TEST_CASE("a manual callback failure is surfaced and stops the subscription",
     auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{200}, 1), std::runtime_error);
-    CHECK(subscription->state() == SubscriberState::Failed);
-    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{0}, 1), BulkException);
+    REQUIRE(eventually([&subscription] { return subscription->state() == SubscriberState::Failed; }));
 }
 
 TEST_CASE("a dispatch callback may destroy its subscription",
@@ -518,7 +492,7 @@ TEST_CASE("a dispatch callback may destroy its subscription",
 {
     Script script;
     SubscriberConfig config = subscription_config();
-    config.delivery_mode = DeliveryMode::DispatchThread;
+    config.delivery_mode = DeliveryMode::Push;
 
     std::unique_ptr<Subscription> subscription;
     std::atomic<bool> callback_finished{false};
@@ -547,7 +521,7 @@ TEST_CASE("a dispatch callback failure terminates delivery once",
     script.receive(2);
 
     SubscriberConfig config = subscription_config();
-    config.delivery_mode = DeliveryMode::DispatchThread;
+    config.delivery_mode = DeliveryMode::Push;
 
     SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [](FrameView) { throw std::runtime_error("callback failed"); };
@@ -573,7 +547,6 @@ TEST_CASE("close is explicit, idempotent, and returns the subscription to Closed
     subscription->close();
     CHECK(subscription->state() == SubscriberState::Closed);
     CHECK(subscription->counters().delivery_queue_depth == 0);
-    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{0}, 1), BulkException);
     CHECK(script.closes.load() == 1);
 
     subscription->close();
@@ -590,7 +563,6 @@ TEST_CASE("interrupt is sticky and distinct from an orderly close",
 
     subscription->interrupt();
     CHECK(subscription->snapshot().interrupted);
-    CHECK_THROWS_AS(subscription->poll(std::chrono::milliseconds{0}, 1), BulkException);
     CHECK(script.closes.load() == 0);
 
     subscription->interrupt();
@@ -611,11 +583,8 @@ TEST_CASE("frames arriving after the open are delivered too", "[core][subscripti
     auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(subscription->poll(std::chrono::milliseconds{5}, 1) == 0);
-
     script.receive(7);
-    CHECK(subscription->poll(std::chrono::milliseconds{500}, 1) == 1);
-    REQUIRE(seen.count() == 1);
+    REQUIRE(eventually([&seen] { return seen.count() == 1; }));
     CHECK(seen.sequences.front() == 7);
 }
 
@@ -626,7 +595,7 @@ TEST_CASE("a dispatch thread delivers without the application asking",
     Delivered seen;
 
     SubscriberConfig config = subscription_config();
-    config.delivery_mode = DeliveryMode::DispatchThread;
+    config.delivery_mode = DeliveryMode::Push;
 
     SubscriptionCallbacks callbacks = noop_callbacks();
     callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
@@ -646,51 +615,6 @@ TEST_CASE("a dispatch thread delivers without the application asking",
     CHECK_FALSE(seen.on(std::this_thread::get_id()));
 }
 
-TEST_CASE("poll() delivers no more frames than it was asked for", "[core][subscription]")
-{
-    Script script;
-    Delivered seen;
-
-    for(std::uint64_t sequence = 1; sequence <= 5; ++sequence)
-    {
-        script.receive(sequence);
-    }
-
-    SubscriptionCallbacks callbacks = noop_callbacks();
-    callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
-
-    auto subscription = detail::SubscriptionFactory::open(
-        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
-
-    CHECK(subscription->poll(std::chrono::milliseconds{200}, 2) == 2);
-    CHECK(seen.count() == 2);
-
-    CHECK(subscription->poll(std::chrono::milliseconds{200}, 3) == 3);
-    REQUIRE(seen.count() == 5);
-    CHECK(seen.sequences == std::vector<std::uint64_t>{1, 2, 3, 4, 5});
-}
-
-TEST_CASE("frames are delivered on the polling thread, never on a coordination thread",
-          "[core][subscription]")
-{
-    Script script;
-    Delivered seen;
-
-    script.receive(1);
-    script.receive(2);
-
-    SubscriptionCallbacks callbacks = noop_callbacks();
-    callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
-
-    auto subscription = detail::SubscriptionFactory::open(
-        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
-
-    CHECK(subscription->poll(std::chrono::milliseconds{200}, 2) == 2);
-
-    CHECK(seen.thread_count() == 1);
-    CHECK(seen.on(std::this_thread::get_id()));
-}
-
 TEST_CASE("a frame the application kept outlives the session that delivered it",
           "[core][subscription]")
 {
@@ -705,8 +629,7 @@ TEST_CASE("a frame the application kept outlives the session that delivered it",
     auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(subscription->poll(std::chrono::milliseconds{200}, 1) == 1);
-    REQUIRE(static_cast<bool>(retained));
+    REQUIRE(eventually([&retained] { return static_cast<bool>(retained); }));
 
     subscription.reset();
 
@@ -731,8 +654,7 @@ TEST_CASE("a frame delivered before a reconnect survives the session that replac
     auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    CHECK(subscription->poll(std::chrono::milliseconds{200}, 1) == 1);
-    REQUIRE(static_cast<bool>(retained));
+    REQUIRE(eventually([&retained] { return static_cast<bool>(retained); }));
 
     script.refuse_next_renew(Status::SessionExpired);
     REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
@@ -741,7 +663,7 @@ TEST_CASE("a frame delivered before a reconnect survives the session that replac
     CHECK(*reinterpret_cast<const std::uint16_t *>(retained.data()) == 11);
 
     script.receive(12);
-    CHECK(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}, 1) == 1; }));
+    REQUIRE(eventually([&retained] { return static_cast<bool>(retained); }));
 }
 
 
@@ -753,20 +675,27 @@ bool readable(int fd)
     return ::poll(&descriptor, 1, 0) > 0;
 }
 
-TEST_CASE("a consumer blocked in poll() does not delay replacing the transport",
+TEST_CASE("a Pull reader blocked on delivery does not delay replacing the transport",
           "[core][subscription]")
 {
     Script script;
+    SubscriberConfig config = subscription_config();
+    config.delivery_mode = DeliveryMode::Pull;
 
     auto subscription = detail::SubscriptionFactory::open(
-        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+        config, fake_channel(script), fake_factory(script), SubscriptionCallbacks{});
 
     REQUIRE(eventually([&script] { return script.transports_built.load() == 1; }));
 
-    std::atomic<bool> still_polling{true};
+    std::atomic<bool> still_reading{true};
+    FrameView received;
     std::thread consumer([&] {
-        subscription->poll(std::chrono::seconds{2}, 1);
-        still_polling.store(false);
+        const std::optional<FrameView> frame = subscription->read_for(std::chrono::seconds{2});
+        if(frame)
+        {
+            received = std::move(*frame);
+        }
+        still_reading.store(false);
     });
 
     std::this_thread::sleep_for(std::chrono::milliseconds{50});
@@ -781,18 +710,22 @@ TEST_CASE("a consumer blocked in poll() does not delay replacing the transport",
     CHECK(replaced);
     CHECK(elapsed < std::chrono::milliseconds{1'000});
 
-    CHECK(still_polling.load());
+    CHECK(still_reading.load());
 
     script.receive(1);
     consumer.join();
+    REQUIRE(static_cast<bool>(received));
+    CHECK(received.sequence() == 1);
 }
 
 TEST_CASE("the readiness descriptor survives a reconnect", "[core][subscription]")
 {
     Script script;
+    SubscriberConfig config = subscription_config();
+    config.delivery_mode = DeliveryMode::Pull;
 
     auto subscription = detail::SubscriptionFactory::open(
-        subscription_config(), fake_channel(script), fake_factory(script), noop_callbacks());
+        config, fake_channel(script), fake_factory(script), SubscriptionCallbacks{});
 
     const int before = subscription->fd();
     REQUIRE(before >= 0);
@@ -802,47 +735,44 @@ TEST_CASE("the readiness descriptor survives a reconnect", "[core][subscription]
 
     CHECK(subscription->fd() == before);
 
-    Delivered seen;
     script.receive(9);
-    REQUIRE(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}, 1) == 1; }));
+    const std::optional<FrameView> frame = subscription->read_for(50ms);
+    REQUIRE(frame.has_value());
+    CHECK(frame->sequence() == 9);
 }
 
-TEST_CASE("an empty poll arms the descriptor, and a frame makes it readable",
+TEST_CASE("an empty Pull read arms the descriptor, and a frame makes it readable",
           "[core][subscription]")
 {
     Script script;
-    Delivered seen;
-
-    SubscriptionCallbacks callbacks = noop_callbacks();
-    callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
+    SubscriberConfig config = subscription_config();
+    config.delivery_mode = DeliveryMode::Pull;
 
     auto subscription = detail::SubscriptionFactory::open(
-        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+        config, fake_channel(script), fake_factory(script), SubscriptionCallbacks{});
 
     REQUIRE(subscription->fd() >= 0);
 
-    CHECK(subscription->poll(std::chrono::milliseconds{0}, 1) == 0);
+    CHECK_FALSE(subscription->try_read().has_value());
     CHECK_FALSE(readable(subscription->fd()));
 
     script.receive(4);
 
     CHECK(readable(subscription->fd()));
-    CHECK(subscription->poll(std::chrono::milliseconds{0}, 1) == 1);
-    REQUIRE(seen.count() == 1);
-    CHECK(seen.sequences.front() == 4);
+    const std::optional<FrameView> frame = subscription->try_read();
+    REQUIRE(frame.has_value());
+    CHECK(frame->sequence() == 4);
 }
 
 TEST_CASE("frames the retired session left behind are discarded, not delivered later",
           "[core][subscription]")
 {
     Script script;
-    Delivered seen;
-
-    SubscriptionCallbacks callbacks = noop_callbacks();
-    callbacks.on_frame = [&seen](FrameView frame) { seen.record(frame); };
+    SubscriberConfig config = subscription_config();
+    config.delivery_mode = DeliveryMode::Pull;
 
     auto subscription = detail::SubscriptionFactory::open(
-        subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
+        config, fake_channel(script), fake_factory(script), SubscriptionCallbacks{});
 
     script.receive(1);
     REQUIRE(eventually([&subscription] {
@@ -852,13 +782,12 @@ TEST_CASE("frames the retired session left behind are discarded, not delivered l
     script.refuse_next_renew(Status::SessionExpired);
     REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
 
-    CHECK(subscription->poll(std::chrono::milliseconds{50}, 1) == 0);
-    CHECK(seen.count() == 0);
+    CHECK_FALSE(subscription->try_read().has_value());
 
     script.receive(2);
-    REQUIRE(eventually([&] { return subscription->poll(std::chrono::milliseconds{50}, 1) == 1; }));
-    REQUIRE(seen.count() == 1);
-    CHECK(seen.sequences.front() == 2);
+    const std::optional<FrameView> frame = subscription->read_for(50ms);
+    REQUIRE(frame.has_value());
+    CHECK(frame->sequence() == 2);
 }
 
 
