@@ -330,6 +330,7 @@ struct BulkPublisher::Impl
         std::uint64_t dropped_for_session{0};
         std::uint64_t processed_ordinal{0};
         std::size_t sends_inflight{0};
+        std::atomic<std::uint64_t> observed_lag_frames{0};
     };
 
     /// Endpoint creation is a `ucp_*` call, so it belongs to the engine thread
@@ -976,7 +977,9 @@ struct BulkPublisher::Impl
 
             // The laggard, not the last one to speak: under fan-out the useful
             // reading is how far behind the slowest consumer has fallen.
-            worst_outstanding = std::max(worst_outstanding, session.window.outstanding());
+            const std::uint64_t outstanding = session.window.outstanding();
+            session.observed_lag_frames.store(outstanding, std::memory_order_release);
+            worst_outstanding = std::max(worst_outstanding, outstanding);
         }
 
         const std::uint64_t admission_credit =
@@ -1525,9 +1528,36 @@ PublisherSnapshot BulkPublisher::snapshot() const
     out.stream_name = impl_->config.stream_name;
     out.geometry = detail::to_geometry(impl_->current_geometry());
     out.counters = counters();
-    out.active_sessions = impl_->armed_sessions.load(std::memory_order_acquire);
+    out.transport = "ActiveMessage";
+    out.worst_lag_frames = out.counters.credits_outstanding;
     out.sampled_at_steady_ns = now_steady_ms() * 1'000'000ull;
     out.accepting = impl_->running.load(std::memory_order_acquire);
+
+    // Session identity and state are publisher-owned observation. Copy them
+    // while the coordination table is protected; the Tango adapter never
+    // reaches into this table or waits on a remote operation.
+    const std::lock_guard<std::mutex> lock(impl_->session_mutex);
+    for(const std::unique_ptr<Impl::Session> &held : impl_->sessions)
+    {
+        const Impl::Session &session = *held;
+        const Protocol::SessionState state = session.state.load(std::memory_order_acquire);
+        if(state != Protocol::SessionState::Open && state != Protocol::SessionState::Armed &&
+           state != Protocol::SessionState::Active)
+        {
+            continue;
+        }
+
+        PublisherSnapshot::SessionObservation observation;
+        observation.session_id = Protocol::to_hex(session.id);
+        observation.state = Protocol::to_string(state);
+        observation.lag_frames =
+            session.observed_lag_frames.load(std::memory_order_acquire);
+        out.sessions.push_back(std::move(observation));
+        if(state == Protocol::SessionState::Armed || state == Protocol::SessionState::Active)
+        {
+            ++out.active_sessions;
+        }
+    }
     return out;
 }
 

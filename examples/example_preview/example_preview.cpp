@@ -241,6 +241,7 @@ class PreviewDetectorClass : public Tango::DeviceClass
     void attribute_factory(std::vector<Tango::Attr *> &attributes) override
     {
         attributes.push_back(new PreviewAttr());
+        install_bulk_attributes(attributes);
     }
 
     void device_factory(const Tango::DevVarStringArray *devices) override

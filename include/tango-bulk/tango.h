@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // The one public header allowed to name Tango types, and the reason the
 // layering check has an explicit exception for it.  Note what is *not* here:
@@ -23,6 +24,7 @@ namespace Tango
 class DeviceClass;
 class DeviceImpl;
 class DeviceProxy;
+class Attr;
 } // namespace Tango
 
 namespace TangoBulk
@@ -51,6 +53,13 @@ struct CommandNames
 /// read from write.  BulkRenew is registered at the same level.
 void install_bulk_commands(Tango::DeviceClass &device_class,
                            const CommandNames &names = {});
+
+/// Call from DeviceClass::attribute_factory(). Appends fixed, read-only
+/// BulkStreams, BulkSessions, BulkFramesPublished, BulkFramesDropped,
+/// BulkTransport, and BulkWorstLagFrames attributes. BulkStreams remains the
+/// pre-Open discovery marker; every other value is copied from one publisher
+/// snapshot. The registry protects publisher lifetime but is never held across I/O.
+void install_bulk_attributes(std::vector<Tango::Attr *> &attributes);
 
 /// Call from DeviceImpl::init_device(), so the installed commands can find the
 /// publisher.  Detach in delete_device().
