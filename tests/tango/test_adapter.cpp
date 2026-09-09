@@ -184,6 +184,27 @@ TEST_CASE("BulkQuery reports the publisher an operator can see", "[tango][m4]")
     CHECK(status.counters.find("rkey") == std::string::npos);
 }
 
+TEST_CASE("BulkStreams reports the fixed conservative offer row", "[tango][discovery]")
+{
+    Tango::DeviceProxy proxy(DeviceServer::instance().device());
+
+    Tango::DeviceAttribute attribute = proxy.read_attribute("BulkStreams");
+    CHECK(attribute.get_type() == Tango::DEV_STRING);
+    CHECK(attribute.get_data_format() == Tango::SPECTRUM);
+    CHECK_FALSE(attribute.has_failed());
+    CHECK_FALSE(attribute.is_empty());
+    std::vector<std::string> rows;
+    REQUIRE(attribute.extract_read(rows));
+    REQUIRE(rows.size() == 1);
+
+    const StreamOffer offer = StreamOffer::from_bulk_stream_row(rows.front());
+    CHECK(offer.stream_name == "bulk.tango");
+    CHECK(offer.outcome() == StreamOffer::Outcome::Available);
+    CHECK(offer.geometry.max_frame_bytes == k_frame_bytes);
+    CHECK(offer.geometry.ring_depth == 8);
+    CHECK(offer.geometry.credit_window == 4);
+}
+
 TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tango][m4]")
 {
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
