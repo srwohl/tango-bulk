@@ -43,6 +43,39 @@ void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexc
     total.pinned_bytes = part.pinned_bytes;
 }
 
+[[noreturn]] void throw_delivery_terminal(const detail::DeliveryRead &result)
+{
+    switch(result.kind)
+    {
+    case detail::DeliveryRead::Kind::Closed:
+        throw BulkException(
+            BulkError{Status::Shutdown, "the subscription is closed", "subscriber"});
+    case detail::DeliveryRead::Kind::Interrupted:
+        throw BulkException(
+            BulkError{Status::Shutdown, "the subscription was interrupted", "subscriber"});
+    case detail::DeliveryRead::Kind::SessionFailed:
+        throw BulkException(result.error.status == Status::Ok
+                                ? BulkError{Status::TransportFailure,
+                                            "the subscription failed",
+                                            "subscriber"}
+                                : result.error);
+    case detail::DeliveryRead::Kind::CallbackFailed:
+        throw BulkException(result.error.status == Status::Ok
+                                ? BulkError{Status::Internal,
+                                            "the frame callback failed",
+                                            "subscriber"}
+                                : result.error);
+    case detail::DeliveryRead::Kind::Frame:
+    case detail::DeliveryRead::Kind::Empty:
+    case detail::DeliveryRead::Kind::Timeout:
+        break;
+    }
+
+    throw BulkException(BulkError{Status::Internal,
+                                  "the delivery result was not terminal",
+                                  "subscriber"});
+}
+
 } // namespace
 
 
@@ -314,21 +347,24 @@ struct Subscription::Impl
 
         try
         {
-            fresh = factory(config, delivery);
+            fresh = factory(config, delivery->make_ingress());
         }
         catch(const BulkException &e)
         {
+            delivery->retire_ingress();
             error = e.error();
             return false;
         }
         catch(const std::exception &e)
         {
+            delivery->retire_ingress();
             error = BulkError{Status::Internal, e.what(), "subscriber"};
             return false;
         }
 
         if(!fresh)
         {
+            delivery->retire_ingress();
             error = BulkError{
                 Status::Internal, "the transport factory returned nothing", "subscriber"};
             return false;
@@ -348,6 +384,7 @@ struct Subscription::Impl
                 candidate.adopt_open_reply(reply.data(), reply.size(), config, correlation_id);
             if(status != Status::Ok)
             {
+                delivery->retire_ingress();
                 error = BulkError{status,
                                   std::string("BulkOpen was refused: ") + to_string(status),
                                   "subscriber"};
@@ -356,11 +393,13 @@ struct Subscription::Impl
         }
         catch(const BulkException &e)
         {
+            delivery->retire_ingress();
             error = e.error();
             return false;
         }
         catch(const std::exception &e)
         {
+            delivery->retire_ingress();
             error = BulkError{Status::TransportFailure, e.what(), "subscriber"};
             return false;
         }
@@ -376,6 +415,7 @@ struct Subscription::Impl
                               "with the new contract in hand",
                               "subscriber"};
 
+            delivery->retire_ingress();
             fresh.reset();
             return false;
         }
@@ -401,6 +441,7 @@ struct Subscription::Impl
                         ? reported
                         : BulkError{status, "the transport could not adopt the grant",
                                     "subscriber"};
+            delivery->retire_ingress();
             fresh.reset();
             {
                 const std::lock_guard<std::mutex> lock(observation);
@@ -669,7 +710,6 @@ struct Subscription::Impl
         if(state.load(std::memory_order_acquire) == SubscriberState::Failed)
         {
             running.store(false, std::memory_order_release);
-            delivery->stop();
             wake.notify_all();
         }
     }
@@ -755,6 +795,10 @@ struct Subscription::Impl
     {
         if(transport)
         {
+            // The transport gets a generation-scoped ingress. Retire it
+            // before destroying the object so delayed progress cannot publish
+            // into the replacement session's queue.
+            delivery->retire_ingress();
             std::lock_guard<std::mutex> lock(observation);
 
             accumulate(retired, transport->counters());
@@ -799,6 +843,13 @@ struct Subscription::Impl
 
     void transition(SubscriberState next, BulkError error) noexcept
     {
+        if(next == SubscriberState::Failed)
+        {
+            // Delivery publishes the terminal boundary before state is made
+            // visible. Readers therefore drain accepted frames first and only
+            // then observe this failure.
+            delivery->fail(error);
+        }
         state.store(next, std::memory_order_release);
         if(next == SubscriberState::Failed)
         {
@@ -821,12 +872,10 @@ struct Subscription::Impl
 
         while(delivered < max_frames)
         {
-            FrameView view;
-
-            const bool got =
-                delivered == 0 ? delivery->take(view, deadline) : delivery->try_take(view);
-
-            if(!got)
+            detail::DeliveryRead result = delivered == 0
+                                              ? delivery->read_result(deadline)
+                                              : delivery->try_read_result();
+            if(result.kind != detail::DeliveryRead::Kind::Frame)
             {
                 break;
             }
@@ -835,7 +884,7 @@ struct Subscription::Impl
 
             try
             {
-                frame_callback(std::move(view));
+                frame_callback(std::move(result.frame));
             }
             catch(...)
             {
@@ -847,7 +896,7 @@ struct Subscription::Impl
                 break;
             }
 
-            view.reset();
+            result.frame.reset();
         }
 
         return delivered;
@@ -855,11 +904,10 @@ struct Subscription::Impl
 
     void fail_delivery() noexcept
     {
-        transition(SubscriberState::Failed,
-                   BulkError{Status::Internal, "the frame callback threw", "subscriber"});
+        const BulkError error{Status::Internal, "the frame callback threw", "subscriber"};
+        delivery->callback_failed(error);
+        transition(SubscriberState::Failed, error);
         running.store(false, std::memory_order_release);
-        delivery->stop();
-        delivery->discard();
         wake.notify_all();
     }
 
@@ -868,7 +916,8 @@ struct Subscription::Impl
         for(;;)
         {
             const bool active = running.load(std::memory_order_acquire) &&
-                                !interrupted.load(std::memory_order_acquire);
+                                !interrupted.load(std::memory_order_acquire) &&
+                                state.load(std::memory_order_acquire) != SubscriberState::Failed;
             if(!active && delivery->stats().depth == 0)
             {
                 return;
@@ -915,8 +964,7 @@ struct Subscription::Impl
         running.store(false, std::memory_order_release);
         wake.notify_all();
 
-        delivery->stop();
-        delivery->discard();
+        delivery->close();
 
         const std::thread::id self = std::this_thread::get_id();
         if(control.joinable())
@@ -1023,7 +1071,7 @@ void Subscription::close() noexcept
 void Subscription::interrupt() noexcept
 {
     impl_->interrupted.store(true, std::memory_order_release);
-    impl_->delivery->stop();
+    impl_->delivery->interrupt();
     impl_->wake.notify_all();
 }
 
@@ -1038,37 +1086,16 @@ std::optional<FrameView> Subscription::try_read()
                                       "subscriber"});
     }
 
-    if(impl.interrupted.load(std::memory_order_acquire))
+    detail::DeliveryRead result = impl.delivery->try_read_result();
+    if(result.kind == detail::DeliveryRead::Kind::Frame)
     {
-        throw BulkException(BulkError{Status::Shutdown,
-                                      "the subscription was interrupted",
-                                      "subscriber"});
+        return std::move(result.frame);
     }
-
-    FrameView frame;
-    if(impl.delivery->try_take(frame))
+    if(result.kind == detail::DeliveryRead::Kind::Empty)
     {
-        return frame;
+        return std::nullopt;
     }
-
-    const SubscriberState state = impl.state.load(std::memory_order_acquire);
-    if(state == SubscriberState::Failed)
-    {
-        std::lock_guard<std::mutex> lock(impl.observation);
-        throw BulkException(impl.last_error.status == Status::Ok
-                                ? BulkError{Status::TransportFailure,
-                                            "the subscription failed",
-                                            "subscriber"}
-                                : impl.last_error);
-    }
-    if(state == SubscriberState::Closed)
-    {
-        throw BulkException(BulkError{Status::Shutdown,
-                                      "the subscription is closed",
-                                      "subscriber"});
-    }
-
-    return std::nullopt;
+    throw_delivery_terminal(result);
 }
 
 std::optional<FrameView> Subscription::read_for(std::chrono::milliseconds timeout)
@@ -1082,45 +1109,18 @@ std::optional<FrameView> Subscription::read_for(std::chrono::milliseconds timeou
                                       "subscriber"});
     }
 
-    if(impl.interrupted.load(std::memory_order_acquire))
-    {
-        throw BulkException(BulkError{Status::Shutdown,
-                                      "the subscription was interrupted",
-                                      "subscriber"});
-    }
-
-    FrameView frame;
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    if(impl.delivery->take(frame, deadline))
+    detail::DeliveryRead result = impl.delivery->read_result(deadline);
+    if(result.kind == detail::DeliveryRead::Kind::Frame)
     {
-        return frame;
+        return std::move(result.frame);
     }
-
-    if(impl.interrupted.load(std::memory_order_acquire))
+    if(result.kind == detail::DeliveryRead::Kind::Empty ||
+       result.kind == detail::DeliveryRead::Kind::Timeout)
     {
-        throw BulkException(BulkError{Status::Shutdown,
-                                      "the subscription was interrupted",
-                                      "subscriber"});
+        return std::nullopt;
     }
-
-    const SubscriberState state = impl.state.load(std::memory_order_acquire);
-    if(state == SubscriberState::Failed)
-    {
-        std::lock_guard<std::mutex> lock(impl.observation);
-        throw BulkException(impl.last_error.status == Status::Ok
-                                ? BulkError{Status::TransportFailure,
-                                            "the subscription failed",
-                                            "subscriber"}
-                                : impl.last_error);
-    }
-    if(state == SubscriberState::Closed)
-    {
-        throw BulkException(BulkError{Status::Shutdown,
-                                      "the subscription is closed",
-                                      "subscriber"});
-    }
-
-    return std::nullopt;
+    throw_delivery_terminal(result);
 }
 
 std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
