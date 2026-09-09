@@ -67,13 +67,11 @@ using Protocol::SessionState;
 using CoordinationRequest =
     std::variant<Protocol::OpenRequest,
                  Protocol::RenewRequest,
-                 Protocol::CloseRequest,
-                 Protocol::QueryRequest>;
+                 Protocol::CloseRequest>;
 using CoordinationReply =
     std::variant<Protocol::OpenReply,
                  Protocol::RenewReply,
                  Protocol::CloseReply,
-                 Protocol::QueryReply,
                  Protocol::ErrorMessage>;
 
 template <typename Message>
@@ -1226,12 +1224,10 @@ struct BulkPublisher::Impl
     CoordinationReply handle_open(const Protocol::OpenRequest &request);
     CoordinationReply handle_renew(const Protocol::RenewRequest &request);
     CoordinationReply handle_close(const Protocol::CloseRequest &request);
-    CoordinationReply handle_query(const Protocol::QueryRequest &request);
 
     /// The geometry this publisher grants, at the current epoch.
     ///
-    /// `Open` clamps it downward per client (3.5 step 5); `Query` reports it
-    /// unclamped, because a server-wide question has no client to clamp to.
+    /// `Open` clamps it downward per client (3.5 step 5).
     Protocol::GeometryBlock current_geometry() const noexcept
     {
         Protocol::GeometryBlock geometry;
@@ -1596,13 +1592,9 @@ CoordinationReply BulkPublisher::Impl::handle_coordination(const CoordinationReq
             {
                 return handle_renew(typed_request);
             }
-            else if constexpr(std::is_same_v<Request, Protocol::CloseRequest>)
-            {
-                return handle_close(typed_request);
-            }
             else
             {
-                return handle_query(typed_request);
+                return handle_close(typed_request);
             }
         },
         request);
@@ -1667,16 +1659,6 @@ std::vector<std::byte> BulkPublisher::Impl::handle_encoded_coordination(
         case Protocol::CoordType::Close:
         {
             Protocol::CloseRequest decoded;
-            decode_status = Protocol::decode(data, size, decoded);
-            if(decode_status == Status::Ok)
-            {
-                request = std::move(decoded);
-            }
-            break;
-        }
-        case Protocol::CoordType::Query:
-        {
-            Protocol::QueryRequest decoded;
             decode_status = Protocol::decode(data, size, decoded);
             if(decode_status == Status::Ok)
             {
@@ -1975,114 +1957,6 @@ CoordinationReply BulkPublisher::Impl::handle_close(const Protocol::CloseRequest
     // calls on the worker.  The reply does not wait for it -- the counters it
     // carries are diagnostics, and 3.8 asks for idempotence, not synchrony.
     reply.status = Status::Ok;
-    return typed_reply(std::move(reply));
-}
-
-CoordinationReply BulkPublisher::Impl::handle_query(const Protocol::QueryRequest &request)
-{
-    Protocol::QueryReply reply;
-    reply.session_id = request.session_id;
-    reply.generation = generation;
-    reply.geometry = current_geometry();
-
-    std::string blob;
-    const auto add = [&blob](const char *key, std::uint64_t value)
-    {
-        blob += key;
-        blob += '=';
-        blob += std::to_string(value);
-        blob += ';';
-    };
-    const auto add_text = [&blob](const char *key, const std::string &value)
-    {
-        blob += key;
-        blob += '=';
-        blob += value;
-        blob += ';';
-    };
-
-    // 3.8: the blob MUST NOT carry UCX addresses, memory keys, untruncated
-    // session identifiers, or hostnames the caller does not already know.  Every
-    // value below is either a counter, a configured bound, or an identifier in
-    // the truncated form 3.2 mandates for logs.  The stream name is safe
-    // unescaped because 3.9 restricts it to [A-Za-z0-9_.-].
-    add_text("stream", config.stream_name);
-    add_text("transport", "am");
-    add_text("memory_kind", "host");
-    add_text("fanout_mode", to_string(config.fanout_mode));
-
-    const AtomicPublisherCounters &c = counters;
-    add("frames_published", c.frames_published.load(std::memory_order_relaxed));
-    add("frames_submitted", c.frames_submitted.load(std::memory_order_relaxed));
-    add("frames_completed", c.frames_completed.load(std::memory_order_relaxed));
-    add("frames_credited", c.frames_credited.load(std::memory_order_relaxed));
-    add("dropped_no_session", c.dropped_no_session.load(std::memory_order_relaxed));
-    add("dropped_queue_full", c.dropped_queue_full.load(std::memory_order_relaxed));
-    add("dropped_credit_stalled", c.dropped_credit_stalled.load(std::memory_order_relaxed));
-    add("dropped_bad_metadata", c.dropped_bad_metadata.load(std::memory_order_relaxed));
-    add("acquire_failed", c.acquire_failed.load(std::memory_order_relaxed));
-    add("leases_retained", slots->retained());
-    add("credits_outstanding", c.credits_outstanding.load(std::memory_order_relaxed));
-    add("publish_queue_depth", c.publish_queue_depth.load(std::memory_order_relaxed));
-    add("publish_queue_high_water", c.publish_queue_high_water.load(std::memory_order_relaxed));
-    add("sessions_opened", c.sessions_opened.load(std::memory_order_relaxed));
-    add("sessions_closed", c.sessions_closed.load(std::memory_order_relaxed));
-    add("sessions_expired", c.sessions_expired.load(std::memory_order_relaxed));
-    add("sessions_rejected", c.sessions_rejected.load(std::memory_order_relaxed));
-    add("renewals_accepted", c.renewals_accepted.load(std::memory_order_relaxed));
-    add("renewals_late", c.renewals_late.load(std::memory_order_relaxed));
-    add("renewals_rejected", c.renewals_rejected.load(std::memory_order_relaxed));
-    add("malformed_messages", c.malformed_messages.load(std::memory_order_relaxed));
-    add("transport_errors", c.transport_errors.load(std::memory_order_relaxed));
-    add("pinned_bytes", c.pinned_bytes.load(std::memory_order_relaxed));
-    add("max_sessions", config.max_sessions);
-    add("lease_ttl_ms", config.lease_ttl_ms);
-    add("renew_interval_ms", config.renew_interval_ms);
-
-    const std::uint64_t now = now_steady_ms();
-
-    {
-        std::lock_guard<std::mutex> lock(session_mutex);
-
-        std::uint32_t live = 0;
-        for(const std::unique_ptr<Session> &held : sessions)
-        {
-            const SessionState state = held->state.load(std::memory_order_acquire);
-            if(state != SessionState::Unknown && state != SessionState::Closed)
-            {
-                ++live;
-            }
-        }
-        reply.active_sessions = live;
-        add("sessions_live", live);
-        add("sessions_armed", armed_sessions.load(std::memory_order_relaxed));
-
-        // 3.8 allows an all-zero session_id to ask for server-wide status.  A
-        // quoted identifier asks about one session, and an identifier this
-        // publisher does not hold is `UnknownSession` -- the same answer 3.7
-        // gives a `Renew`, so an operator's Query and a client's Renew cannot
-        // disagree about whether a session still exists.
-        if(!request.session_id.is_zero())
-        {
-            const Session *session = session_for_id(request.session_id);
-            if(session == nullptr)
-            {
-                reply.status = Status::UnknownSession;
-            }
-            else
-            {
-                const SessionState state = session->state.load(std::memory_order_acquire);
-                const std::uint64_t deadline = session->deadline_ms.load(std::memory_order_relaxed);
-
-                add_text("session", Protocol::to_log_string(session->id));
-                add_text("session_state", Protocol::to_string(state));
-                add("session_lease_ms_remaining", deadline > now ? deadline - now : 0);
-                add("session_geometry_generation", session->geometry.generation);
-            }
-        }
-    }
-
-    reply.counters = std::move(blob);
     return typed_reply(std::move(reply));
 }
 

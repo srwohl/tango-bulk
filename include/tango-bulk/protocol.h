@@ -80,7 +80,7 @@ std::string to_log_string(const SessionId &id);
 std::string to_log_string(const ClientInstanceId &id);
 std::string to_log_string(StreamId id);
 
-/// Full lowercase hex.  For BulkQuery output and tests, not for logs.
+/// Full lowercase hex. Used by protocol tests and diagnostics, not for logs.
 std::string to_hex(const SessionId &id);
 std::string to_hex(const ClientInstanceId &id);
 
@@ -108,7 +108,6 @@ inline constexpr std::size_t k_coord_envelope_bytes = 32;
 inline constexpr std::size_t k_max_coord_message_bytes = 65'536;
 inline constexpr std::uint32_t k_max_coord_body_bytes = 65'504;
 inline constexpr std::size_t k_max_error_message_bytes = 512;
-inline constexpr std::size_t k_max_counters_bytes = 8'192;
 
 enum class CoordType : std::uint16_t
 {
@@ -118,8 +117,6 @@ enum class CoordType : std::uint16_t
     RenewReply = 0x0004,
     Close = 0x0005,
     CloseReply = 0x0006,
-    Query = 0x0007,
-    QueryReply = 0x0008,
     Error = 0x00FF,
 };
 
@@ -184,7 +181,7 @@ Status decode_envelope(const std::byte *data, std::size_t size, Envelope &out) n
 // ---------------------------------------------------------------------------
 
 /// One layout, one validator, one set of bounds checks, reused verbatim by
-/// OpenReply, RenewReply, QueryReply, and the data-plane Geometry message.
+/// OpenReply, RenewReply, and the data-plane Geometry message.
 struct GeometryBlock
 {
     std::uint32_t generation{0}; ///< epoch; starts at 1, increments, never wraps
@@ -287,26 +284,6 @@ struct CloseReply
     std::uint32_t frames_credited_final{0}; ///< low 32 bits; diagnostics
 };
 
-struct QueryRequest
-{
-    SessionId session_id{}; ///< all-zero requests server-wide status
-    std::uint32_t query_flags{0};
-};
-
-struct QueryReply
-{
-    SessionId session_id{};
-    Status status{Status::Ok};
-    std::uint32_t active_sessions{0};
-    std::uint32_t generation{0};
-    GeometryBlock geometry{};
-
-    /// `key=value;` pairs.  MUST NOT contain UCX addresses, memory keys, session
-    /// identifiers beyond the truncated form, or hostnames not already known to
-    /// the caller.
-    std::string counters;
-};
-
 struct ErrorMessage
 {
     Status status{Status::Internal}; ///< never Ok
@@ -320,24 +297,19 @@ inline constexpr std::size_t k_renew_bytes = 40;
 inline constexpr std::size_t k_renew_reply_bytes = 128;
 inline constexpr std::size_t k_close_bytes = 24;
 inline constexpr std::size_t k_close_reply_bytes = 24;
-inline constexpr std::size_t k_query_bytes = 24;
-inline constexpr std::size_t k_query_reply_fixed_bytes = 128;
 inline constexpr std::size_t k_error_fixed_bytes = 8;
 
 /// Encode, envelope included.  Control path: allowed to allocate, allowed to
 /// throw BulkException if the message cannot be represented (an over-long
 /// stream name, an address blob past k_max_ucx_address_bytes).
 ///
-/// Fields the spec bounds by truncation on encode -- ErrorMessage::message and
-/// QueryReply::counters -- are truncated rather than rejected.
+/// ErrorMessage::message is truncated rather than rejected.
 std::vector<std::byte> encode(const OpenRequest &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const OpenReply &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const RenewRequest &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const RenewReply &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const CloseRequest &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const CloseReply &msg, std::uint64_t correlation_id);
-std::vector<std::byte> encode(const QueryRequest &msg, std::uint64_t correlation_id);
-std::vector<std::byte> encode(const QueryReply &msg, std::uint64_t correlation_id);
 std::vector<std::byte> encode(const ErrorMessage &msg, std::uint64_t correlation_id);
 
 /// Decode, envelope included.  Returns Status::MalformedMessage for anything
@@ -360,10 +332,6 @@ Status decode(const std::byte *data, std::size_t size, RenewReply &out,
 Status decode(const std::byte *data, std::size_t size, CloseRequest &out,
               Envelope *envelope = nullptr) noexcept;
 Status decode(const std::byte *data, std::size_t size, CloseReply &out,
-              Envelope *envelope = nullptr) noexcept;
-Status decode(const std::byte *data, std::size_t size, QueryRequest &out,
-              Envelope *envelope = nullptr) noexcept;
-Status decode(const std::byte *data, std::size_t size, QueryReply &out,
               Envelope *envelope = nullptr) noexcept;
 Status decode(const std::byte *data, std::size_t size, ErrorMessage &out,
               Envelope *envelope = nullptr) noexcept;

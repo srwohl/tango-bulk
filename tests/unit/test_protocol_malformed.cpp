@@ -163,8 +163,6 @@ TEST_CASE("truncation sweep, coordination plane", "[protocol][malformed]")
     sweep_truncations(encode(RenewReply{}, 1), coord_decoder<RenewReply>(), "RenewReply");
     sweep_truncations(encode(CloseRequest{}, 1), coord_decoder<CloseRequest>(), "Close");
     sweep_truncations(encode(CloseReply{}, 1), coord_decoder<CloseReply>(), "CloseReply");
-    sweep_truncations(encode(QueryRequest{}, 1), coord_decoder<QueryRequest>(), "Query");
-    sweep_truncations(encode(QueryReply{}, 1), coord_decoder<QueryReply>(), "QueryReply");
     sweep_truncations(encode(ErrorMessage{Status::Internal, "boom"}, 1),
                       coord_decoder<ErrorMessage>(), "Error");
 }
@@ -209,7 +207,6 @@ TEST_CASE("bit-flip sweep, coordination plane", "[protocol][malformed]")
     sweep_bit_flips(encode(RenewRequest{}, 1), coord_decoder<RenewRequest>(), "Renew");
     sweep_bit_flips(encode(RenewReply{}, 1), coord_decoder<RenewReply>(), "RenewReply");
     sweep_bit_flips(encode(CloseRequest{}, 1), coord_decoder<CloseRequest>(), "Close");
-    sweep_bit_flips(encode(QueryReply{}, 1), coord_decoder<QueryReply>(), "QueryReply");
     sweep_bit_flips(encode(ErrorMessage{Status::Internal, "boom"}, 1),
                     coord_decoder<ErrorMessage>(), "Error");
 }
@@ -519,14 +516,6 @@ TEST_CASE("over-long bounded text is truncated on encode", "[protocol][bounds]")
     REQUIRE(decode(error_bytes.data(), error_bytes.size(), error_out) == Status::Ok);
     CHECK(error_out.message.size() == k_max_error_message_bytes);
 
-    QueryReply reply;
-    reply.counters = std::string(k_max_counters_bytes + 100, 'y');
-
-    const auto reply_bytes = encode(reply, 0);
-
-    QueryReply reply_out;
-    REQUIRE(decode(reply_bytes.data(), reply_bytes.size(), reply_out) == Status::Ok);
-    CHECK(reply_out.counters.size() == k_max_counters_bytes);
 }
 
 // ---------------------------------------------------------------------------

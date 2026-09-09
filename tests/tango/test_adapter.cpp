@@ -122,7 +122,7 @@ std::vector<std::byte> raw_command(Tango::DeviceProxy &proxy,
 
 } // namespace
 
-TEST_CASE("The four bulk commands are ordinary commands on a stock device", "[tango][m4]")
+TEST_CASE("The three bulk commands are ordinary commands on a stock device", "[tango][m4]")
 {
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
@@ -141,7 +141,7 @@ TEST_CASE("The four bulk commands are ordinary commands on a stock device", "[ta
         return nullptr;
     };
 
-    for(const std::string name : {"BulkOpen", "BulkRenew", "BulkClose", "BulkQuery"})
+    for(const std::string name : {"BulkOpen", "BulkRenew", "BulkClose"})
     {
         const Tango::CommandInfo *info = find(name);
         INFO("command " << name);
@@ -154,34 +154,12 @@ TEST_CASE("The four bulk commands are ordinary commands on a stock device", "[ta
     }
 
     // 7.3: BulkOpen allocates pinned memory and BulkClose terminates a stream,
-    // so both are write-level; BulkQuery only reads.
+    // so all three are write-level.
     CHECK(find("BulkOpen")->disp_level == Tango::EXPERT);
     CHECK(find("BulkRenew")->disp_level == Tango::EXPERT);
     CHECK(find("BulkClose")->disp_level == Tango::EXPERT);
-    CHECK(find("BulkQuery")->disp_level == Tango::OPERATOR);
 
     delete commands;
-}
-
-TEST_CASE("BulkQuery reports the publisher an operator can see", "[tango][m4]")
-{
-    Tango::DeviceProxy proxy(DeviceServer::instance().device());
-
-    const BulkQueryResult status = bulk_query(proxy);
-
-    CHECK(status.status == Status::Ok);
-    CHECK(status.generation == 1);
-    CHECK(status.max_frame_bytes == k_frame_bytes);
-    CHECK(status.ring_depth == 8);
-    CHECK(status.credit_window == 4);
-    CHECK(status.counters.find("stream=bulk.tango;") != std::string::npos);
-    CHECK(status.counters.find("frames_published=") != std::string::npos);
-
-    // 3.8: no UCX address, no memory key, no untruncated identifier.  The
-    // address blob is the one that would be easy to leak and impossible to
-    // notice, so it is asserted rather than assumed.
-    CHECK(status.counters.find("address") == std::string::npos);
-    CHECK(status.counters.find("rkey") == std::string::npos);
 }
 
 TEST_CASE("BulkStreams reports the fixed conservative offer row", "[tango][discovery]")
@@ -283,17 +261,12 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
     CHECK(subscriber->state() == SubscriberState::Closed);
     subscriber.reset();
 
-    // 3.8: `Close` releases the session, so the publisher is back where it
-    // started and did not have to wait out a lease to get there.
-    REQUIRE(eventually([&proxy] { return bulk_query(proxy).active_sessions == 0; }));
+    // `Close` releases the session without waiting out its lease.
 }
 
 TEST_CASE("The granted geometry reaches the application", "[tango][m4]")
 {
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
-
-    const BulkQueryResult reported = bulk_query(proxy);
-    REQUIRE(reported.status == Status::Ok);
 
     Sink sink;
     auto subscriber = subscribe(proxy, subscriber_config(), sink.callbacks());
@@ -303,20 +276,19 @@ TEST_CASE("The granted geometry reaches the application", "[tango][m4]")
     const Geometry granted = subscriber->geometry();
 
     CHECK(granted.generation != 0);
-    CHECK(granted.element_type == reported.element_type);
-    CHECK(granted.element_size == reported.element_size);
-    CHECK(granted.rank == reported.rank);
-    CHECK(granted.shape == reported.shape);
-    CHECK(granted.strides == reported.strides);
+    CHECK(granted.element_type == ElementType::UInt8);
+    CHECK(granted.element_size == 1);
+    CHECK(granted.rank == 1);
+    CHECK(granted.shape[0] == k_frame_bytes);
+    CHECK(granted.strides[0] == 1);
 
-    CHECK(granted.max_frame_bytes <= reported.max_frame_bytes);
-    CHECK(granted.ring_depth <= reported.ring_depth);
+    CHECK(granted.max_frame_bytes <= subscriber_config().max_frame_bytes);
+    CHECK(granted.ring_depth <= subscriber_config().ring_depth);
     CHECK(granted.credit_window <= granted.ring_depth);
 
     CHECK(granted.validate() == Status::Ok);
 
     subscriber.reset();
-    REQUIRE(eventually([&proxy] { return bulk_query(proxy).active_sessions == 0; }));
 }
 
 TEST_CASE("The renew timer keeps a session past its lease", "[tango][m4]")
@@ -343,7 +315,6 @@ TEST_CASE("The renew timer keeps a session past its lease", "[tango][m4]")
     // global counter to make a local claim passes for the wrong reason exactly
     // when the suite is run in one process.
     CHECK(subscriber->state() != SubscriberState::Reconnecting);
-    CHECK(bulk_query(proxy).active_sessions >= 1);
 
     // A session that is still alive can still carry data, which is the thing the
     // renewal is for.
@@ -404,12 +375,14 @@ TEST_CASE("A device with no publisher answers, and does not throw", "[tango][m4]
 
     proxy.command_inout("Detach");
 
-    // 7.2: a device server that has not finished init_device() is a normal
-    // transient state, not a fault.  So this is an encoded Error carrying a
-    // Status -- not a DevFailed, which is what would make a client handle the
-    // same condition in two places.
-    const BulkQueryResult status = bulk_query(proxy);
-    CHECK(status.status == Status::UnknownStream);
+    // A device server that has not finished init_device() is a normal transient
+    // state. The command returns an encoded Error rather than throwing.
+    const std::vector<std::byte> open(16, std::byte{0});
+    const std::vector<std::byte> detached =
+        raw_command(proxy, "BulkOpen", open);
+    Protocol::ErrorMessage detached_error;
+    REQUIRE(Protocol::decode(detached.data(), detached.size(), detached_error) == Status::Ok);
+    CHECK(detached_error.status == Status::UnknownStream);
 
     SubscriberConfig config = subscriber_config();
     config.reconnect_policy = ReconnectPolicy::FailFast;
@@ -420,9 +393,9 @@ TEST_CASE("A device with no publisher answers, and does not throw", "[tango][m4]
 
     proxy.command_inout("Attach");
 
-    // And the device recovers without a restart, which is what makes the
-    // transient reading of UnknownStream honest.
-    CHECK(bulk_query(proxy).status == Status::Ok);
+    // The device recovers without a restart.
+    auto recovered = subscribe(proxy, config, sink.callbacks());
+    REQUIRE(recovered->state() == SubscriberState::Active);
 }
 
 TEST_CASE("A command answers only for the message it is the door for", "[tango][m4]")
@@ -447,7 +420,7 @@ TEST_CASE("A command answers only for the message it is the door for", "[tango][
 
     // Garbage, to the same command.  Neither is a DevFailed.
     const std::vector<std::byte> garbage(16, std::byte{0xAB});
-    const std::vector<std::byte> answer = raw_command(proxy, "BulkQuery", garbage);
+    const std::vector<std::byte> answer = raw_command(proxy, "BulkOpen", garbage);
     REQUIRE(Protocol::decode_envelope(answer.data(), answer.size(), envelope) == Status::Ok);
     CHECK(envelope.msg_type == Protocol::CoordType::Error);
 }
