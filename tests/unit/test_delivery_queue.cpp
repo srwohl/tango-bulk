@@ -12,6 +12,8 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -230,14 +232,14 @@ TEST_CASE("take() returns as soon as a producer pushes and notifies",
     CHECK(elapsed < 2s);
 }
 
-TEST_CASE("stop() breaks a blocked take() out with nothing queued",
+TEST_CASE("a session failure breaks a blocked take() out with nothing queued",
           "[core][delivery]")
 {
     detail::DeliveryQueue queue(2, DropPolicy::DropNewest);
 
     std::thread stopper([&queue] {
         std::this_thread::sleep_for(20ms);
-        queue.stop();
+        queue.fail(BulkError{Status::TransportFailure, "session failed", "test"});
     });
 
     const auto started = std::chrono::steady_clock::now();
@@ -251,14 +253,14 @@ TEST_CASE("stop() breaks a blocked take() out with nothing queued",
     CHECK(elapsed < 2s);
 }
 
-TEST_CASE("a stopped queue hands over what it already holds, then stops waiting",
+TEST_CASE("a failed session hands over accepted frames, then stops waiting",
           "[core][delivery]")
 {
     detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
 
     CHECK(queue.push(frame_over(storage(1), 1)));
     CHECK(queue.push(frame_over(storage(2), 2)));
-    queue.stop();
+    queue.fail(BulkError{Status::TransportFailure, "session failed", "test"});
 
     const auto started = std::chrono::steady_clock::now();
 
@@ -274,11 +276,11 @@ TEST_CASE("a stopped queue hands over what it already holds, then stops waiting"
     CHECK_FALSE(queue.take(frame, std::chrono::steady_clock::now() + 5s));
 }
 
-TEST_CASE("a stopped queue refuses new ingress and accounts it as discarded",
+TEST_CASE("a failed session refuses new ingress and accounts it as discarded",
           "[core][delivery]")
 {
     detail::DeliveryQueue queue(2, DropPolicy::DropNewest);
-    queue.stop();
+    queue.fail(BulkError{Status::TransportFailure, "session failed", "test"});
 
     const auto payload = storage(3);
     CHECK_FALSE(queue.push(frame_over(payload, 3)));
@@ -373,6 +375,108 @@ TEST_CASE("many frames survive a producer and a consumer running at once",
     CHECK(expected == k_frames + 1);
     CHECK(queue.stats().taken == k_frames);
     CHECK(queue.stats().dropped == 0);
+}
+
+TEST_CASE("a session failure drains accepted frames before its terminal result",
+          "[core][delivery]")
+{
+    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    REQUIRE(queue.push(frame_over(storage(1), 1)));
+    REQUIRE(queue.push(frame_over(storage(2), 2)));
+
+    queue.fail(BulkError{Status::TransportFailure, "session failed", "test"});
+
+    auto first = queue.try_read_result();
+    REQUIRE(first.kind == detail::DeliveryRead::Kind::Frame);
+    CHECK(first.frame.sequence() == 1);
+
+    auto second = queue.try_read_result();
+    REQUIRE(second.kind == detail::DeliveryRead::Kind::Frame);
+    CHECK(second.frame.sequence() == 2);
+
+    const auto failed = queue.try_read_result();
+    CHECK(failed.kind == detail::DeliveryRead::Kind::SessionFailed);
+    CHECK(failed.error.status == Status::TransportFailure);
+    CHECK(queue.stats().discarded == 0);
+}
+
+TEST_CASE("close and interrupt discard queued frames and report distinct outcomes",
+          "[core][delivery]")
+{
+    detail::DeliveryQueue closed(2, DropPolicy::DropNewest);
+    REQUIRE(closed.push(frame_over(storage(1), 1)));
+    closed.close();
+    CHECK(closed.stats().discarded == 1);
+    CHECK(closed.try_read_result().kind == detail::DeliveryRead::Kind::Closed);
+
+    detail::DeliveryQueue interrupted(2, DropPolicy::DropNewest);
+    REQUIRE(interrupted.push(frame_over(storage(2), 2)));
+    interrupted.interrupt();
+    CHECK(interrupted.stats().discarded == 1);
+    CHECK(interrupted.try_read_result().kind == detail::DeliveryRead::Kind::Interrupted);
+}
+
+TEST_CASE("retiring an ingress rejects late transport progress", "[core][delivery]")
+{
+    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    const auto old = queue.make_ingress();
+    const int descriptor = queue.fd();
+
+    queue.retire_ingress();
+
+    CHECK_FALSE(old->push(frame_over(storage(1), 1)));
+    CHECK(queue.stats().discarded == 1);
+    CHECK(queue.fd() == descriptor);
+
+    const auto current = queue.make_ingress();
+    REQUIRE(current->push(frame_over(storage(2), 2)));
+    FrameView frame;
+    REQUIRE(queue.try_take(frame));
+    CHECK(frame.sequence() == 2);
+}
+
+TEST_CASE("competing pull readers claim each frame at most once", "[core][delivery]")
+{
+    detail::DeliveryQueue queue(256, DropPolicy::DropNewest);
+    constexpr std::uint64_t frame_count = 128;
+    for(std::uint64_t sequence = 1; sequence <= frame_count; ++sequence)
+    {
+        REQUIRE(queue.push(frame_over(storage(static_cast<std::uint16_t>(sequence)), sequence)));
+    }
+    queue.fail(BulkError{Status::TransportFailure, "session failed", "test"});
+
+    std::mutex mutex;
+    std::set<std::uint64_t> sequences;
+    std::vector<std::thread> readers;
+    for(int i = 0; i < 4; ++i)
+    {
+        readers.emplace_back([&] {
+            for(;;)
+            {
+                const auto result = queue.try_read_result();
+                if(result.kind == detail::DeliveryRead::Kind::Frame)
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    sequences.insert(result.frame.sequence());
+                }
+                else if(result.kind == detail::DeliveryRead::Kind::SessionFailed)
+                {
+                    return;
+                }
+                else
+                {
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+
+    for(auto &reader : readers)
+    {
+        reader.join();
+    }
+
+    CHECK(sequences.size() == frame_count);
 }
 
 } // namespace

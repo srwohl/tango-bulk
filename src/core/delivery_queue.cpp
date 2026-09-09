@@ -10,134 +10,428 @@
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
 #include <thread>
 
 namespace TangoBulk::detail
 {
 
-DeliveryQueue::DeliveryQueue(std::size_t capacity, DropPolicy policy) :
-    queue_(capacity),
-    policy_(policy)
+namespace
 {
-    wakeup_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
+enum class Terminal : std::uint32_t
+{
+    None,
+    Closed,
+    Interrupted,
+    SessionFailed,
+    CallbackFailed,
+};
+
+DeliveryRead::Kind read_kind(Terminal terminal) noexcept
+{
+    switch(terminal)
+    {
+    case Terminal::Closed:
+        return DeliveryRead::Kind::Closed;
+    case Terminal::Interrupted:
+        return DeliveryRead::Kind::Interrupted;
+    case Terminal::SessionFailed:
+        return DeliveryRead::Kind::SessionFailed;
+    case Terminal::CallbackFailed:
+        return DeliveryRead::Kind::CallbackFailed;
+    case Terminal::None:
+        break;
+    }
+    return DeliveryRead::Kind::Empty;
 }
 
-DeliveryQueue::~DeliveryQueue()
+} // namespace
+
+struct DeliveryQueue::Ingress
 {
-    if(wakeup_fd_ >= 0)
+    std::atomic<bool> retired{false};
+    std::atomic<std::uint64_t> active_pushes{0};
+};
+
+struct DeliveryQueue::State
+{
+    State(std::size_t capacity, DropPolicy drop_policy) : queue(capacity), policy(drop_policy)
     {
-        ::close(wakeup_fd_);
+        wakeup_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC | EFD_SEMAPHORE);
     }
 
+    ~State()
+    {
+        if(wakeup_fd >= 0)
+        {
+            ::close(wakeup_fd);
+        }
+    }
+
+    BoundedQueue<FrameView> queue;
+    DropPolicy policy;
+    int wakeup_fd{-1};
+
+    // A producer enters this barrier before observing accepting. Terminal
+    // publication waits for the barrier, so every accepted frame is visible
+    // before SessionFailed becomes observable.
+    std::atomic<std::uint64_t> active_pushes{0};
+    std::atomic<bool> accepting{true};
+    std::atomic<Terminal> terminal{Terminal::None};
+
+    std::atomic<std::uint64_t> waiting_readers{0};
+    std::atomic<bool> armed_reader{false};
+    std::mutex terminal_mutex;
+    std::mutex transition_mutex;
+    BulkError terminal_error;
+
+    std::mutex ingress_mutex;
+    std::shared_ptr<Ingress> current_ingress;
+
+    std::atomic<std::uint64_t> taken{0};
+    std::atomic<std::uint64_t> dropped{0};
+    std::atomic<std::uint64_t> discarded{0};
+    std::atomic<std::uint64_t> high_water{0};
+};
+
+DeliveryQueue::DeliveryQueue(std::size_t capacity, DropPolicy policy) :
+    state_(std::make_shared<State>(capacity, policy))
+{
+}
+
+DeliveryQueue::DeliveryQueue(std::shared_ptr<State> state, std::shared_ptr<Ingress> ingress) noexcept :
+    state_(std::move(state)),
+    ingress_(std::move(ingress))
+{
+}
+
+DeliveryQueue::~DeliveryQueue() = default;
+
+void signal_one(std::shared_ptr<DeliveryQueue::State> const &state) noexcept
+{
+    std::uint64_t waiting = state->waiting_readers.load(std::memory_order_acquire);
+    while(waiting != 0 &&
+          !state->waiting_readers.compare_exchange_weak(
+              waiting, waiting - 1, std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+    }
+
+    if(waiting == 0 &&
+       !state->armed_reader.exchange(false, std::memory_order_acq_rel))
+    {
+        return;
+    }
+
+    if(state->wakeup_fd < 0)
+    {
+        return;
+    }
+
+    const std::uint64_t one = 1;
+    const ssize_t written = ::write(state->wakeup_fd, &one, sizeof(one));
+    static_cast<void>(written); // EAGAIN means another wake token is pending.
+}
+
+void signal_all(std::shared_ptr<DeliveryQueue::State> const &state) noexcept
+{
+    const std::uint64_t waiting =
+        state->waiting_readers.exchange(0, std::memory_order_acq_rel);
+    if(state->wakeup_fd < 0)
+    {
+        return;
+    }
+
+    const std::uint64_t tokens = std::max<std::uint64_t>(waiting, 1);
+    const ssize_t written = ::write(state->wakeup_fd, &tokens, sizeof(tokens));
+    static_cast<void>(written);
+}
+
+void remove_waiter(std::shared_ptr<DeliveryQueue::State> const &state) noexcept
+{
+    std::uint64_t waiting = state->waiting_readers.load(std::memory_order_acquire);
+    while(waiting != 0 &&
+          !state->waiting_readers.compare_exchange_weak(
+              waiting, waiting - 1, std::memory_order_acq_rel, std::memory_order_acquire))
+    {
+    }
+}
+
+void consume_one(std::shared_ptr<DeliveryQueue::State> const &state) noexcept
+{
+    if(state->wakeup_fd < 0)
+    {
+        return;
+    }
+
+    std::uint64_t token = 0;
+    const ssize_t read = ::read(state->wakeup_fd, &token, sizeof(token));
+    static_cast<void>(read); // EAGAIN means this frame had no waiter token.
+}
+
+void drain_wakeups(std::shared_ptr<DeliveryQueue::State> const &state) noexcept
+{
+    if(state->wakeup_fd < 0)
+    {
+        return;
+    }
+
+    std::uint64_t token = 0;
+    while(::read(state->wakeup_fd, &token, sizeof(token)) > 0)
+    {
+    }
+}
+
+void update_high_water(std::shared_ptr<DeliveryQueue::State> const &state,
+                       std::uint64_t depth) noexcept
+{
+    std::uint64_t high_water = state->high_water.load(std::memory_order_relaxed);
+    while(depth > high_water &&
+          !state->high_water.compare_exchange_weak(
+              high_water, depth, std::memory_order_relaxed, std::memory_order_relaxed))
+    {
+    }
 }
 
 bool DeliveryQueue::push(FrameView frame) noexcept
 {
-    if(stopped_.load(std::memory_order_acquire))
+    if(ingress_ != nullptr)
     {
-        frame.reset();
-        discarded_.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        ingress_->active_pushes.fetch_add(1, std::memory_order_acq_rel);
     }
+    state_->active_pushes.fetch_add(1, std::memory_order_acq_rel);
 
-    bool queued = queue_.try_push(std::move(frame));
+    const bool current = ingress_ == nullptr || !ingress_->retired.load(std::memory_order_acquire);
+    const bool accepting = state_->accepting.load(std::memory_order_acquire);
+    bool queued = false;
     bool dropped = false;
 
-    if(!queued && policy_ == DropPolicy::DropOldest)
+    if(current && accepting)
     {
-        FrameView oldest;
-        if(queue_.try_pop(oldest))
+        queued = state_->queue.try_push(std::move(frame));
+
+        if(!queued && state_->policy == DropPolicy::DropOldest)
         {
-            oldest.reset();
+            FrameView oldest;
+            if(state_->queue.try_pop(oldest))
+            {
+                oldest.reset();
+                consume_one(state_);
+                dropped = true;
+                queued = state_->queue.try_push(std::move(frame));
+            }
+        }
+
+        if(!queued)
+        {
             dropped = true;
-            queued = queue_.try_push(std::move(frame));
         }
     }
 
-    if(!queued)
+    if(!current || !accepting)
     {
-        dropped = true;
+        frame.reset();
+        state_->discarded.fetch_add(1, std::memory_order_relaxed);
+        if(ingress_ != nullptr)
+        {
+            ingress_->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        state_->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
+        return false;
     }
 
     if(dropped)
     {
-        dropped_.fetch_add(1, std::memory_order_relaxed);
+        state_->dropped.fetch_add(1, std::memory_order_relaxed);
     }
 
     if(queued)
     {
-        const std::uint64_t depth = queue_.size();
-        if(depth > high_water_.load(std::memory_order_relaxed))
-        {
-            high_water_.store(depth, std::memory_order_relaxed);
-        }
-
-        // Enqueue and readiness form one producer operation. Keeping them
-        // together prevents a transport adapter from publishing a frame that
-        // a blocked reader cannot observe.
-        signal_waiter();
+        update_high_water(state_, state_->queue.size());
+        signal_one(state_);
     }
+
+    if(ingress_ != nullptr)
+    {
+        ingress_->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    state_->active_pushes.fetch_sub(1, std::memory_order_acq_rel);
 
     return queued;
 }
 
-void DeliveryQueue::signal_waiter() noexcept
+std::shared_ptr<DeliveryQueue> DeliveryQueue::make_ingress()
 {
-    if(wakeup_fd_ < 0 || queue_.empty() ||
-       !consumer_waiting_.exchange(false, std::memory_order_acq_rel))
+    auto ingress = std::make_shared<Ingress>();
+    std::shared_ptr<Ingress> previous;
     {
-        return;
+        std::lock_guard<std::mutex> lock(state_->ingress_mutex);
+        previous = std::move(state_->current_ingress);
+        if(previous)
+        {
+            previous->retired.store(true, std::memory_order_release);
+        }
+        state_->current_ingress = ingress;
     }
 
-    const std::uint64_t one = 1;
-    const ssize_t written = ::write(wakeup_fd_, &one, sizeof(one));
-    static_cast<void>(written); // EAGAIN: already signalled
+    if(previous)
+    {
+        while(previous->active_pushes.load(std::memory_order_acquire) != 0)
+        {
+            std::this_thread::yield();
+        }
+    }
+
+    return std::shared_ptr<DeliveryQueue>(new DeliveryQueue(state_, std::move(ingress)));
+}
+
+void DeliveryQueue::retire_ingress() noexcept
+{
+    std::shared_ptr<Ingress> current;
+    {
+        std::lock_guard<std::mutex> lock(state_->ingress_mutex);
+        current = std::move(state_->current_ingress);
+        if(current)
+        {
+            current->retired.store(true, std::memory_order_release);
+        }
+    }
+
+    if(current)
+    {
+        while(current->active_pushes.load(std::memory_order_acquire) != 0)
+        {
+            std::this_thread::yield();
+        }
+    }
 }
 
 std::size_t DeliveryQueue::discard() noexcept
 {
-    std::size_t dropped = 0;
+    std::size_t discarded = 0;
 
     FrameView frame;
-    while(queue_.try_pop(frame))
+    while(state_->queue.try_pop(frame))
     {
         frame.reset();
-        ++dropped;
+        consume_one(state_);
+        ++discarded;
     }
 
-    discarded_.fetch_add(dropped, std::memory_order_relaxed);
-    return dropped;
+    state_->discarded.fetch_add(discarded, std::memory_order_relaxed);
+    drain_wakeups(state_);
+    return discarded;
 }
 
-void DeliveryQueue::stop() noexcept
+void set_terminal(std::shared_ptr<DeliveryQueue::State> const &state,
+                  Terminal terminal,
+                  BulkError error,
+                  bool discard) noexcept
 {
-    stopped_.store(true, std::memory_order_release);
-
-    if(wakeup_fd_ < 0)
+    std::lock_guard<std::mutex> transition_lock(state->transition_mutex);
+    if(state->terminal.load(std::memory_order_acquire) != Terminal::None)
     {
         return;
     }
 
-    consumer_waiting_.store(false, std::memory_order_release);
-
-    const std::uint64_t one = 1;
-    const ssize_t written = ::write(wakeup_fd_, &one, sizeof(one));
-    static_cast<void>(written);
-}
-
-void DeliveryQueue::drain() noexcept
-{
-    if(wakeup_fd_ < 0)
+    state->accepting.store(false, std::memory_order_release);
+    while(state->active_pushes.load(std::memory_order_acquire) != 0)
     {
-        return;
+        std::this_thread::yield();
     }
 
-    std::uint64_t drained = 0;
-    const ssize_t got = ::read(wakeup_fd_, &drained, sizeof(drained));
-    static_cast<void>(got); // EAGAIN: nothing pending
+    if(discard)
+    {
+        FrameView frame;
+        while(state->queue.try_pop(frame))
+        {
+            frame.reset();
+            state->discarded.fetch_add(1, std::memory_order_relaxed);
+        }
+        drain_wakeups(state);
+    }
+
+    {
+        std::lock_guard<std::mutex> error_lock(state->terminal_mutex);
+        state->terminal_error = std::move(error);
+    }
+    state->terminal.store(terminal, std::memory_order_release);
+    signal_all(state);
 }
 
-bool DeliveryQueue::await(std::chrono::steady_clock::time_point deadline) noexcept
+void DeliveryQueue::fail(BulkError error) noexcept
+{
+    set_terminal(state_, Terminal::SessionFailed, std::move(error), false);
+}
+
+void DeliveryQueue::callback_failed(BulkError error) noexcept
+{
+    set_terminal(state_, Terminal::CallbackFailed, std::move(error), true);
+}
+
+void DeliveryQueue::close() noexcept
+{
+    set_terminal(state_, Terminal::Closed, BulkError{}, true);
+}
+
+void DeliveryQueue::interrupt() noexcept
+{
+    set_terminal(state_, Terminal::Interrupted, BulkError{}, true);
+}
+
+DeliveryQueue::Stats DeliveryQueue::stats() const noexcept
+{
+    Stats out;
+    out.depth = state_->queue.size();
+    out.capacity = state_->queue.capacity();
+    out.taken = state_->taken.load(std::memory_order_relaxed);
+    out.dropped = state_->dropped.load(std::memory_order_relaxed);
+    out.discarded = state_->discarded.load(std::memory_order_relaxed);
+    out.high_water = state_->high_water.load(std::memory_order_relaxed);
+    return out;
+}
+
+int DeliveryQueue::fd() const noexcept
+{
+    return state_->wakeup_fd;
+}
+
+bool DeliveryQueue::try_take(FrameView &out) noexcept
+{
+    if(state_->queue.try_pop(out))
+    {
+        state_->armed_reader.store(false, std::memory_order_release);
+        consume_one(state_);
+        state_->taken.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    state_->armed_reader.store(true, std::memory_order_release);
+    if(state_->queue.try_pop(out))
+    {
+        state_->armed_reader.store(false, std::memory_order_release);
+        consume_one(state_);
+        state_->taken.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+bool take_one(std::shared_ptr<DeliveryQueue::State> const &state, FrameView &out) noexcept
+{
+    if(!state->queue.try_pop(out))
+    {
+        return false;
+    }
+
+    state->armed_reader.store(false, std::memory_order_release);
+    consume_one(state);
+    state->taken.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool await(std::shared_ptr<DeliveryQueue::State> const &state,
+           std::chrono::steady_clock::time_point deadline) noexcept
 {
     const auto now = std::chrono::steady_clock::now();
     if(now >= deadline)
@@ -145,88 +439,118 @@ bool DeliveryQueue::await(std::chrono::steady_clock::time_point deadline) noexce
         return false;
     }
 
-    const auto remaining =
-        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
-
-    if(wakeup_fd_ < 0)
+    state->waiting_readers.fetch_add(1, std::memory_order_acq_rel);
+    state->armed_reader.store(false, std::memory_order_release);
+    if(!state->queue.empty() || state->terminal.load(std::memory_order_acquire) != Terminal::None)
     {
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        remove_waiter(state);
         return true;
     }
 
-    arm();
-
-    if(!queue_.empty())
+    if(state->wakeup_fd < 0)
     {
-        consumer_waiting_.store(false, std::memory_order_release);
+        while(std::chrono::steady_clock::now() < deadline &&
+              state->queue.empty() &&
+              state->terminal.load(std::memory_order_acquire) == Terminal::None)
+        {
+            std::this_thread::yield();
+        }
+        remove_waiter(state);
         return true;
     }
+
+    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
+    const auto bounded_remaining = std::min<std::int64_t>(
+        remaining.count(), std::numeric_limits<int>::max());
+    const int timeout_ms = static_cast<int>(std::max<std::int64_t>(1, bounded_remaining));
 
     pollfd descriptor{};
-    descriptor.fd = wakeup_fd_;
+    descriptor.fd = state->wakeup_fd;
     descriptor.events = POLLIN;
-
-    const auto bounded_remaining = std::min<std::int64_t>(
-        static_cast<std::int64_t>(remaining), std::numeric_limits<int>::max());
-    const int timeout_ms = static_cast<int>(std::max<std::int64_t>(1, bounded_remaining));
     const int ready = ::poll(&descriptor, 1, timeout_ms);
-
-    consumer_waiting_.store(false, std::memory_order_release);
-
     if(ready > 0)
     {
-        drain();
+        consume_one(state);
     }
+    remove_waiter(state);
 
-    return true;
+    return ready > 0;
 }
 
-bool DeliveryQueue::try_take(FrameView &out) noexcept
+DeliveryRead terminal_result(std::shared_ptr<DeliveryQueue::State> const &state,
+                              Terminal terminal)
 {
-    if(queue_.try_pop(out))
+    DeliveryRead result;
+    result.kind = read_kind(terminal);
+    if(terminal == Terminal::SessionFailed || terminal == Terminal::CallbackFailed)
     {
-        taken_.fetch_add(1, std::memory_order_relaxed);
-        return true;
+        std::lock_guard<std::mutex> lock(state->terminal_mutex);
+        result.error = state->terminal_error;
     }
-
-    arm();
-
-    if(queue_.try_pop(out))
-    {
-        consumer_waiting_.store(false, std::memory_order_release);
-        taken_.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-
-    return false;
+    return result;
 }
 
-bool DeliveryQueue::take(FrameView &out, std::chrono::steady_clock::time_point deadline) noexcept
+DeliveryRead DeliveryQueue::try_read_result()
+{
+    DeliveryRead result;
+    if(take_one(state_, result.frame))
+    {
+        result.kind = DeliveryRead::Kind::Frame;
+        return result;
+    }
+
+    const Terminal terminal = state_->terminal.load(std::memory_order_acquire);
+    if(terminal != Terminal::None)
+    {
+        return terminal_result(state_, terminal);
+    }
+    state_->armed_reader.store(true, std::memory_order_release);
+    result.kind = DeliveryRead::Kind::Empty;
+    return result;
+}
+
+DeliveryRead DeliveryQueue::read_result(std::chrono::steady_clock::time_point deadline)
 {
     for(;;)
     {
-        if(try_take(out))
+        DeliveryRead result;
+        if(take_one(state_, result.frame))
+        {
+            result.kind = DeliveryRead::Kind::Frame;
+            return result;
+        }
+
+        const Terminal terminal = state_->terminal.load(std::memory_order_acquire);
+        if(terminal != Terminal::None)
+        {
+            return terminal_result(state_, terminal);
+        }
+
+        if(!await(state_, deadline))
+        {
+            state_->armed_reader.store(true, std::memory_order_release);
+            result.kind = DeliveryRead::Kind::Timeout;
+            return result;
+        }
+    }
+}
+
+bool DeliveryQueue::take(FrameView &out,
+                         std::chrono::steady_clock::time_point deadline) noexcept
+{
+    for(;;)
+    {
+        if(take_one(state_, out))
         {
             return true;
         }
 
-        if(stopped_.load(std::memory_order_acquire) || !await(deadline))
+        if(state_->terminal.load(std::memory_order_acquire) != Terminal::None ||
+           !await(state_, deadline))
         {
             return false;
         }
     }
-}
-
-DeliveryQueue::Stats DeliveryQueue::stats() const noexcept
-{
-    Stats out;
-    out.depth = queue_.size();
-    out.capacity = queue_.capacity();
-    out.taken = taken_.load(std::memory_order_relaxed);
-    out.dropped = dropped_.load(std::memory_order_relaxed);
-    out.discarded = discarded_.load(std::memory_order_relaxed);
-    out.high_water = high_water_.load(std::memory_order_relaxed);
-    return out;
 }
 
 } // namespace TangoBulk::detail
