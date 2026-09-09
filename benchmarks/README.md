@@ -7,7 +7,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 # benchmarks
 
 `tango-bulk-bench` moves frames between two processes using the same
-`BulkPublisher` and `SubscriberEngine` a device server links. Nothing in the data
+`BulkPublisher` and `Subscription` a device server links. Nothing in the data
 path is reimplemented for the benchmark's convenience, which is the property that
 makes a number from it worth recording.
 
