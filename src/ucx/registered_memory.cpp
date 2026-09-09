@@ -6,12 +6,7 @@
 
 #include <tango-bulk/errors.h>
 
-#include <sys/resource.h>
-
-#include <atomic>
-#include <cstdio>
 #include <cstring>
-#include <mutex>
 #include <string>
 #include <utility>
 
@@ -20,116 +15,27 @@ namespace TangoBulk::detail
 namespace
 {
 
-std::atomic<std::uint64_t> &pinned_bytes() noexcept
+PinnedLedger::Reservation acquire(std::uint64_t bytes,
+                                   std::uint64_t limit,
+                                   const char *origin)
 {
-    static std::atomic<std::uint64_t> value{0};
-    return value;
-}
-
-bool try_reserve(std::uint64_t bytes, std::uint64_t limit) noexcept
-{
-    std::atomic<std::uint64_t> &counter = pinned_bytes();
-    std::uint64_t observed = counter.load(std::memory_order_relaxed);
-
-    for(;;)
+    PinnedLedger::Reservation reservation =
+        PinnedLedger::Reservation::try_acquire(bytes, limit);
+    if(!reservation)
     {
-        if(bytes > limit || observed > limit - bytes)
-        {
-            return false;
-        }
-
-        if(counter.compare_exchange_weak(observed,
-                                         observed + bytes,
-                                         std::memory_order_acq_rel,
-                                         std::memory_order_relaxed))
-        {
-            return true;
-        }
+        throw BulkException(
+            BulkError{Status::ResourceExhausted,
+                      "pinned memory budget exceeded: this region needs " +
+                          std::to_string(bytes) + " bytes, the process already holds " +
+                          std::to_string(PinnedLedger::current()) + ", limit is " +
+                          std::to_string(limit),
+                      origin});
     }
-}
 
-void release_reservation(std::uint64_t bytes) noexcept
-{
-    pinned_bytes().fetch_sub(bytes, std::memory_order_acq_rel);
-}
-
-void check_memlock(std::uint64_t limit) noexcept
-{
-    static std::once_flag once;
-
-    std::call_once(
-        once,
-        [](std::uint64_t configured)
-        {
-            struct rlimit rl
-            {
-            };
-
-            if(getrlimit(RLIMIT_MEMLOCK, &rl) != 0 || rl.rlim_cur == RLIM_INFINITY)
-            {
-                return;
-            }
-
-            const auto allowed = static_cast<std::uint64_t>(rl.rlim_cur);
-            if(configured > allowed)
-            {
-                std::fprintf(stderr,
-                             "tango-bulk: warning: pinned_memory_limit_bytes is %llu but "
-                             "RLIMIT_MEMLOCK is %llu. Registration will fail with an opaque "
-                             "UCX error once the ring exceeds the kernel limit; raise "
-                             "'ulimit -l' or lower the configured limit.\n",
-                             static_cast<unsigned long long>(configured),
-                             static_cast<unsigned long long>(allowed));
-            }
-        },
-        limit);
+    return reservation;
 }
 
 } // namespace
-
-class RegisteredMemory::Reservation
-{
-  public:
-    static std::unique_ptr<Reservation> acquire(std::uint64_t bytes,
-                                                std::uint64_t limit,
-                                                const char *origin)
-    {
-        check_memlock(limit);
-        if(!try_reserve(bytes, limit))
-        {
-            throw BulkException(
-                BulkError{Status::ResourceExhausted,
-                          "pinned memory budget exceeded: this region needs " +
-                              std::to_string(bytes) + " bytes, the process already holds " +
-                              std::to_string(pinned_bytes().load(std::memory_order_relaxed)) +
-                              ", limit is " + std::to_string(limit),
-                          origin});
-        }
-
-        try
-        {
-            return std::unique_ptr<Reservation>(new Reservation(bytes));
-        }
-        catch(...)
-        {
-            release_reservation(bytes);
-            throw;
-        }
-    }
-
-    ~Reservation()
-    {
-        release_reservation(bytes_);
-    }
-
-    Reservation(const Reservation &) = delete;
-    Reservation &operator=(const Reservation &) = delete;
-
-  private:
-    explicit Reservation(std::uint64_t bytes) noexcept : bytes_(bytes) {}
-
-    std::uint64_t bytes_;
-};
 
 RegisteredMemory RegisteredMemory::ucx_allocated(UcxContext &context,
                                                  std::uint64_t bytes,
@@ -139,7 +45,7 @@ RegisteredMemory RegisteredMemory::ucx_allocated(UcxContext &context,
     RegisteredMemory memory;
     memory.context_ = context.get();
     memory.bytes_ = bytes;
-    memory.reservation_ = Reservation::acquire(bytes, pinned_limit, origin);
+    memory.reservation_ = acquire(bytes, pinned_limit, origin);
 
     ucp_mem_map_params_t params;
     std::memset(&params, 0, sizeof(params));
@@ -184,6 +90,18 @@ RegisteredMemory RegisteredMemory::ucx_allocated(UcxContext &context,
                                       origin});
     }
 
+    if(attr.length > bytes &&
+       !memory.reservation_.extend(attr.length - bytes, pinned_limit))
+    {
+        memory.release();
+        throw BulkException(
+            BulkError{Status::ResourceExhausted,
+                      "ucp_mem_map returned more bytes than the process budget allows",
+                      origin});
+    }
+
+    memory.bytes_ = attr.length;
+
     return memory;
 }
 
@@ -197,7 +115,7 @@ RegisteredMemory RegisteredMemory::adopted(UcxContext &context,
     memory.context_ = context.get();
     memory.bytes_ = bytes;
     memory.owner_ = std::move(owner);
-    memory.reservation_ = Reservation::acquire(bytes, pinned_limit, "subscriber");
+    memory.reservation_ = acquire(bytes, pinned_limit, "subscriber");
 
     ucp_mem_map_params_t params;
     std::memset(&params, 0, sizeof(params));

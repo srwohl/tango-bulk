@@ -89,7 +89,7 @@ TEST_CASE("an overflowing receive plan cannot become valid by wrapping its byte 
 {
     const ReceivePlan plan = ReceivePlan::from_limits(~std::uint64_t{0}, k_max_ring_depth, 1);
 
-    CHECK(plan.validate() != Status::Ok);
+    CHECK(plan.validate() == Status::ResourceExhausted);
 }
 
 TEST_CASE("a stream offer is a safe pre-open receive-plan upper bound",
