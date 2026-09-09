@@ -25,6 +25,12 @@ using CoordinationChannel =
                                          const std::vector<std::byte> &,
                                          std::chrono::steady_clock::time_point)>;
 
+/// Discovery is a read-only observation and is deliberately separate from
+/// CoordinationChannel: it must run before allocation and never hold a
+/// publisher or registry lock while contacting Tango.
+using StreamDiscovery = std::function<StreamOffer(
+    const std::string &, std::chrono::steady_clock::time_point)>;
+
 using TransportFactory = std::function<std::unique_ptr<SubscriberTransport>(
     const SubscriberConfig &, std::shared_ptr<DeliveryQueue>)>;
 
@@ -40,7 +46,9 @@ class InMemoryStreamDiscovery
     {
     }
 
-    StreamOffer discover(const std::string &stream_name) const
+    StreamOffer discover(
+        const std::string &stream_name,
+        std::chrono::steady_clock::time_point = std::chrono::steady_clock::time_point::max()) const
     {
         for(const StreamOffer &offer : offers_)
         {
