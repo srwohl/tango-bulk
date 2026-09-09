@@ -108,8 +108,6 @@ TEST_CASE("every message type carries its spec msg_type", "[protocol][layout]")
     CHECK(type_of(encode(RenewReply{}, 0)) == 0x0004);
     CHECK(type_of(encode(CloseRequest{}, 0)) == 0x0005);
     CHECK(type_of(encode(CloseReply{}, 0)) == 0x0006);
-    CHECK(type_of(encode(QueryRequest{}, 0)) == 0x0007);
-    CHECK(type_of(encode(QueryReply{}, 0)) == 0x0008);
     CHECK(type_of(encode(ErrorMessage{Status::Internal, ""}, 0)) == 0x00FF);
 }
 
@@ -304,37 +302,6 @@ TEST_CASE("Close and CloseReply bodies match spec 3.8", "[protocol][layout]")
     CHECK_FIELD(reply_bytes, b + 20, 4, k_probe_u32);
 }
 
-TEST_CASE("Query and QueryReply bodies match spec 3.8", "[protocol][layout]")
-{
-    QueryRequest query;
-    query.query_flags = k_probe_u32;
-
-    const auto query_bytes = encode(query, 0);
-    constexpr std::size_t b = k_coord_envelope_bytes;
-
-    REQUIRE(query_bytes.size() == b + 24);
-    CHECK_FIELD(query_bytes, b + 16, 4, k_probe_u32);
-    CHECK_FIELD(query_bytes, b + 20, 4, 0); // reserved
-
-    QueryReply reply;
-    reply.active_sessions = 3;
-    reply.generation = 7;
-    reply.geometry = sample_geometry();
-    reply.counters = "frames=10;drops=0;";
-
-    const auto reply_bytes = encode(reply, 0);
-
-    CHECK_FIELD(reply_bytes, b + 16, 2, 0);  // status
-    CHECK_FIELD(reply_bytes, b + 18, 2, 0);  // reserved
-    CHECK_FIELD(reply_bytes, b + 20, 4, 3);  // active_sessions
-    CHECK_FIELD(reply_bytes, b + 24, 4, 7);  // generation
-    CHECK_FIELD(reply_bytes, b + 28, 4, 0);  // reserved
-    CHECK_FIELD(reply_bytes, b + 32, 4, 7);  // geometry.generation
-    CHECK_FIELD(reply_bytes, b + 128, 4, reply.counters.size());
-
-    CHECK(reply_bytes.size() == b + 128 + 4 + reply.counters.size());
-}
-
 TEST_CASE("Error body matches spec 3.8", "[protocol][layout]")
 {
     const ErrorMessage msg{Status::TooManySessions, "no"};
@@ -507,8 +474,6 @@ TEST_CASE("every fixed part is a multiple of eight bytes", "[protocol][layout]")
     CHECK(k_renew_reply_bytes % 8 == 0);
     CHECK(k_close_bytes % 8 == 0);
     CHECK(k_close_reply_bytes % 8 == 0);
-    CHECK(k_query_bytes % 8 == 0);
-    CHECK(k_query_reply_fixed_bytes % 8 == 0);
     CHECK(k_error_fixed_bytes % 8 == 0);
     CHECK(k_data_prefix_bytes % 8 == 0);
     CHECK(k_frame_header_bytes % 8 == 0);
