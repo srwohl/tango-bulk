@@ -58,7 +58,7 @@ int main(int argc, char *argv[])
 
         // BulkOpen can clamp a request downward, but it cannot make an
         // undersized receive slot larger. Until StreamOffer discovery is
-        // available, use an explicit complete upper plan rather than a query
+        // available, use an explicit complete upper plan rather than relying on discovery
         // shaped preflight. This is conservative but safe for any valid peer.
         TangoBulk::SubscriberConfig config;
         config.stream_name = stream;

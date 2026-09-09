@@ -199,52 +199,6 @@ TEST_CASE("Close and CloseReply round trip", "[protocol][roundtrip]")
     CHECK(got_reply.frames_credited_final == reply.frames_credited_final);
 }
 
-TEST_CASE("Query and QueryReply round trip", "[protocol][roundtrip]")
-{
-    QueryRequest query;
-    query.query_flags = 0xFFFF'FFFFu;
-
-    // An all-zero session_id requests server-wide status.
-    CHECK(query.session_id.is_zero());
-
-    const auto query_bytes = encode(query, 2);
-
-    QueryRequest got_query;
-    REQUIRE(decode(query_bytes.data(), query_bytes.size(), got_query) == Status::Ok);
-    CHECK(got_query.session_id.is_zero());
-    CHECK(got_query.query_flags == query.query_flags);
-
-    QueryReply reply;
-    reply.session_id.bytes = pattern_id16(0xAA);
-    reply.status = Status::Ok;
-    reply.active_sessions = 4;
-    reply.generation = 12;
-    reply.geometry = filled_geometry();
-    reply.counters = "frames_published=1000;frames_credited=996;credits_returned=996;";
-
-    const auto reply_bytes = encode(reply, 2);
-
-    QueryReply got_reply;
-    REQUIRE(decode(reply_bytes.data(), reply_bytes.size(), got_reply) == Status::Ok);
-    CHECK(got_reply.session_id == reply.session_id);
-    CHECK(got_reply.active_sessions == reply.active_sessions);
-    CHECK(got_reply.generation == reply.generation);
-    CHECK(got_reply.geometry == reply.geometry);
-    CHECK(got_reply.counters == reply.counters);
-}
-
-TEST_CASE("an empty counter blob round trips", "[protocol][roundtrip]")
-{
-    QueryReply reply;
-    reply.geometry = filled_geometry();
-
-    const auto bytes = encode(reply, 0);
-
-    QueryReply got;
-    REQUIRE(decode(bytes.data(), bytes.size(), got) == Status::Ok);
-    CHECK(got.counters.empty());
-}
-
 TEST_CASE("Error round trip", "[protocol][roundtrip]")
 {
     const ErrorMessage sent{Status::ResourceExhausted,

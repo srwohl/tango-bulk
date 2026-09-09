@@ -9,7 +9,6 @@
 
 #include <tango/tango.h>
 
-#include <atomic>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -239,8 +238,6 @@ Status discovery_failure_status(const StreamOffer &offer) noexcept
     return Status::MalformedMessage;
 }
 
-std::atomic<std::uint64_t> query_correlation{0};
-
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -274,8 +271,6 @@ class CommandChannel
             return names.renew;
         case Protocol::CoordType::Close:
             return names.close;
-        case Protocol::CoordType::Query:
-            return names.query;
         default:
             break;
         }
@@ -399,73 +394,6 @@ std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
                   std::chrono::steady_clock::time_point deadline)
         { return adapter->command(kind, request, deadline); },
         std::move(callbacks));
-}
-
-
-BulkQueryResult bulk_query(Tango::DeviceProxy &proxy, const CommandNames &names)
-{
-    Protocol::QueryRequest request; ///< all-zero session_id: server-wide status
-    const std::uint64_t correlation_id =
-        query_correlation.fetch_add(1, std::memory_order_relaxed) + 1;
-    const std::vector<std::byte> encoded = Protocol::encode(request, correlation_id);
-    CommandChannel channel(proxy, names, 5'000);
-    const std::vector<std::byte> out =
-        channel.command(Protocol::CoordType::Query,
-                        encoded,
-                        std::chrono::steady_clock::time_point::max());
-
-    const std::byte *data = out.empty() ? nullptr : out.data();
-
-    Protocol::Envelope envelope;
-    if(Protocol::decode_envelope(data, out.size(), envelope) != Status::Ok)
-    {
-        throw BulkException(
-            BulkError{Status::MalformedMessage, "undecodable BulkQuery reply", "tango"});
-    }
-
-    if(envelope.correlation_id != correlation_id)
-    {
-        throw BulkException(
-            BulkError{Status::MalformedMessage, "BulkQuery correlation mismatch", "tango"});
-    }
-
-    // A client must accept Error in place of any expected reply (3.3).
-    if(envelope.msg_type == Protocol::CoordType::Error)
-    {
-        Protocol::ErrorMessage error;
-        if(Protocol::decode(data, out.size(), error) != Status::Ok)
-        {
-            throw BulkException(
-                BulkError{Status::MalformedMessage, "undecodable BulkQuery error", "tango"});
-        }
-
-        BulkQueryResult result;
-        result.status = error.status;
-        result.counters = error.message;
-        return result;
-    }
-
-    Protocol::QueryReply decoded;
-    if(Protocol::decode(data, out.size(), decoded) != Status::Ok)
-    {
-        throw BulkException(
-            BulkError{Status::MalformedMessage, "undecodable BulkQuery reply", "tango"});
-    }
-
-    BulkQueryResult result;
-    result.status = decoded.status;
-    result.active_sessions = decoded.active_sessions;
-    result.generation = decoded.generation;
-    result.max_frame_bytes = decoded.geometry.max_frame_bytes;
-    result.ring_depth = decoded.geometry.ring_depth;
-    result.credit_window = decoded.geometry.credit_window;
-    result.element_type = decoded.geometry.element_type;
-    result.element_size = decoded.geometry.element_size;
-    result.rank = decoded.geometry.rank;
-    result.shape = decoded.geometry.shape;
-    result.strides = decoded.geometry.strides;
-    result.counters = std::move(decoded.counters);
-    return result;
 }
 
 } // namespace TangoBulk

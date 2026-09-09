@@ -169,10 +169,9 @@ Recorded rather than silently taken. None changes a signature in §2.
    to *exactly* the delivered length. For coordination messages these conflict, because only
    the envelope carries `header_bytes` — a body has no size field of its own. Resolved as:
 
-   - Bodies with **no variable tail** (`Renew`, `RenewReply`, `Close`, `CloseReply`,
-     `Query`) tolerate trailing bytes, but only when the sender claims a minor above the one
+   - Bodies with **no variable tail** (`Renew`, `RenewReply`, `Close`, `CloseReply`) tolerate trailing bytes, but only when the sender claims a minor above the one
      implemented. At our own minor the length is exact, because there a longer body is a bug.
-   - Bodies **with** a variable tail (`Open`, `OpenReply`, `QueryReply`, `Error`) require
+   - Bodies **with** a variable tail (`Open`, `OpenReply`, `Error`) require
      exactness always. Appending a fixed field to one of those would move the tail, so
      reading the tail at its old offset would yield garbage. Refusing fails safe.
 
@@ -205,27 +204,6 @@ The following arrived with M2.
     died just after `Open` takes, so a retry policy would add a mechanism the lease already
     provides. Under the `UCP_ERR_HANDLING_MODE_NONE` §6.3 mandates, `ProbeAck` is the only
     evidence this side has that the endpoint reaches anyone at all.
-
-11. **`Query` returns `Error{Internal}`; everything else it said is closed in M3.** M2 had
-    one implicit session, no `Renew`, and a `Close` that stopped the whole publisher engine —
-    a client's clean shutdown permanently killed the device server's stream. M3 replaces all
-    of it with the §6.1 session table and the §4.2 per-session `Expiring` transition.
-
-    `Query` remains unimplemented and answers `"not implemented before M4"`, because
-    MVP_PLAN.md puts `BulkQuery` with the Tango adapter. The handler exists and gives a
-    protocol-legal reply rather than dropping the message.
-
-    **Closed in M4.** `handle_query()` answers both halves of §3.8: an all-zero `session_id`
-    asks for server-wide status, a quoted one asks about a session, and an identifier this
-    publisher does not hold is `UnknownSession` — the same answer §3.7 gives a `Renew`, so an
-    operator's `Query` and a client's `Renew` cannot disagree about whether a session exists.
-    The `key=value;` blob carries counters, configured bounds, and identifiers only in §3.2's
-    truncated form; a UCX address or a memory key would be a §3.8 violation and the UCX tests
-    assert their absence.
-
-    The default arm of the dispatcher changed with it. It used to say "not implemented before
-    M4"; it now answers `MalformedMessage` and counts the message, because everything left is
-    a *reply* type and a publisher never receives one.
 
 12. **The consumer has a teardown order, and §4.2 does not give it one.** §4.2 fixes the
     publisher's `Expiring` order and says it MUST NOT be reordered. Nothing states the
@@ -495,17 +473,7 @@ The following arrived with M4.
     because the session was opened with the old names and renaming them would leave no way to
     renew or close it.
 
-28. **`bulk_query()` and `BulkQueryResult` added.** MVP_PLAN M4 asks the server to "expose
-    optional `BulkQuery` status" and §2 defines no client-side shape for reading it. A caller
-    would otherwise have to encode a `QueryRequest`, call `command_inout` and decode a
-    `QueryReply` by hand — three steps whose only interesting part is the middle one.
-
-    It asks the server-wide question only. §3.8's other half, a `Query` naming one session,
-    needs a `session_id` that no public API hands out; that path is covered in `tests/ucx/`,
-    where the test decodes the `OpenReply` itself. Inventing a public accessor for a session
-    identifier to make one function symmetrical would have been a worse trade.
-
-29. **A command checks that the message matches the door it came through.** §7.1 says all four
+29. **A command checks that the message matches the door it came through.** §7.1 says all three
     commands take an encoded coordination message and return an encoded reply, and does not
     say what happens when a `Close` body arrives at `BulkOpen`. Both are `DevVarCharArray`
     commands, so nothing below the protocol can tell them apart, and dispatching purely on
@@ -744,7 +712,6 @@ state machine), §5.1 (thread inventory) and §5.2 (callback isolation). Tests a
 |---|---|---|
 | Reusable ordinary-command implementations for `BulkOpen`, `BulkRenew`, `BulkClose` | met | `src/tango/commands.cpp`; `The four bulk commands are ordinary commands on a stock device` |
 | A small registration helper suitable for a normal device class | met | `install_bulk_commands()` / `attach_publisher()` / `detach_publisher()`; three lines in `fixture_device.cpp` and in `examples/example_device/` |
-| Optional `BulkQuery` status | met | `handle_query()`; `bulk_query()`; `BulkQuery reports the publisher an operator can see`, `Query answers server-wide and per session` |
 | A separate low-rate preview attribute example | met | `examples/example_preview/` — decimated, 10 Hz, ordinary change event, wholly outside the bulk path |
 | `FrameMetadata` sourced from device state and the acquired lease | met | `examples/example_device/`, `fixture_device.cpp` — no `AttributeValue_5` anywhere on either path |
 | Never construct `AttributeValue_5` or call `push_change_event()` on the bulk-only path | met | the only `push_change_event()` in the repository is inside `if(preview_due())` in the preview example |

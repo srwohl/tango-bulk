@@ -85,7 +85,7 @@ struct Locality
     /// What this placement amounts to.  `Split` is the one worth acting on.
     Placement placement() const noexcept;
 
-    /// One line, safe to log and safe to put in `QueryReply.counters`.
+    /// One line, safe to log as an operator diagnostic.
     ///
     /// 3.8 forbids that blob from carrying addresses, memory keys or session
     /// identifiers; a device name and a node number are none of those.

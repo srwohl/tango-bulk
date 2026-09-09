@@ -17,10 +17,9 @@ TEST_CASE("default command names are unprefixed", "[tango][commands]")
     CHECK(names.open == "BulkOpen");
     CHECK(names.renew == "BulkRenew");
     CHECK(names.close == "BulkClose");
-    CHECK(names.query == "BulkQuery");
 }
 
-TEST_CASE("with_prefix renames all four commands", "[tango][commands]")
+TEST_CASE("with_prefix renames all three commands", "[tango][commands]")
 {
     // The override exists for devices with a name collision, not as the normal
     // path -- which is why it prefixes rather than letting each name be set
@@ -30,7 +29,6 @@ TEST_CASE("with_prefix renames all four commands", "[tango][commands]")
     CHECK(names.open == "XyzBulkOpen");
     CHECK(names.renew == "XyzBulkRenew");
     CHECK(names.close == "XyzBulkClose");
-    CHECK(names.query == "XyzBulkQuery");
 }
 
 TEST_CASE("the adapter is built against an installed cppTango", "[tango][build]")

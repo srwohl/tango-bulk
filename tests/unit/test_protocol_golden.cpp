@@ -139,26 +139,6 @@ CloseReply canonical_close_reply()
     return msg;
 }
 
-QueryRequest canonical_query()
-{
-    QueryRequest msg;
-    msg.session_id.bytes = canonical_id(0x20);
-    msg.query_flags = 1;
-    return msg;
-}
-
-QueryReply canonical_query_reply()
-{
-    QueryReply msg;
-    msg.session_id.bytes = canonical_id(0x20);
-    msg.status = Status::Ok;
-    msg.active_sessions = 1;
-    msg.generation = 3;
-    msg.geometry = canonical_geometry();
-    msg.counters = "frames=1000;";
-    return msg;
-}
-
 ErrorMessage canonical_error()
 {
     return ErrorMessage{Status::TooManySessions, "session limit reached"};
@@ -223,8 +203,6 @@ TEST_CASE("golden vectors, coordination plane", "[protocol][golden]")
     CHECK_GOLDEN(k_renew_reply, encode(canonical_renew_reply(), k_correlation));
     CHECK_GOLDEN(k_close, encode(canonical_close(), k_correlation));
     CHECK_GOLDEN(k_close_reply, encode(canonical_close_reply(), k_correlation));
-    CHECK_GOLDEN(k_query, encode(canonical_query(), k_correlation));
-    CHECK_GOLDEN(k_query_reply, encode(canonical_query_reply(), k_correlation));
     CHECK_GOLDEN(k_error, encode(canonical_error(), k_correlation));
 }
 
