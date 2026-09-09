@@ -399,8 +399,8 @@ The following arrived with M2.
 
     That is a worse failure than an unimplemented feature, and the difference is worth
     stating: every other unimplemented thing here refuses in the caller's face —
-    `DeliveryMode::DispatchThread` throws, `declare_geometry()` returns `Internal`, `Query`
-    answers "not implemented before M4". A silent no-op on a field whose *only* purpose is to
+    `DeliveryMode::Push` is the library-owned callback path, `declare_geometry()` returns `Internal`,
+    and discovery is provided by the `BulkStreams` attribute. A silent no-op on a field whose *only* purpose is to
     influence measurements means a benchmark can be attributed to a configuration that was
     never in effect. It is the same shape as `FINDINGS.md`'s warning that a missing flush
     "shows up as a *faster* result".

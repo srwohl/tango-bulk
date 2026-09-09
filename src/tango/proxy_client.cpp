@@ -353,6 +353,14 @@ std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
                                         SubscriptionCallbacks callbacks,
                                         const CommandNames &names)
 {
+    // Reject local configuration before spending the shared establishment
+    // budget on a Tango discovery read.
+    if(const Status status = config.validate(); status != Status::Ok)
+    {
+        throw BulkException(BulkError{
+            status, std::string("invalid SubscriberConfig: ") + to_string(status), "tango"});
+    }
+
     const auto discovery_deadline =
         std::chrono::steady_clock::now() +
         std::chrono::milliseconds(config.establishment_timeout_ms);

@@ -127,7 +127,7 @@ has never been observed to fail is not a check.
 ## Testing
 
 ```sh
-pixi run test        # 143 cases
+pixi run test        # full unit, UCX, and Tango suite
 pixi run test-asan   # the same, under -fsanitize=address,undefined
 ```
 
@@ -146,8 +146,8 @@ fails.
 
 Both sides are worth a race detector. The server state machine is a handshake between a Tango
 command thread and the engine thread; the client has three threads and passes a transport
-between them, so the control thread may rebuild the engine while the dispatch thread is inside
-`poll()`. There is no pixi task because TSan needs ASLR disabled on recent kernels — including
+between them, so the control thread may rebuild the engine while the dispatch thread is delivering
+a callback. There is no pixi task because TSan needs ASLR disabled on recent kernels — including
 at *build* time, since `catch_discover_tests` runs the binary to enumerate cases:
 
 ```sh
@@ -280,7 +280,7 @@ void MyDevice::delete_device()        { TangoBulk::detach_publisher(*this); }
 The acquisition path then never touches Tango:
 
 ```cpp
-TangoBulk::BulkSource::Lease lease = publisher_->source().try_acquire();
+TangoBulk::BulkPublisher::SlotHandle lease = publisher_->try_acquire();
 if(lease)                             // never blocks; a full ring means drop, not wait
 {
     fill(lease.data());               // the DMA target, filled in place

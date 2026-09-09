@@ -622,17 +622,27 @@ TEST_CASE("a frame the application kept outlives the session that delivered it",
     script.receive(42);
 
     FrameView retained;
+    std::mutex retained_mutex;
 
     SubscriptionCallbacks callbacks = noop_callbacks();
-    callbacks.on_frame = [&retained](FrameView frame) { retained = std::move(frame); };
+    callbacks.on_frame = [&retained, &retained_mutex](FrameView frame)
+    {
+        const std::lock_guard<std::mutex> lock(retained_mutex);
+        retained = std::move(frame);
+    };
 
     auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    REQUIRE(eventually([&retained] { return static_cast<bool>(retained); }));
+    REQUIRE(eventually([&retained, &retained_mutex]
+                       {
+                           const std::lock_guard<std::mutex> lock(retained_mutex);
+                           return static_cast<bool>(retained);
+                       }));
 
     subscription.reset();
 
+    const std::lock_guard<std::mutex> lock(retained_mutex);
     REQUIRE(static_cast<bool>(retained));
     CHECK(retained.sequence() == 42);
     CHECK(retained.size() == 128);
@@ -646,24 +656,43 @@ TEST_CASE("a frame delivered before a reconnect survives the session that replac
     Script script;
     script.receive(11);
 
-    FrameView retained;
+    std::vector<FrameView> retained;
+    std::mutex retained_mutex;
 
     SubscriptionCallbacks callbacks = noop_callbacks();
-    callbacks.on_frame = [&retained](FrameView frame) { retained = std::move(frame); };
+    callbacks.on_frame = [&retained, &retained_mutex](FrameView frame)
+    {
+        const std::lock_guard<std::mutex> lock(retained_mutex);
+        retained.push_back(std::move(frame));
+    };
 
     auto subscription = detail::SubscriptionFactory::open(
         subscription_config(), fake_channel(script), fake_factory(script), std::move(callbacks));
 
-    REQUIRE(eventually([&retained] { return static_cast<bool>(retained); }));
+    REQUIRE(eventually([&retained, &retained_mutex]
+                       {
+                           const std::lock_guard<std::mutex> lock(retained_mutex);
+                           return retained.size() >= 1;
+                       }));
 
     script.refuse_next_renew(Status::SessionExpired);
     REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
 
-    CHECK(retained.sequence() == 11);
-    CHECK(*reinterpret_cast<const std::uint16_t *>(retained.data()) == 11);
+    {
+        const std::lock_guard<std::mutex> lock(retained_mutex);
+        REQUIRE(retained.size() >= 1);
+        CHECK(retained[0].sequence() == 11);
+        CHECK(*reinterpret_cast<const std::uint16_t *>(retained[0].data()) == 11);
+    }
 
     script.receive(12);
-    REQUIRE(eventually([&retained] { return static_cast<bool>(retained); }));
+    REQUIRE(eventually([&retained, &retained_mutex]
+                       {
+                           const std::lock_guard<std::mutex> lock(retained_mutex);
+                           return retained.size() >= 2;
+                       }));
+    const std::lock_guard<std::mutex> lock(retained_mutex);
+    CHECK(retained[1].sequence() == 12);
 }
 
 

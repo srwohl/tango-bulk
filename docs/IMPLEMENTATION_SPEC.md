@@ -39,7 +39,7 @@ decision is deferred into code review.
 |---|---|---|
 | Command prefix | `BulkOpen` / `BulkRenew` / `BulkClose`, unprefixed by default; a `CommandNames` struct allows a per-device prefix | Unprefixed names are discoverable and match the docs already written; the override exists for devices with a name collision, not as the normal path |
 | Default lease timings | TTL 10 000 ms, renew interval 3 333 ms (TTL/3), both negotiated per session | Three renewal attempts fit inside one TTL, so a single lost Tango command never expires a healthy session |
-| Callback executor default | One library-owned dispatch thread per subscriber; `DeliveryMode::Manual` + `poll()` for deterministic tests | Structurally guarantees §5's "callbacks never run on the engine thread" without forcing an executor dependency on applications |
+| Callback executor default | One library-owned dispatch thread per subscriber; `DeliveryMode::Pull` + `read_for()` for caller-owned reads | Structurally guarantees §5's "callbacks never run on the engine thread" while keeping delivery ownership immutable per subscription |
 | Wire codec | Hand-written fixed-offset little-endian encode/decode, with a `header_bytes` trailing-extension rule | Already validated in the prototype ([bulk_wire.h](../../src/include/tango/internal/ucx/bulk_wire.h)); adds no dependency, decodes in a few ns inside an AM callback, and keeps the protocol independent of Tango IDL and of any third-party schema compiler |
 | Relay in MVP? | **No.** Relay is M6, post-MVP | The MVP objective is one line-rate consumer; fan-out is a capacity problem, not a semantics problem, and shipping it early would not be exercised |
 
@@ -459,13 +459,13 @@ const char *to_string(SubscriberState) noexcept;
 
 enum class DeliveryMode : std::uint32_t
 {
-    DispatchThread = 0,   // library-owned thread invokes the callback (default)
-    Manual         = 1,   // application calls poll(); no dispatch thread is created
+    Push = 0,              // library-owned thread invokes the callback (default)
+    Pull = 1,              // application claims frames with read_for()
 };
 
 enum class ReconnectPolicy : std::uint32_t
 {
-    FailFast = 0, BoundedRetry = 1, Manual = 2,
+    FailFast = 0, BoundedRetry = 1,
 };
 
 struct SubscriberConfig
@@ -475,7 +475,7 @@ struct SubscriberConfig
     std::uint32_t ring_depth{32};
     std::uint32_t credit_window{16};
     std::uint32_t delivery_queue_depth{64};
-    DeliveryMode  delivery_mode{DeliveryMode::DispatchThread};
+    DeliveryMode  delivery_mode{DeliveryMode::Push};
     DropPolicy    drop_policy{DropPolicy::DropNewest};
     ReconnectPolicy reconnect_policy{ReconnectPolicy::BoundedRetry};
     std::uint32_t reconnect_max_attempts{10};
@@ -509,9 +509,8 @@ class BulkSubscriber
     void start();       // throws BulkException on open failure under FailFast
     void stop() noexcept;   // idempotent; sends BulkClose best-effort, joins threads
 
-    // Manual mode only. Returns the number of frames dispatched. Invokes the frame
-    // callback on the CALLING thread. Throws if delivery_mode != Manual.
-    std::size_t poll(std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+    // Pull mode only. The application claims frames directly with try_read()
+    // or read_for(); Push mode invokes the callback on the library thread.
 
     SubscriberState state() const noexcept;
     std::uint32_t   generation() const noexcept;
@@ -1061,12 +1060,12 @@ Closed ──start()──► Opening ──OpenReply{Ok}──► Probing ─�
 | `Reconnecting` | drop endpoint, keep ring, back off, retry `Open` | `Opening`, `Failed`, `Closed` |
 | `Failed` | terminal until `stop()`/`start()`; state callback fired with `BulkError` | `Closed` |
 
-The state callback fires on **every** transition, on the dispatch thread (or from `poll()` in manual
-mode), never on the engine thread.
+The frame callback fires on the dedicated Push thread and Pull callers claim frames directly;
+neither delivery path runs application code on the engine thread.
 
 Reconnect policy: `FailFast` → any transition to `Reconnecting` becomes `Failed`. `BoundedRetry` →
 up to `reconnect_max_attempts` with exponential backoff from `reconnect_backoff_ms`, capped at the
-last known lease TTL. `Manual` → enter `Failed` and let the application call `start()` again.
+last known lease TTL.
 
 ### 4.2 Server (per session)
 
@@ -1169,7 +1168,7 @@ geometry.
 |---|---|---|---|
 | **Application / acquisition** | N (caller's) | `BulkSource::Lease` between `try_acquire()` and `publish()` | enter UCX; take a UCX lock; block |
 | **Engine** | 1 per worker/rail | the `ucp_worker` **exclusively**; all `ucp_*` calls | invoke a user callback; call Tango; allocate on the frame path |
-| **Dispatch** | 1 per subscriber (`DispatchThread` mode) | invoking `FrameCallback` and `StateCallback` | touch UCX; hold a lease longer than the callback |
+| **Dispatch** | 1 per Push subscription | invoking `FrameCallback` | touch UCX; hold a lease longer than the callback |
 | **Control** | 1 per publisher and per subscriber | lease timers, `Renew` commands, expiry sweeps, `DeviceProxy` calls | touch UCX; invoke user frame callbacks |
 
 The `ucp_worker` is created with `UCS_THREAD_MODE_SINGLE` and is touched **only** by its engine
@@ -1540,7 +1539,7 @@ registered receive ring; `FrameView` with the shared-ptr lease; cumulative credi
 
 - no Tango process, no `DeviceProxy`, no commands (the coordination plane is driven directly through
   `handle_coordination`, or by `oob.hpp` in the UCX tests);
-- no user callbacks and no dispatch thread — `DeliveryMode::Manual` and `poll()` only;
+- no user callbacks and no dispatch thread — `DeliveryMode::Pull` reads only;
 - no geometry changes;
 - no probe;
 - no session leases, renewal, or expiry;
