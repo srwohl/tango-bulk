@@ -56,8 +56,6 @@ class Subscription
     /// Only available for DeliveryMode::Pull.
     std::optional<FrameView> read_for(std::chrono::milliseconds timeout);
 
-    std::size_t poll(std::chrono::milliseconds timeout, std::size_t max_frames);
-
     SubscriberState state() const noexcept;
 
     int fd() const noexcept;

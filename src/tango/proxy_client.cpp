@@ -370,19 +370,6 @@ std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
         }
         config.discovery_offer = offer;
 
-        // SubscriptionFactory owns the existing establishment deadline, so
-        // carry the consumed discovery time through its existing timeout
-        // option instead of starting a second full budget after the read.
-        const std::uint32_t remaining = remaining_timeout_ms(
-            discovery_deadline, config.establishment_timeout_ms);
-        if(remaining == 0)
-        {
-            throw BulkException(BulkError{Status::TransportFailure,
-                                          "BulkStreams discovery consumed the establishment "
-                                          "deadline",
-                                          "tango"});
-        }
-        config.establishment_timeout_ms = remaining;
     }
 
     const auto adapter = std::make_shared<CommandChannel>(proxy, names, config.command_timeout_ms);
@@ -393,7 +380,8 @@ std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
                   const std::vector<std::byte> &request,
                   std::chrono::steady_clock::time_point deadline)
         { return adapter->command(kind, request, deadline); },
-        std::move(callbacks));
+        std::move(callbacks),
+        discovery_deadline);
 }
 
 } // namespace TangoBulk

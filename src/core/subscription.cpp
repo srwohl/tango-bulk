@@ -337,6 +337,24 @@ struct Subscription::Impl
     {
     }
 
+    void close_candidate(const SessionState &candidate,
+                         std::chrono::steady_clock::time_point deadline) noexcept
+    {
+        try
+        {
+            const std::uint64_t correlation_id = next_correlation_id();
+            const std::vector<std::byte> request = candidate.make_close_request(correlation_id);
+            const std::vector<std::byte> reply =
+                channel(Protocol::CoordType::Close, request, deadline);
+            (void)candidate.adopt_close_reply(reply.data(), reply.size(), correlation_id);
+        }
+        catch(const std::exception &)
+        {
+            // BulkClose is best effort while abandoning a session that never
+            // became active; the original establishment error is authoritative.
+        }
+    }
+
 
     bool open_subscription(
         BulkError &error,
@@ -415,6 +433,7 @@ struct Subscription::Impl
                               "with the new contract in hand",
                               "subscriber"};
 
+            close_candidate(candidate, establishment_deadline);
             delivery->retire_ingress();
             fresh.reset();
             return false;
@@ -441,6 +460,7 @@ struct Subscription::Impl
                         ? reported
                         : BulkError{status, "the transport could not adopt the grant",
                                     "subscriber"};
+            close_candidate(candidate, establishment_deadline);
             delivery->retire_ingress();
             fresh.reset();
             {
@@ -661,8 +681,15 @@ struct Subscription::Impl
         return granted == 0 ? 1'000u : granted;
     }
 
-    std::chrono::steady_clock::time_point coordination_deadline() const noexcept
+    std::chrono::steady_clock::time_point coordination_deadline() noexcept
     {
+        {
+            std::lock_guard<std::mutex> lock(shutdown_mutex);
+            if(shutdown_started)
+            {
+                return shutdown_deadline;
+            }
+        }
         return std::chrono::steady_clock::now() +
                std::chrono::milliseconds(config.command_timeout_ms);
     }
@@ -712,6 +739,12 @@ struct Subscription::Impl
             running.store(false, std::memory_order_release);
             wake.notify_all();
         }
+
+        {
+            std::lock_guard<std::mutex> lock(shutdown_mutex);
+            control_finished = true;
+        }
+        shutdown_wake.notify_all();
     }
 
     bool reconnect(std::uint32_t &attempt, BulkError error) noexcept
@@ -889,10 +922,6 @@ struct Subscription::Impl
             catch(...)
             {
                 fail_delivery();
-                if(config.delivery_mode == DeliveryMode::Manual)
-                {
-                    throw;
-                }
                 break;
             }
 
@@ -918,8 +947,16 @@ struct Subscription::Impl
             const bool active = running.load(std::memory_order_acquire) &&
                                 !interrupted.load(std::memory_order_acquire) &&
                                 state.load(std::memory_order_acquire) != SubscriberState::Failed;
-            if(!active && delivery->stats().depth == 0)
+            if(!active &&
+               (interrupted.load(std::memory_order_acquire) ||
+                state.load(std::memory_order_acquire) == SubscriberState::Closed ||
+                delivery->stats().depth == 0))
             {
+                {
+                    std::lock_guard<std::mutex> lock(shutdown_mutex);
+                    dispatch_finished = true;
+                }
+                shutdown_wake.notify_all();
                 return;
             }
 
@@ -938,6 +975,8 @@ struct Subscription::Impl
 
     void shutdown(bool announce_closed) noexcept
     {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(config.command_timeout_ms);
         {
             std::unique_lock<std::mutex> lock(shutdown_mutex);
             if(shutdown_complete)
@@ -959,6 +998,7 @@ struct Subscription::Impl
 
             shutdown_started = true;
             shutdown_owner = self;
+            shutdown_deadline = deadline;
         }
 
         running.store(false, std::memory_order_release);
@@ -967,15 +1007,30 @@ struct Subscription::Impl
         delivery->close();
 
         const std::thread::id self = std::this_thread::get_id();
+        bool control_detached = false;
         if(control.joinable())
         {
             if(control.get_id() == self)
             {
                 control.detach();
+                control_detached = true;
             }
             else
             {
-                control.join();
+                std::unique_lock<std::mutex> lock(shutdown_mutex);
+                const bool finished = control_finished ||
+                                      shutdown_wake.wait_until(
+                                          lock, deadline, [this] { return control_finished; });
+                lock.unlock();
+                if(finished)
+                {
+                    control.join();
+                }
+                else
+                {
+                    control.detach();
+                    control_detached = true;
+                }
             }
         }
         if(dispatch.joinable())
@@ -986,11 +1041,26 @@ struct Subscription::Impl
             }
             else
             {
-                dispatch.join();
+                std::unique_lock<std::mutex> lock(shutdown_mutex);
+                const bool finished = dispatch_finished ||
+                                      shutdown_wake.wait_until(
+                                          lock, deadline, [this] { return dispatch_finished; });
+                lock.unlock();
+                if(finished)
+                {
+                    dispatch.join();
+                }
+                else
+                {
+                    dispatch.detach();
+                }
             }
         }
 
-        close_session();
+        if(!control_started || (interrupted.load(std::memory_order_acquire) && !control_detached))
+        {
+            close_session(deadline);
+        }
 
         if(announce_closed)
         {
@@ -1042,8 +1112,13 @@ struct Subscription::Impl
     std::mutex shutdown_mutex;
     std::condition_variable shutdown_wake;
     std::thread::id shutdown_owner;
+    std::chrono::steady_clock::time_point shutdown_deadline{
+        std::chrono::steady_clock::time_point::max()};
     bool shutdown_started{false};
     bool shutdown_complete{false};
+    bool control_started{false};
+    bool control_finished{false};
+    bool dispatch_finished{false};
 
     std::atomic<std::uint64_t> correlation{0};
     std::atomic<std::uint64_t> reconnects{0};
@@ -1071,6 +1146,7 @@ void Subscription::close() noexcept
 void Subscription::interrupt() noexcept
 {
     impl_->interrupted.store(true, std::memory_order_release);
+    impl_->running.store(false, std::memory_order_release);
     impl_->delivery->interrupt();
     impl_->wake.notify_all();
 }
@@ -1127,7 +1203,8 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
     SubscriberConfig config,
     detail::CoordinationChannel channel,
     detail::TransportFactory factory,
-    SubscriptionCallbacks callbacks)
+    SubscriptionCallbacks callbacks,
+    std::chrono::steady_clock::time_point establishment_deadline)
 {
     const Status status = config.validate();
     if(status != Status::Ok)
@@ -1152,7 +1229,7 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
                                       "subscriber"});
     }
 
-    if(config.delivery_mode != DeliveryMode::Pull && !callbacks.on_frame)
+    if(config.delivery_mode == DeliveryMode::Push && !callbacks.on_frame)
     {
         throw BulkException(BulkError{Status::Internal,
                                       "SubscriptionCallbacks needs on_frame",
@@ -1167,15 +1244,19 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
     impl->transition(SubscriberState::Opening, BulkError{});
 
     BulkError error;
-    const auto establishment_deadline =
-        std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(impl->config.establishment_timeout_ms);
+    if(establishment_deadline == std::chrono::steady_clock::time_point::max())
+    {
+        establishment_deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(impl->config.establishment_timeout_ms);
+    }
     if(impl->open_subscription(error, establishment_deadline))
     {
-        if(impl->config.delivery_mode == DeliveryMode::DispatchThread)
+        if(impl->config.delivery_mode == DeliveryMode::Push)
         {
             impl->dispatch = std::thread([worker = impl] { worker->dispatch_loop(); });
         }
+        impl->control_started = true;
         impl->control = std::thread([worker = impl] { worker->control_loop(); });
         return std::unique_ptr<Subscription>(new Subscription(std::move(impl)));
     }
@@ -1210,10 +1291,11 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
 
         if(opened)
         {
-            if(impl->config.delivery_mode == DeliveryMode::DispatchThread)
+            if(impl->config.delivery_mode == DeliveryMode::Push)
             {
                 impl->dispatch = std::thread([worker = impl] { worker->dispatch_loop(); });
             }
+            impl->control_started = true;
             impl->control = std::thread([worker = impl] { worker->control_loop(); });
             return std::unique_ptr<Subscription>(new Subscription(std::move(impl)));
         }
@@ -1224,78 +1306,6 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
     throw BulkException(error);
 }
 
-std::size_t Subscription::poll(std::chrono::milliseconds timeout, std::size_t max_frames)
-{
-    Impl &impl = *impl_;
-
-    if(impl.interrupted.load(std::memory_order_acquire))
-    {
-        throw BulkException(BulkError{Status::Shutdown,
-                                      "the subscription was interrupted",
-                                      "subscriber"});
-    }
-
-    if(impl.config.delivery_mode != DeliveryMode::Manual)
-    {
-        throw BulkException(BulkError{Status::Internal,
-                                      "poll() requires DeliveryMode::Manual; a dispatch thread "
-                                      "is already delivering frames",
-                                      "subscriber"});
-    }
-
-    if(max_frames == 0)
-    {
-        throw BulkException(BulkError{Status::DepthTooLarge,
-                                      "poll() requires a positive max_frames bound",
-                                      "subscriber"});
-    }
-
-    if(!impl.frame_callback)
-    {
-        throw BulkException(BulkError{Status::Internal,
-                                      "poll() requires a callback; use read_for() for Pull",
-                                      "subscriber"});
-    }
-
-    std::size_t frames = 0;
-    try
-    {
-        frames = impl.deliver_frames(timeout, max_frames);
-    }
-    catch(...)
-    {
-        throw;
-    }
-
-    if(frames == 0)
-    {
-        if(impl.interrupted.load(std::memory_order_acquire))
-        {
-            throw BulkException(BulkError{Status::Shutdown,
-                                          "the subscription was interrupted",
-                                          "subscriber"});
-        }
-
-        const SubscriberState state = impl.state.load(std::memory_order_acquire);
-        if(state == SubscriberState::Failed)
-        {
-            std::lock_guard<std::mutex> lock(impl.observation);
-            throw BulkException(impl.last_error.status == Status::Ok
-                                    ? BulkError{Status::TransportFailure,
-                                                "the subscription failed",
-                                                "subscriber"}
-                                    : impl.last_error);
-        }
-        if(state == SubscriberState::Closed)
-        {
-            throw BulkException(BulkError{Status::Shutdown,
-                                          "the subscription is closed",
-                                          "subscriber"});
-        }
-    }
-    return frames;
-}
-
 SubscriberState Subscription::state() const noexcept
 {
     return impl_->state.load(std::memory_order_acquire);
@@ -1303,10 +1313,7 @@ SubscriberState Subscription::state() const noexcept
 
 int Subscription::fd() const noexcept
 {
-    return impl_->config.delivery_mode == DeliveryMode::Pull ||
-                   impl_->config.delivery_mode == DeliveryMode::Manual
-               ? impl_->delivery->fd()
-               : -1;
+    return impl_->config.delivery_mode == DeliveryMode::Pull ? impl_->delivery->fd() : -1;
 }
 
 Geometry Subscription::geometry() const noexcept

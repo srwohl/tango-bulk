@@ -74,11 +74,6 @@ enum class DeliveryMode : std::uint32_t
 {
     Push = 0, ///< a dedicated library thread invokes the callback (default)
     Pull = 1, ///< the application claims frames with Subscription::read_for()
-
-    // Transitional spellings retained for source compatibility. New code
-    // should choose the ownership model explicitly as Push or Pull.
-    DispatchThread = Push,
-    Manual = 2,
 };
 
 enum class ReconnectPolicy : std::uint32_t
@@ -94,7 +89,7 @@ struct SubscriberConfig
     std::uint32_t ring_depth{32};
     std::uint32_t credit_window{16};
     std::uint32_t delivery_queue_depth{64};
-    DeliveryMode delivery_mode{DeliveryMode::DispatchThread};
+    DeliveryMode delivery_mode{DeliveryMode::Push};
     DropPolicy drop_policy{DropPolicy::DropNewest};
     ReconnectPolicy reconnect_policy{ReconnectPolicy::BoundedRetry};
     std::uint32_t reconnect_max_attempts{10};

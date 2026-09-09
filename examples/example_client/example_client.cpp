@@ -69,7 +69,7 @@ int main(int argc, char *argv[])
         // it never runs on the UCX engine thread (5.2) -- which is what lets a
         // slow consumer be slow without stalling the transport.  Swap in
         // Pull mode and call read_for() to own frame reads yourself.
-        config.delivery_mode = TangoBulk::DeliveryMode::DispatchThread;
+        config.delivery_mode = TangoBulk::DeliveryMode::Push;
 
         // 4.1: keep trying when the link drops, up to ten times with an
         // exponential backoff capped at the lease TTL.
