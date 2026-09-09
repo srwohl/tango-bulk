@@ -9,13 +9,31 @@
 
 #include <tango-bulk/frame.h>
 
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 namespace TangoBulk::detail
 {
+
+struct DeliveryRead
+{
+    enum class Kind : std::uint32_t
+    {
+        Frame,
+        Empty,
+        Timeout,
+        Closed,
+        Interrupted,
+        SessionFailed,
+        CallbackFailed,
+    };
+
+    Kind kind{Kind::Empty};
+    FrameView frame;
+    BulkError error{};
+};
 
 class DeliveryQueue
 {
@@ -26,7 +44,7 @@ class DeliveryQueue
         std::size_t capacity{0};
         std::uint64_t taken{0};      ///< handed to a consumer
         std::uint64_t dropped{0};    ///< refused or evicted by the queue policy
-        std::uint64_t discarded{0};  ///< let go because a session retired
+        std::uint64_t discarded{0};  ///< let go because a session or delivery ended
         std::uint64_t high_water{0};
     };
 
@@ -38,45 +56,47 @@ class DeliveryQueue
 
     bool push(FrameView frame) noexcept;
 
+    DeliveryRead try_read_result();
+
+    DeliveryRead read_result(std::chrono::steady_clock::time_point deadline);
+
     bool try_take(FrameView &out) noexcept;
 
     bool take(FrameView &out, std::chrono::steady_clock::time_point deadline) noexcept;
 
-    void stop() noexcept;
+    /// Accepted frames remain claimable before a final session failure is
+    /// reported. Close and interrupt instead discard queued frames first.
+    void fail(BulkError error) noexcept;
+
+    void callback_failed(BulkError error) noexcept;
+
+    void close() noexcept;
+
+    void interrupt() noexcept;
 
     std::size_t discard() noexcept;
 
-    int fd() const noexcept
-    {
-        return wakeup_fd_;
-    }
+    /// Each transport receives a capability sharing this queue's storage and
+    /// descriptor. Retiring it makes late transport progress harmless.
+    std::shared_ptr<DeliveryQueue> make_ingress();
+
+    void retire_ingress() noexcept;
+
+    int fd() const noexcept;
 
     Stats stats() const noexcept;
 
+    // Definitions stay private to delivery_queue.cpp; the forward declarations
+    // are public only so its small non-member synchronization helpers can use
+    // the opaque shared state without exposing queue storage.
+    struct State;
+    struct Ingress;
+
   private:
-    void signal_waiter() noexcept;
+    DeliveryQueue(std::shared_ptr<State> state, std::shared_ptr<Ingress> ingress) noexcept;
 
-    void arm() noexcept
-    {
-        consumer_waiting_.store(true, std::memory_order_release);
-    }
-
-    void drain() noexcept;
-
-    bool await(std::chrono::steady_clock::time_point deadline) noexcept;
-
-    BoundedQueue<FrameView> queue_;
-    DropPolicy policy_;
-
-    int wakeup_fd_{-1};
-
-    std::atomic<bool> consumer_waiting_{false};
-
-    std::atomic<bool> stopped_{false};
-    std::atomic<std::uint64_t> taken_{0};
-    std::atomic<std::uint64_t> dropped_{0};
-    std::atomic<std::uint64_t> discarded_{0};
-    std::atomic<std::uint64_t> high_water_{0};
+    std::shared_ptr<State> state_;
+    std::shared_ptr<Ingress> ingress_;
 };
 
 } // namespace TangoBulk::detail
