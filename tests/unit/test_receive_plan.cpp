@@ -119,6 +119,57 @@ TEST_CASE("a stream offer is a safe pre-open receive-plan upper bound",
     CHECK(intersected.validate() == Status::Ok);
 }
 
+TEST_CASE("BulkStreams rows have one versioned fixed field order", "[core][stream-offer]")
+{
+    StreamOffer offer;
+    offer.status = Status::Ok;
+    offer.stream_name = "bulk.unit";
+    offer.geometry = granted_geometry();
+    offer.age_ms = 17;
+
+    const std::string row = offer.to_bulk_stream_row();
+    CHECK(row == "1|bulk.unit|1|1|1|1|16777216|64|32|4096,0,0,0|1,0,0,0|17");
+
+    const StreamOffer decoded = StreamOffer::from_bulk_stream_row(row);
+    CHECK(decoded == offer);
+    CHECK(decoded.outcome() == StreamOffer::Outcome::Available);
+}
+
+TEST_CASE("BulkStreams rows reject malformed, unsupported, and stale observations",
+          "[core][stream-offer]")
+{
+    StreamOffer offer;
+    offer.status = Status::Ok;
+    offer.stream_name = "bulk.unit";
+    offer.geometry = granted_geometry();
+
+    SECTION("wrong field count")
+    {
+        const StreamOffer malformed = StreamOffer::from_bulk_stream_row("1|bulk.unit");
+        CHECK(malformed.status == Status::MalformedMessage);
+        CHECK(malformed.outcome() == StreamOffer::Outcome::Malformed);
+    }
+
+    SECTION("unsupported row version")
+    {
+        const std::string row = offer.to_bulk_stream_row();
+        const StreamOffer unsupported = StreamOffer::from_bulk_stream_row(
+            std::string("2") + row.substr(row.find('|')));
+        CHECK(unsupported.validate() == Status::UnsupportedVersion);
+        CHECK(unsupported.outcome() == StreamOffer::Outcome::Malformed);
+    }
+
+    SECTION("age is a safety bound")
+    {
+        offer.age_ms = StreamOffer::k_max_age_ms + 1;
+        const StreamOffer stale = StreamOffer::from_bulk_stream_row(offer.to_bulk_stream_row());
+        CHECK(stale.validate() == Status::TransportFailure);
+        CHECK(stale.outcome() == StreamOffer::Outcome::Stale);
+        CHECK_FALSE(stale.available());
+        CHECK(ReceivePlan::derive(stale, 64ull << 20) == ReceivePlan{});
+    }
+}
+
 TEST_CASE("an unsafe or unavailable offer never produces an allocation plan",
           "[core][stream-offer]")
 {
