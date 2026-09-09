@@ -183,6 +183,51 @@ TEST_CASE("BulkStreams reports the fixed conservative offer row", "[tango][disco
     CHECK(offer.geometry.credit_window == 4);
 }
 
+TEST_CASE("Publisher observation attributes are fixed and read-only", "[tango][observation]")
+{
+    Tango::DeviceProxy proxy(DeviceServer::instance().device());
+    Tango::AttributeInfoList *attributes = proxy.attribute_list_query();
+    REQUIRE(attributes != nullptr);
+
+    const auto find = [attributes](const std::string &name) -> const Tango::AttributeInfo *
+    {
+        for(const Tango::AttributeInfo &info : *attributes)
+        {
+            if(info.name == name)
+            {
+                return &info;
+            }
+        }
+        return nullptr;
+    };
+
+    for(const std::string name : {"BulkStreams", "BulkSessions", "BulkTransport"})
+    {
+        const Tango::AttributeInfo *info = find(name);
+        REQUIRE(info != nullptr);
+        CHECK(info->data_type == Tango::DEV_STRING);
+        CHECK(info->writable == Tango::READ);
+        CHECK(info->disp_level == Tango::OPERATOR);
+        CHECK(info->data_format ==
+              (name == "BulkTransport" ? Tango::SCALAR : Tango::SPECTRUM));
+        CHECK_FALSE(proxy.read_attribute(name).has_failed());
+    }
+
+    for(const std::string name : {"BulkFramesPublished", "BulkFramesDropped",
+                                  "BulkWorstLagFrames"})
+    {
+        const Tango::AttributeInfo *info = find(name);
+        REQUIRE(info != nullptr);
+        CHECK(info->data_type == Tango::DEV_ULONG64);
+        CHECK(info->writable == Tango::READ);
+        CHECK(info->disp_level == Tango::OPERATOR);
+        CHECK(info->data_format == Tango::SCALAR);
+        CHECK_FALSE(proxy.read_attribute(name).has_failed());
+    }
+
+    delete attributes;
+}
+
 TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tango][m4]")
 {
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
@@ -199,6 +244,22 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
     REQUIRE(count == 4);
 
     REQUIRE(eventually([&sink] { return sink.frame_count.load() >= 4; }));
+
+    Tango::DeviceAttribute sessions_attribute = proxy.read_attribute("BulkSessions");
+    std::vector<std::string> sessions;
+    REQUIRE(sessions_attribute.extract_read(sessions));
+    REQUIRE(sessions.size() == 1);
+    CHECK(sessions.front().find("|Active|") != std::string::npos);
+
+    std::string transport;
+    Tango::DeviceAttribute transport_attribute = proxy.read_attribute("BulkTransport");
+    REQUIRE(transport_attribute >> transport);
+    CHECK(transport == "ActiveMessage");
+
+    Tango::DevULong64 published = 0;
+    Tango::DeviceAttribute published_attribute = proxy.read_attribute("BulkFramesPublished");
+    REQUIRE(published_attribute >> published);
+    CHECK(published >= 4);
 
     {
         std::lock_guard<std::mutex> lock(sink.mutex);

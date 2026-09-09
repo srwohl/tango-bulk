@@ -884,6 +884,7 @@ class Hdf5ReplayDetectorClass : public Tango::DeviceClass
                                             ReplayAttribute::ReadyFrames, Tango::READ));
         attributes.push_back(new ReplayAttr("frameRate", Tango::DEV_DOUBLE,
                                             ReplayAttribute::FrameRate, Tango::READ_WRITE));
+        install_bulk_attributes(attributes);
     }
 
     void device_factory(const Tango::DevVarStringArray *devices) override

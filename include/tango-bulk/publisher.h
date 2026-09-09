@@ -86,12 +86,30 @@ const char *to_string(PublishResult result) noexcept;
 /// upper bound until OpenReply supplies the actual grant.
 struct PublisherSnapshot
 {
+    struct SessionObservation
+    {
+        std::string session_id;
+        std::string state;
+        std::uint64_t lag_frames{0};
+    };
+
     std::string stream_name;
     Geometry geometry{};
     PublisherCounters counters{};
+    /// Live sessions; Tango renders each as session_id|state|lag_frames.
+    std::vector<SessionObservation> sessions;
     std::size_t active_sessions{0};
+    std::string transport; ///< selected data transport, not a discovery result
+    std::uint64_t worst_lag_frames{0}; ///< maximum live-session lag in frames
     std::uint64_t sampled_at_steady_ns{0};
     bool accepting{false};
+
+    /// Sum the publisher-side drop reasons from this one sampled counter set.
+    std::uint64_t frames_dropped() const noexcept
+    {
+        return counters.dropped_no_session + counters.dropped_queue_full +
+               counters.dropped_credit_stalled + counters.dropped_bad_metadata;
+    }
 
     StreamOffer stream_offer() const;
 };

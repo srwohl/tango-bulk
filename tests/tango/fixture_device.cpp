@@ -53,17 +53,6 @@ unsigned char pattern_byte(unsigned seed, std::uint64_t i)
 
 class BulkTestDevice;
 
-class BulkStreamsAttr final : public Tango::SpectrumAttr
-{
-  public:
-    BulkStreamsAttr() :
-        Tango::SpectrumAttr("BulkStreams", Tango::DEV_STRING, 8, Tango::OPERATOR)
-    {
-    }
-
-    void read(Tango::DeviceImpl *device, Tango::Attribute &attribute) override;
-};
-
 class BulkTestDevice : public TANGO_BASE_CLASS
 {
   public:
@@ -103,14 +92,6 @@ class BulkTestDevice : public TANGO_BASE_CLASS
 
         set_state(Tango::ON);
         set_status("bulk.tango is open for business");
-    }
-
-    void read_bulk_streams(Tango::Attribute &attribute)
-    {
-        const std::string row = publisher_->snapshot().stream_offer().to_bulk_stream_row();
-        auto *rows = new Tango::DevString[1];
-        rows[0] = Tango::string_dup(row.c_str());
-        attribute.set_value(rows, 1, 0, true);
     }
 
     void delete_device() override
@@ -190,11 +171,6 @@ class BulkTestDevice : public TANGO_BASE_CLASS
     bool attached_{false};
 };
 
-void BulkStreamsAttr::read(Tango::DeviceImpl *device, Tango::Attribute &attribute)
-{
-    static_cast<BulkTestDevice *>(device)->read_bulk_streams(attribute);
-}
-
 class PublishCommand : public Tango::Command
 {
   public:
@@ -268,7 +244,7 @@ class BulkTestClass : public Tango::DeviceClass
 
     void attribute_factory(std::vector<Tango::Attr *> &attributes) override
     {
-        attributes.push_back(new BulkStreamsAttr());
+        install_bulk_attributes(attributes);
     }
 
     void device_factory(const Tango::DevVarStringArray *devices) override

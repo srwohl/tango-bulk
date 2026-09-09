@@ -96,6 +96,10 @@ TEST_CASE("publisher snapshot is an owner value and yields a discovery offer",
     CHECK(snapshot.geometry.max_frame_bytes == k_frame_bytes);
     CHECK(snapshot.geometry.ring_depth == k_ring_depth);
     CHECK(snapshot.counters.sessions_opened == 0);
+    CHECK(snapshot.sessions.empty());
+    CHECK(snapshot.transport == "ActiveMessage");
+    CHECK(snapshot.worst_lag_frames == 0);
+    CHECK(snapshot.frames_dropped() == 0);
 
     const StreamOffer offer = snapshot.stream_offer();
     CHECK(offer.status == Status::Ok);

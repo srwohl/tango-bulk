@@ -362,23 +362,6 @@ class ConfigurationAttr : public Tango::Attr
     ConfigurationAttribute which_;
 };
 
-class BulkStreamsAttr final : public Tango::SpectrumAttr
-{
-  public:
-    BulkStreamsAttr() : Tango::SpectrumAttr("BulkStreams", Tango::DEV_STRING, 8, Tango::OPERATOR)
-    {
-    }
-
-    void read(Tango::DeviceImpl *device, Tango::Attribute &attribute) override
-    {
-        const std::string row =
-            static_cast<ExampleDetector *>(device)->snapshot().stream_offer().to_bulk_stream_row();
-        auto *rows = new Tango::DevString[1];
-        rows[0] = Tango::string_dup(row.c_str());
-        attribute.set_value(rows, 1, 0, true);
-    }
-};
-
 class ExampleDetectorClass : public Tango::DeviceClass
 {
   public:
@@ -409,7 +392,7 @@ class ExampleDetectorClass : public Tango::DeviceClass
             "frameRate", Tango::DEV_DOUBLE, ConfigurationAttribute::FrameRate));
         attributes.push_back(new ConfigurationAttr(
             "fillPayload", Tango::DEV_BOOLEAN, ConfigurationAttribute::FillPayload));
-        attributes.push_back(new BulkStreamsAttr());
+        install_bulk_attributes(attributes);
     }
 
     void device_factory(const Tango::DevVarStringArray *devices) override

@@ -57,6 +57,141 @@ Registry &registry()
     return instance;
 }
 
+PublisherSnapshot snapshot_for(Tango::DeviceImpl *device) noexcept
+{
+    try
+    {
+        Registry &reg = registry();
+        const std::shared_lock<std::shared_mutex> lock(reg.mutex);
+        const auto found = device == nullptr ? reg.publishers.end() : reg.publishers.find(device);
+        return found == reg.publishers.end() || found->second == nullptr
+                   ? PublisherSnapshot{}
+                   : found->second->snapshot();
+    }
+    catch(...)
+    {
+        // Attribute reads must not take a device server down if a diagnostic
+        // copy cannot be made. The empty snapshot is an unavailable reading.
+        return PublisherSnapshot{};
+    }
+}
+
+void set_string_spectrum(Tango::Attribute &attribute,
+                         const std::vector<std::string> &values)
+{
+    auto *rows = new Tango::DevString[values.size()];
+    for(std::size_t i = 0; i < values.size(); ++i)
+    {
+        rows[i] = Tango::string_dup(values[i].c_str());
+    }
+    attribute.set_value(rows, static_cast<long>(values.size()), 0, true);
+}
+
+std::vector<std::string> session_rows(const PublisherSnapshot &snapshot)
+{
+    std::vector<std::string> rows;
+    rows.reserve(snapshot.sessions.size());
+    for(const PublisherSnapshot::SessionObservation &session : snapshot.sessions)
+    {
+        // RFC fixed row order: session_id|state|lag_frames.
+        rows.push_back(session.session_id + "|" + session.state + "|" +
+                       std::to_string(session.lag_frames));
+    }
+    return rows;
+}
+
+class BulkStreamsAttribute final : public Tango::SpectrumAttr
+{
+  public:
+    BulkStreamsAttribute() :
+        Tango::SpectrumAttr("BulkStreams", Tango::DEV_STRING, 8, Tango::OPERATOR)
+    {
+    }
+
+    void read(Tango::DeviceImpl *device, Tango::Attribute &attribute) override
+    {
+        const PublisherSnapshot snapshot = snapshot_for(device);
+        const StreamOffer offer = snapshot.stream_offer();
+        const std::vector<std::string> rows =
+            offer.status == Status::Ok ? std::vector<std::string>{offer.to_bulk_stream_row()}
+                                       : std::vector<std::string>{};
+        set_string_spectrum(attribute, rows);
+    }
+};
+
+class BulkSessionsAttribute final : public Tango::SpectrumAttr
+{
+  public:
+    BulkSessionsAttribute() :
+        Tango::SpectrumAttr("BulkSessions", Tango::DEV_STRING, k_max_sessions, Tango::OPERATOR)
+    {
+    }
+
+    void read(Tango::DeviceImpl *device, Tango::Attribute &attribute) override
+    {
+        set_string_spectrum(attribute, session_rows(snapshot_for(device)));
+    }
+};
+
+enum class ScalarObservation
+{
+    FramesPublished,
+    FramesDropped,
+    WorstLagFrames,
+};
+
+class ScalarObservationAttribute final : public Tango::Attr
+{
+  public:
+    ScalarObservationAttribute(const char *attribute_name, ScalarObservation observation) :
+        Tango::Attr(attribute_name, Tango::DEV_ULONG64, Tango::OPERATOR, Tango::READ),
+        observation_(observation)
+    {
+    }
+
+    void read(Tango::DeviceImpl *device, Tango::Attribute &attribute) override
+    {
+        const PublisherSnapshot snapshot = snapshot_for(device);
+        Tango::DevULong64 value = 0;
+        switch(observation_)
+        {
+        case ScalarObservation::FramesPublished:
+            value = snapshot.counters.frames_published;
+            break;
+        case ScalarObservation::FramesDropped:
+            value = snapshot.frames_dropped();
+            break;
+        case ScalarObservation::WorstLagFrames:
+            value = snapshot.worst_lag_frames;
+            break;
+        }
+        attribute.set_value(&value);
+    }
+
+  private:
+    ScalarObservation observation_;
+};
+
+class BulkTransportAttribute final : public Tango::Attr
+{
+  public:
+    BulkTransportAttribute() :
+        Tango::Attr("BulkTransport", Tango::DEV_STRING, Tango::OPERATOR, Tango::READ)
+    {
+    }
+
+    void read(Tango::DeviceImpl *device, Tango::Attribute &attribute) override
+    {
+        const PublisherSnapshot snapshot = snapshot_for(device);
+        // Tango retains scalar string storage until the read is serialized;
+        // thread-local backing keeps separate device reads independent.
+        thread_local std::string value;
+        value = snapshot.transport;
+        Tango::DevString raw_value = const_cast<char *>(value.c_str());
+        attribute.set_value(&raw_value);
+    }
+};
+
 std::string lowercase(const std::string &text)
 {
     std::string out = text;
@@ -160,6 +295,19 @@ void install_bulk_commands(Tango::DeviceClass &device_class, const CommandNames 
     {
         device_class.get_command_list().push_back(command);
     }
+}
+
+void install_bulk_attributes(std::vector<Tango::Attr *> &attributes)
+{
+    attributes.push_back(new BulkStreamsAttribute());
+    attributes.push_back(new BulkSessionsAttribute());
+    attributes.push_back(new ScalarObservationAttribute(
+        "BulkFramesPublished", ScalarObservation::FramesPublished));
+    attributes.push_back(new ScalarObservationAttribute(
+        "BulkFramesDropped", ScalarObservation::FramesDropped));
+    attributes.push_back(new BulkTransportAttribute());
+    attributes.push_back(new ScalarObservationAttribute(
+        "BulkWorstLagFrames", ScalarObservation::WorstLagFrames));
 }
 
 void attach_publisher(Tango::DeviceImpl &device, BulkPublisher &publisher)
