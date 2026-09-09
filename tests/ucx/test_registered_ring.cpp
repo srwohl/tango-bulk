@@ -5,6 +5,8 @@
 #include <ucx/registered_ring.h>
 #include <ucx/ucx_context.h>
 
+#include <core/pinned_ledger.h>
+
 #include <tango-bulk/frame.h>
 #include <tango-bulk/errors.h>
 
@@ -51,6 +53,8 @@ TEST_CASE("caller-owned registered memory participates in the pinned budget",
     constexpr std::uint64_t second_bytes = 4096;
 
     UcxContext context("");
+    const std::uint64_t baseline = PinnedLedger::current();
+    const std::uint64_t process_limit = baseline + budget;
 
     auto first_owner = std::shared_ptr<void>(
         ::operator new(static_cast<std::size_t>(first_bytes)),
@@ -61,20 +65,28 @@ TEST_CASE("caller-owned registered memory participates in the pinned budget",
 
     {
         RegisteredMemory first = RegisteredMemory::adopted(
-            context, std::move(first_owner), first_bytes, MemoryKind::Host, budget);
+            context, std::move(first_owner), first_bytes, MemoryKind::Host, process_limit);
+        CHECK(PinnedLedger::current() == baseline + first_bytes);
 
         RegisteredMemory moved = std::move(first);
         CHECK_THROWS_AS(RegisteredMemory::adopted(context,
                                                   std::move(second_owner),
                                                   second_bytes,
                                                   MemoryKind::Host,
-                                                  budget),
+                                                  process_limit),
                         BulkException);
+        CHECK(PinnedLedger::current() == baseline + first_bytes);
     }
+
+    CHECK(PinnedLedger::current() == baseline);
 
     auto released_owner = std::shared_ptr<void>(
         ::operator new(static_cast<std::size_t>(second_bytes)),
         [](void *pointer) { ::operator delete(pointer); });
-    CHECK_NOTHROW(RegisteredMemory::adopted(
-        context, std::move(released_owner), second_bytes, MemoryKind::Host, budget));
+    {
+        RegisteredMemory released = RegisteredMemory::adopted(
+            context, std::move(released_owner), second_bytes, MemoryKind::Host, process_limit);
+        CHECK(PinnedLedger::current() == baseline + second_bytes);
+    }
+    CHECK(PinnedLedger::current() == baseline);
 }

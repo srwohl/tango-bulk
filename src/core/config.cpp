@@ -7,6 +7,8 @@
 
 #include <tango-bulk/limits.h>
 
+#include <core/pinned_ledger.h>
+
 #include <cstdint>
 #include <algorithm>
 #include <limits>
@@ -37,19 +39,6 @@ namespace TangoBulk
 {
 namespace
 {
-
-bool multiply_without_overflow(std::uint64_t left,
-                               std::uint64_t right,
-                               std::uint64_t &result) noexcept
-{
-    if(right != 0 && left > std::numeric_limits<std::uint64_t>::max() / right)
-    {
-        return false;
-    }
-
-    result = left * right;
-    return true;
-}
 
 /// 1..64 bytes of [A-Za-z0-9_.-].
 ///
@@ -328,6 +317,12 @@ ReceivePlan SubscriberConfig::upper_receive_plan() const noexcept
 
 Status ReceivePlan::validate() const noexcept
 {
+    std::uint64_t required_bytes = 0;
+    if(!detail::PinnedLedger::checked_bytes(max_frame_bytes, ring_depth, required_bytes))
+    {
+        return Status::ResourceExhausted;
+    }
+
     if(max_frame_bytes < k_min_frame_bytes || max_frame_bytes > k_max_frame_bytes_hard_cap)
     {
         return Status::FrameTooLarge;
@@ -343,9 +338,7 @@ Status ReceivePlan::validate() const noexcept
         return Status::DepthTooLarge;
     }
 
-    std::uint64_t required_bytes = 0;
-    if(!multiply_without_overflow(max_frame_bytes, ring_depth, required_bytes) ||
-       pinned_bytes != required_bytes)
+    if(pinned_bytes != required_bytes)
     {
         return Status::ResourceExhausted;
     }
@@ -362,7 +355,7 @@ ReceivePlan ReceivePlan::from_limits(std::uint64_t max_frame_bytes,
     out.ring_depth = ring_depth;
     out.credit_window = credit_window;
 
-    if(!multiply_without_overflow(max_frame_bytes, ring_depth, out.pinned_bytes))
+    if(!detail::PinnedLedger::checked_bytes(max_frame_bytes, ring_depth, out.pinned_bytes))
     {
         // Keep the value observably invalid.  Returning a wrapped byte count
         // would allow a caller to mistake an overflowing upper plan for a
@@ -434,8 +427,7 @@ ReceivePlan ReceivePlan::derive(const Geometry &geometry,
         return {};
     }
     out.credit_window = std::min(out.credit_window, out.ring_depth);
-    (void)multiply_without_overflow(out.max_frame_bytes, out.ring_depth, out.pinned_bytes);
-    return out;
+    return from_limits(out.max_frame_bytes, out.ring_depth, out.credit_window);
 }
 
 ReceivePlan ReceivePlan::derive(const StreamOffer &offer,
