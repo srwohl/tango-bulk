@@ -166,16 +166,7 @@ TEST_CASE("BulkStreams reports the fixed conservative offer row", "[tango][disco
 {
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
-    Tango::DeviceAttribute attribute = proxy.read_attribute("BulkStreams");
-    CHECK(attribute.get_type() == Tango::DEV_STRING);
-    CHECK(attribute.get_data_format() == Tango::SPECTRUM);
-    CHECK_FALSE(attribute.has_failed());
-    CHECK_FALSE(attribute.is_empty());
-    std::vector<std::string> rows;
-    REQUIRE(attribute.extract_read(rows));
-    REQUIRE(rows.size() == 1);
-
-    const StreamOffer offer = StreamOffer::from_bulk_stream_row(rows.front());
+    const StreamOffer offer = discover(proxy, "bulk.tango");
     CHECK(offer.stream_name == "bulk.tango");
     CHECK(offer.outcome() == StreamOffer::Outcome::Available);
     CHECK(offer.geometry.max_frame_bytes == k_frame_bytes);
