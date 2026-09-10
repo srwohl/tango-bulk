@@ -70,8 +70,15 @@ void install_bulk_attributes(std::vector<Tango::Attr *> &attributes);
 void attach_publisher(Tango::DeviceImpl &device, BulkPublisher &publisher);
 void detach_publisher(Tango::DeviceImpl &device) noexcept;
 
+/// Read the safe pre-Open geometry advertised by BulkStreams.
 ///
-///
+/// The returned offer is suitable for preparing caller-owned receive storage.
+/// OpenReply remains authoritative for the established Geometry and ReceivePlan.
+/// Missing, stale, malformed, or unavailable discovery throws BulkException.
+StreamOffer discover(Tango::DeviceProxy &proxy,
+                     const std::string &stream_name,
+                     std::uint32_t timeout_ms = 5'000);
+
 std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
                                         SubscriberConfig config,
                                         SubscriptionCallbacks callbacks,

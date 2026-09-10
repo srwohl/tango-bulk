@@ -1356,19 +1356,30 @@ int main(int argc, char *argv[])
         Tango::DeviceProxy proxy(options.device);
         TangoBulk::SubscriberConfig config;
         config.stream_name = options.stream;
-        // Discovery supplies the safe upper bound inside subscribe(). The
-        // caller-owned ring is sized from this conservative library limit;
-        // OpenReply and Subscription::plan() remain authoritative.
-        config.max_frame_bytes = 8ull << 20;
+        const TangoBulk::StreamOffer offer =
+            TangoBulk::discover(proxy, options.stream, config.command_timeout_ms);
+
+        if(options.ring_depth > offer.geometry.ring_depth)
+            throw std::runtime_error("requested receive ring exceeds the discovery offer");
+        const auto ring_depth = static_cast<std::uint32_t>(options.ring_depth);
+        const std::uint32_t credit_window =
+            std::min(offer.geometry.credit_window, ring_depth);
+        if(options.frames_per_block > credit_window)
+            throw std::runtime_error("--frames-per-block exceeds the available credit window");
+
+        const TangoBulk::ReceivePlan receive_plan = TangoBulk::ReceivePlan::from_limits(
+            offer.geometry.max_frame_bytes, ring_depth, credit_window);
+        config.receive_plan = receive_plan;
+        config.discovery_offer = offer;
         config.delivery_mode = TangoBulk::DeliveryMode::Pull;
         config.drop_policy = TangoBulk::DropPolicy::DropNewest;
         config.reconnect_policy = TangoBulk::ReconnectPolicy::BoundedRetry;
-        config.ring_depth = static_cast<std::uint32_t>(options.ring_depth);
-        config.credit_window = std::min<std::uint32_t>(16, config.ring_depth);
-        config.delivery_queue_depth = config.ring_depth;
-        if(config.max_frame_bytes > std::numeric_limits<std::uint64_t>::max() / config.ring_depth)
-            throw std::runtime_error("receive-ring byte size overflows");
-        const std::uint64_t receive_bytes = config.max_frame_bytes * config.ring_depth;
+        config.delivery_queue_depth = ring_depth;
+        if(const TangoBulk::Status status = config.validate(); status != TangoBulk::Status::Ok)
+            throw TangoBulk::BulkException(
+                {status, "discovery geometry cannot satisfy the receive plan", "tango"});
+
+        const std::uint64_t receive_bytes = receive_plan.pinned_bytes;
         SharedReceiveRing receive_ring(receive_bytes);
         config.receive_buffer = receive_ring.memory();
         config.receive_buffer_bytes = receive_bytes;
@@ -1393,7 +1404,7 @@ int main(int argc, char *argv[])
             std::cout << (i == 0 ? "[" : ",") << publisher.shape[i];
         std::cout << "] frame_bytes=" << geometry.frame_bytes << " block_bytes=" << block_bytes
                   << " zero_copy_ring_bytes=" << receive_bytes
-                  << " retained_frame_limit=" << config.credit_window << std::endl;
+                  << " retained_frame_limit=" << plan.credit_window << std::endl;
 
         ParallelShardWriter writer(options, geometry, receive_ring.fd(), receive_ring.data(),
                                    receive_ring.bytes());

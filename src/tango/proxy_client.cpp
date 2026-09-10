@@ -347,6 +347,27 @@ std::vector<std::byte> CommandChannel::command(Protocol::CoordType kind,
 
 // ---------------------------------------------------------------------------
 
+StreamOffer discover(Tango::DeviceProxy &proxy,
+                     const std::string &stream_name,
+                     std::uint32_t timeout_ms)
+{
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    TangoStreamDiscovery discovery(proxy, timeout_ms);
+    const StreamOffer offer = discovery.discover(stream_name, deadline);
+    if(!offer.available())
+    {
+        const Status status = discovery_failure_status(offer);
+        throw BulkException(BulkError{status,
+                                      offer.message.empty() ? "BulkStreams discovery failed"
+                                                            : offer.message,
+                                      "tango"});
+    }
+    return offer;
+}
+
+// ---------------------------------------------------------------------------
+
 
 std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
                                         SubscriberConfig config,
