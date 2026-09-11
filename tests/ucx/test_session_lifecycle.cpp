@@ -231,7 +231,7 @@ TEST_CASE("An unrenewed session expires on schedule with no frames in flight", "
 
     std::vector<Protocol::OpenReply> grants;
     detail::TransportFactory transport = detail::make_subscriber_transport_factory(config);
-    std::unique_ptr<Subscription> subscription = detail::open_subscription(
+    std::unique_ptr<Subscription> subscription = detail::SubscriptionFactory::open(
         config,
         publisher.snapshot().stream_offer(),
         [&publisher, &grants](Protocol::CoordType type,

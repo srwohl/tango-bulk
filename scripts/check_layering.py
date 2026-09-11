@@ -35,6 +35,13 @@ SOURCE_SUFFIXES = {".h", ".hpp", ".hh", ".c", ".cc", ".cpp", ".cxx"}
 # Matches a real preprocessor include only: the '#' must be the first
 # non-whitespace character, so a commented-out include is not a violation.
 INCLUDE_RE = re.compile(r"^\s*#\s*include\s*[<\"]([^>\"]+)[>\"]")
+PUBLIC_SUBSCRIPTION_INTERNALS = (
+    "CoordinationChannel",
+    "DeliveryIngress",
+    "SubscriberTransport",
+    "TransportFactory",
+    "open_subscription",
+)
 
 UCX_PREFIXES = ("ucp/", "uct/", "ucs/", "ucm/")
 TANGO_PREFIXES = ("tango/",)
@@ -73,6 +80,14 @@ RULES: tuple[Rule, ...] = (
         name="tango-bulk-tango",
         paths=("src/tango",),
         forbidden=NO_UCX,
+    ),
+    # The Python binding is an adapter over the deep Subscription module. It
+    # may use the private construction seam, but transport and Tango C++
+    # implementation headers must not become part of the binding itself.
+    Rule(
+        name="Python binding",
+        paths=("src/python", "bindings"),
+        forbidden=NO_UCX + NO_TANGO,
     ),
     # Public headers are compiled into every consumer, so they carry the
     # strictest rule.  tango.h is the declared exception: it is the Tango
@@ -147,6 +162,32 @@ class Report:
     violations: list[Violation] = field(default_factory=list)
 
 
+def check_public_subscription_interface(root: Path, report: Report) -> None:
+    path = root / "include/tango-bulk/subscription.h"
+    if not path.is_file():
+        return
+
+    report.checked += 1
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
+    ):
+        for symbol in PUBLIC_SUBSCRIPTION_INTERNALS:
+            if re.search(rf"\b{re.escape(symbol)}\b", line):
+                report.violations.append(
+                    Violation(
+                        path=path.relative_to(root),
+                        line_number=line_number,
+                        include=symbol,
+                        rule=Rule(
+                            name="public Subscription interface",
+                            paths=("include/tango-bulk/subscription.h",),
+                            forbidden=(),
+                        ),
+                        why="internal construction vocabulary belongs in src/core",
+                    )
+                )
+
+
 def iter_sources(root: Path, rule: Rule):
     excluded = {(root / e).resolve() for e in rule.exclude}
 
@@ -213,6 +254,12 @@ def main() -> int:
             found = len(report.violations) - before
             print(f"{rule.name}: {found} violation(s)")
 
+    before = len(report.violations)
+    check_public_subscription_interface(root, report)
+    if args.verbose:
+        found = len(report.violations) - before
+        print(f"public Subscription interface: {found} violation(s)")
+
     if report.violations:
         print(
             f"Layering violations ({len(report.violations)}) "
@@ -220,9 +267,13 @@ def main() -> int:
             file=sys.stderr,
         )
         for v in report.violations:
+            if v.rule.name == "public Subscription interface":
+                description = f"internal symbol {v.include}"
+            else:
+                description = f"#include <{v.include}>"
             print(
-                f"  {v.path}:{v.line_number}: #include <{v.include}> "
-                f"in {v.rule.name}\n      {v.why}",
+                f"  {v.path}:{v.line_number}: {description} in {v.rule.name}"
+                f"\n      {v.why}",
                 file=sys.stderr,
             )
         return 1

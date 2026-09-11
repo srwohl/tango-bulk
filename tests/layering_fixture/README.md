@@ -13,4 +13,5 @@ IMPLEMENTATION_SPEC.md 1.1.
 Nothing here is compiled, and the real layering run does not scan this
 directory: `check_layering.py`'s rules name `src/` and `tests/unit`,
 `tests/ucx` explicitly, so the fixture is reachable only by pointing `--root`
-at it.
+at it. It also contains negative controls for the Python binding's include
+discipline and the installed Subscription interface's private-seam guard.

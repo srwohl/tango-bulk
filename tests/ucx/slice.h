@@ -6,7 +6,7 @@
 #define TANGO_BULK_TESTS_UCX_SLICE_H
 
 #include <core/publisher_internal.h>
-#include <core/subscriber_transport.h>
+#include <core/subscription_internal.h>
 
 #include <tango-bulk/publisher.h>
 #include <tango-bulk/subscription.h>
@@ -83,7 +83,7 @@ inline std::unique_ptr<Subscription> open_subscription(
 {
     config.delivery_mode = DeliveryMode::Pull;
     detail::TransportFactory transport = detail::make_subscriber_transport_factory(config);
-    return detail::open_subscription(
+    return detail::SubscriptionFactory::open(
         std::move(config),
         publisher.snapshot().stream_offer(),
         [&publisher, observer = std::move(observer), transform = std::move(transform)](

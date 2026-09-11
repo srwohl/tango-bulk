@@ -7,7 +7,7 @@
 
 #include <core/delivery_queue.h>
 #include <core/frame_fields.h>
-#include <core/subscriber_transport.h>
+#include <core/subscription_internal.h>
 
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/subscription.h>
@@ -414,12 +414,12 @@ inline std::unique_ptr<Subscription> open_test_subscription(
         std::chrono::steady_clock::time_point::max())
 {
     StreamOffer offer = subscription_offer(config.stream_name);
-    return detail::open_subscription(std::move(config),
-                                     std::move(offer),
-                                     std::move(channel),
-                                     std::move(factory),
-                                     std::move(callbacks),
-                                     establishment_deadline);
+    return detail::SubscriptionFactory::open(std::move(config),
+                                             std::move(offer),
+                                             std::move(channel),
+                                             std::move(factory),
+                                             std::move(callbacks),
+                                             establishment_deadline);
 }
 
 inline SubscriptionCallbacks noop_callbacks()

@@ -4,9 +4,7 @@
 
 #include <core/delivery_queue.h>
 #include <core/geometry_conversion.h>
-#include <core/subscriber_transport.h>
-
-#include <tango-bulk/subscription.h>
+#include <core/subscription_internal.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1261,7 +1259,7 @@ std::optional<FrameView> Subscription::read_for(std::chrono::milliseconds timeou
     throw_delivery_terminal(result);
 }
 
-std::unique_ptr<Subscription> detail::open_subscription(
+std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
     SubscriberConfig config,
     StreamOffer offer,
     detail::CoordinationChannel channel,

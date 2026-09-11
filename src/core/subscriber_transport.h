@@ -11,6 +11,7 @@
 #include <tango-bulk/subscription.h>
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -41,6 +42,9 @@ class SubscriberTransport
   protected:
     SubscriberTransport() = default;
 };
+
+using TransportFactory = std::function<std::unique_ptr<SubscriberTransport>(
+    const ReceivePlan &, std::shared_ptr<DeliveryIngress>)>;
 
 TransportFactory make_subscriber_transport_factory(SubscriberConfig config);
 

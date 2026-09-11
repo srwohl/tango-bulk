@@ -5,7 +5,7 @@
 #include "oob.h"
 
 #include <core/publisher_internal.h>
-#include <core/subscriber_transport.h>
+#include <core/subscription_internal.h>
 
 #include <tango-bulk/publisher.h>
 #include <tango-bulk/subscription.h>
@@ -492,7 +492,7 @@ int run_subscriber(const Options &options)
     offer.geometry.strides[0] = 1;
 
     detail::TransportFactory transport = detail::make_subscriber_transport_factory(config);
-    auto subscription = detail::open_subscription(
+    auto subscription = detail::SubscriptionFactory::open(
         config,
         std::move(offer),
         [&oob](Protocol::CoordType,

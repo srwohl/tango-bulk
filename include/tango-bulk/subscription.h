@@ -11,41 +11,14 @@
 
 #include <chrono>
 #include <cstddef>
-#include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
-#include <vector>
 
 namespace TangoBulk
 {
-class Subscription;
-struct SubscriptionCallbacks;
-
-namespace Protocol
-{
-enum class CoordType : std::uint16_t;
-}
-
 namespace detail
 {
-class DeliveryIngress;
-class SubscriberTransport;
-
-using CoordinationChannel =
-    std::function<std::vector<std::byte>(Protocol::CoordType,
-                                         const std::vector<std::byte> &,
-                                         std::chrono::steady_clock::time_point)>;
-using TransportFactory = std::function<std::unique_ptr<SubscriberTransport>(
-    const ReceivePlan &, std::shared_ptr<DeliveryIngress>)>;
-
-std::unique_ptr<Subscription> open_subscription(
-    SubscriberConfig config,
-    StreamOffer offer,
-    CoordinationChannel channel,
-    TransportFactory transport_factory,
-    SubscriptionCallbacks callbacks,
-    std::chrono::steady_clock::time_point establishment_deadline);
+class SubscriptionFactory;
 } // namespace detail
 
 struct SubscriptionCallbacks
@@ -96,13 +69,7 @@ class Subscription
     SubscriberCounters counters() const noexcept;
 
   private:
-    friend std::unique_ptr<Subscription> detail::open_subscription(
-        SubscriberConfig,
-        StreamOffer,
-        detail::CoordinationChannel,
-        detail::TransportFactory,
-        SubscriptionCallbacks,
-        std::chrono::steady_clock::time_point);
+    friend class detail::SubscriptionFactory;
 
     struct Impl;
     explicit Subscription(std::shared_ptr<Impl> impl) noexcept;
