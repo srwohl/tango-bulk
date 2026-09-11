@@ -8,7 +8,7 @@
 #include <tango-bulk/counters.h>
 #include <tango-bulk/errors.h>
 #include <tango-bulk/protocol.h>
-#include <tango-bulk/subscriber.h>
+#include <tango-bulk/subscription.h>
 
 #include <cstddef>
 #include <memory>
@@ -42,8 +42,7 @@ class SubscriberTransport
     SubscriberTransport() = default;
 };
 
-std::unique_ptr<SubscriberTransport> make_subscriber_transport(
-    SubscriberConfig config, std::shared_ptr<DeliveryIngress> delivery);
+TransportFactory make_subscriber_transport_factory(SubscriberConfig config);
 
 } // namespace TangoBulk::detail
 

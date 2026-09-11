@@ -151,20 +151,15 @@ struct SubscriberEngine::Pending
     void *request{nullptr};
 };
 
-SubscriberEngine::SubscriberEngine(SubscriberConfig config,
+SubscriberEngine::SubscriberEngine(ReceivePlan plan,
+                                   const SubscriberConfig &config,
                                    std::shared_ptr<DeliveryIngress> delivery) :
-    config_(std::move(config)),
-    tracker_(config_.ring_depth),
+    memory_kind_(config.receive_memory_kind),
+    engine_cpu_affinity_(config.engine_cpu_affinity),
+    tracker_(plan.ring_depth),
     delivery_(std::move(delivery)),
-    pending_(config_.ring_depth)
+    pending_(plan.ring_depth)
 {
-    const Status status = config_.validate();
-    if(status != Status::Ok)
-    {
-        throw BulkException(BulkError{
-            status, std::string("invalid SubscriberConfig: ") + to_string(status), "subscriber"});
-    }
-
     if(!delivery_)
     {
         throw BulkException(BulkError{
@@ -172,19 +167,19 @@ SubscriberEngine::SubscriberEngine(SubscriberConfig config,
     }
 
 
-    context_ = std::make_shared<UcxContext>(config_.ucx_tls);
+    context_ = std::make_shared<UcxContext>(config.ucx_tls);
     worker_ = std::make_unique<UcxWorker>(*context_);
 
     // 4.1, `Opening` entry action, in this order: the ring is allocated,
     // registered and armed *before* Open goes out, because the publisher may
     // send the first frame the moment it replies.
     arena_ = std::make_shared<ReceiveArena>(context_,
-                                            config_.max_frame_bytes,
-                                            config_.ring_depth,
-                                            config_.pinned_memory_limit_bytes,
-                                            config_.receive_buffer,
-                                            config_.receive_buffer_bytes,
-                                            config_.receive_memory_kind);
+                                            plan.max_frame_bytes,
+                                            plan.ring_depth,
+                                            config.pinned_memory_limit_bytes,
+                                            config.receive_buffer,
+                                            config.receive_buffer_bytes,
+                                            config.receive_memory_kind);
     sink_ = arena_;
 
     for(std::size_t i = 0; i < pending_.size(); ++i)
@@ -312,12 +307,12 @@ void SubscriberEngine::engine_loop()
     // 2.4's engine_cpu_affinity.  Same contract as the publisher's: -1 leaves the
     // thread alone so a launcher-level placement is never fought, and a refusal is
     // reported rather than fatal.
-    if(bind_thread_to_cpu(config_.engine_cpu_affinity) != Status::Ok)
+    if(bind_thread_to_cpu(engine_cpu_affinity_) != Status::Ok)
     {
         std::fprintf(stderr,
                      "tango-bulk: warning: subscriber could not pin its engine thread to "
                      "CPU %d (%zu CPUs allowed); running unpinned.\n",
-                     config_.engine_cpu_affinity,
+                     engine_cpu_affinity_,
                      allowed_cpu_count());
     }
 
@@ -775,7 +770,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
     slot.fields.generation = frame.generation;
     // FrameView describes the memory the application receives, not the
     // publisher's source allocation. They differ for GPUDirect receives.
-    slot.fields.memory_kind = config_.receive_memory_kind;
+    slot.fields.memory_kind = memory_kind_;
     slot.fields.endian = frame.endian;
 
     if((param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) != 0)
@@ -794,7 +789,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         // describes the handle as letting a protocol "skip the registration
         // step", and the memory type is what stops UCX probing the pointer for
         // one -- a driver query per frame on the CUDA path.
-        recv_param.memory_type = to_ucs_memory_type(config_.receive_memory_kind);
+        recv_param.memory_type = to_ucs_memory_type(memory_kind_);
         recv_param.memh = arena_->ring().memory().handle();
 
         void *request = ucp_am_recv_data_nbx(worker_->get(),
@@ -830,7 +825,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
     // pointer.  The publisher forces rendezvous for a non-host session (4.4), so
     // arriving here means the two sides disagree and the data path can no longer
     // be trusted -- fail the session, as a failed rendezvous start does.
-    if(config_.receive_memory_kind != MemoryKind::Host)
+    if(memory_kind_ != MemoryKind::Host)
     {
         slot.occupied = false;
         tracker_.release(frame.sequence);
@@ -876,7 +871,7 @@ void SubscriberEngine::on_rndv_complete(void *request,
         self->arena_->slot(pending->slot_index).occupied = false;
         self->transport_errors_.fetch_add(1, std::memory_order_relaxed);
         // A failed rendezvous operation means the endpoint/QP is no longer a
-        // usable data path.  Tell the Tango control loop so BoundedRetry can
+        // usable data path. Tell the Tango control loop so recovery can
         // retire this session and reconnect instead of reporting Active while
         // no further frame or credit can move.
         self->fail(Status::TransportFailure,
@@ -963,12 +958,15 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
     return out;
 }
 
-std::unique_ptr<SubscriberTransport> make_subscriber_transport(
-    SubscriberConfig config, std::shared_ptr<DeliveryIngress> delivery)
+TransportFactory make_subscriber_transport_factory(SubscriberConfig config)
 {
-    // point of the seam: `Subscription` constructs a transport without naming
-    // the concrete type, and therefore without compiling against `ucp/*`.
-    return std::make_unique<SubscriberEngine>(std::move(config), std::move(delivery));
+    return [config = std::move(config)](
+               const ReceivePlan &plan,
+               std::shared_ptr<DeliveryIngress> delivery)
+               -> std::unique_ptr<SubscriberTransport>
+    {
+        return std::make_unique<SubscriberEngine>(plan, config, std::move(delivery));
+    };
 }
 
 } // namespace TangoBulk::detail

@@ -67,8 +67,7 @@ TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring
     pub.credit_window = 4;
 
     SubscriberConfig sub = subscriber_config();
-    sub.ring_depth = 2;
-    sub.credit_window = 2;
+    sub.receive_plan = ReceivePlan{k_frame_bytes, 2, 2};
 
     Slice slice(pub, sub);
     REQUIRE(slice.subscription->plan().ring_depth == 2);
@@ -257,8 +256,7 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
     pub.publish_queue_depth = 8;
 
     SubscriberConfig sub = subscriber_config();
-    sub.ring_depth = 64;
-    sub.credit_window = 64;
+    sub.receive_plan = ReceivePlan{k_frame_bytes, 64, 64};
 
     Slice slice(pub, sub);
 
@@ -488,7 +486,7 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
 
     BulkPublisher publisher(config);
     SubscriberConfig subscriber = subscriber_config();
-    subscriber.reconnect_policy = ReconnectPolicy::FailFast;
+    subscriber.recovery_policy = RecoveryPolicy::Fail;
     std::unique_ptr<Subscription> subscription = open_subscription(
         publisher,
         subscriber,

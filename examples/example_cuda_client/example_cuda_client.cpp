@@ -110,10 +110,9 @@ int main(int argc, char *argv[])
 
         TangoBulk::SubscriberConfig config;
         config.stream_name = stream;
-        config.receive_plan = TangoBulk::ReceivePlan::from_limits(
-            slot_bytes, ring_depth, credit_window);
+        config.receive_plan = TangoBulk::ReceivePlan{slot_bytes, ring_depth, credit_window};
         config.delivery_mode = TangoBulk::DeliveryMode::Push;
-        config.reconnect_policy = TangoBulk::ReconnectPolicy::BoundedRetry;
+        config.recovery_policy = TangoBulk::RecoveryPolicy::Reconnect;
         config.receive_buffer = receive_buffer;
         config.receive_buffer_bytes = ring_bytes;
         config.receive_memory_kind = TangoBulk::MemoryKind::Cuda;

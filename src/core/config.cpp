@@ -180,40 +180,15 @@ Status SubscriberConfig::validate() const noexcept
         }
     }
 
-    if(discovery_offer)
+    if(!is_valid_stream_name(stream_name))
     {
-        if(discovery_offer->stream_name != stream_name)
-        {
-            return Status::MalformedMessage;
-        }
-
-        if(const Status offer_status = discovery_offer->validate();
-           offer_status != Status::Ok)
-        {
-            return offer_status;
-        }
+        return Status::MalformedMessage;
     }
 
-    const ReceivePlan upper = upper_receive_plan();
-    const ReceivePlan requested = receive_plan.value_or(
-        ReceivePlan::from_limits(max_frame_bytes, ring_depth, credit_window));
-    if(requested.validate() == Status::Ok && upper.max_frame_bytes == 0)
+    if(pinned_memory_limit_bytes < k_min_pinned_bytes ||
+       pinned_memory_limit_bytes > k_max_pinned_bytes)
     {
-        // An otherwise valid request that cannot retain even the minimum ring
-        // is a budget failure, not a malformed geometry. Keeping that
-        // distinction here prevents adapters from turning it into a generic
-        // frame-size error later.
         return Status::ResourceExhausted;
-    }
-
-    const Status common = validate_common(stream_name,
-                                          upper.max_frame_bytes,
-                                          upper.ring_depth,
-                                          upper.credit_window,
-                                          pinned_memory_limit_bytes);
-    if(common != Status::Ok)
-    {
-        return common;
     }
 
     if(delivery_queue_depth < k_min_delivery_queue || delivery_queue_depth > k_max_delivery_queue)
@@ -257,12 +232,20 @@ Status SubscriberConfig::validate() const noexcept
         return Status::MalformedMessage;
     }
 
-    if(upper.pinned_bytes > pinned_memory_limit_bytes)
+    if(recovery_policy != RecoveryPolicy::Fail &&
+       recovery_policy != RecoveryPolicy::Reconnect)
+    {
+        return Status::MalformedMessage;
+    }
+
+    const std::uint64_t requested_bytes =
+        receive_plan ? receive_plan->pinned_bytes() : 0;
+    if(receive_plan && requested_bytes > pinned_memory_limit_bytes)
     {
         return Status::ResourceExhausted;
     }
 
-    if(has_receive_buffer && receive_buffer_bytes < upper.pinned_bytes)
+    if(has_receive_buffer && receive_plan && receive_buffer_bytes < requested_bytes)
     {
         return Status::ResourceExhausted;
     }
@@ -277,42 +260,6 @@ Status SubscriberConfig::validate() const noexcept
     // choice about which frames matter, not a memory-safety question.
 
     return Status::Ok;
-}
-
-ReceivePlan SubscriberConfig::upper_receive_plan() const noexcept
-{
-    const bool has_explicit_plan = receive_plan.has_value();
-    ReceivePlan upper = receive_plan.value_or(
-        ReceivePlan::from_limits(max_frame_bytes, ring_depth, credit_window));
-
-    if(discovery_offer)
-    {
-        const ReceivePlan discovered =
-            ReceivePlan::derive(*discovery_offer, pinned_memory_limit_bytes);
-        return ReceivePlan::intersect(upper, discovered);
-    }
-
-    // With no discovery source, the configured frame size is the only safe
-    // pre-Open upper bound. Reduce its depth to the budget rather than
-    // allowing every caller to repeat this division and floor rule.
-    if(!has_explicit_plan && upper.max_frame_bytes != 0 &&
-       upper.pinned_bytes > pinned_memory_limit_bytes)
-    {
-        const std::uint64_t budget_depth =
-            pinned_memory_limit_bytes / upper.max_frame_bytes;
-        if(budget_depth < k_min_ring_depth)
-        {
-            return {};
-        }
-
-        upper = ReceivePlan::from_limits(
-            upper.max_frame_bytes,
-            static_cast<std::uint32_t>(std::min<std::uint64_t>(upper.ring_depth, budget_depth)),
-            upper.credit_window);
-        upper.credit_window = std::min(upper.credit_window, upper.ring_depth);
-    }
-
-    return upper;
 }
 
 Status ReceivePlan::validate() const noexcept
@@ -338,114 +285,23 @@ Status ReceivePlan::validate() const noexcept
         return Status::DepthTooLarge;
     }
 
-    if(pinned_bytes != required_bytes)
-    {
-        return Status::ResourceExhausted;
-    }
-
     return Status::Ok;
 }
 
-ReceivePlan ReceivePlan::from_limits(std::uint64_t max_frame_bytes,
-                                     std::uint32_t ring_depth,
-                                     std::uint32_t credit_window) noexcept
+std::uint64_t ReceivePlan::pinned_bytes() const noexcept
 {
-    ReceivePlan out;
-    out.max_frame_bytes = max_frame_bytes;
-    out.ring_depth = ring_depth;
-    out.credit_window = credit_window;
-
-    if(!detail::PinnedLedger::checked_bytes(max_frame_bytes, ring_depth, out.pinned_bytes))
+    std::uint64_t bytes = 0;
+    if(!detail::PinnedLedger::checked_bytes(max_frame_bytes, ring_depth, bytes))
     {
-        // Keep the value observably invalid.  Returning a wrapped byte count
-        // would allow a caller to mistake an overflowing upper plan for a
-        // valid, small allocation.
-        out.pinned_bytes = std::numeric_limits<std::uint64_t>::max();
+        return std::numeric_limits<std::uint64_t>::max();
     }
-
-    return out;
-}
-
-ReceivePlan ReceivePlan::intersect(const ReceivePlan &upper, const Geometry &grant) noexcept
-{
-    if(upper.validate() != Status::Ok || grant.validate() != Status::Ok)
-    {
-        return {};
-    }
-
-    return from_limits(std::min(upper.max_frame_bytes, grant.max_frame_bytes),
-                       std::min(upper.ring_depth, grant.ring_depth),
-                       std::min(upper.credit_window, grant.credit_window));
-}
-
-ReceivePlan ReceivePlan::intersect(const ReceivePlan &upper,
-                                   const ReceivePlan &grant) noexcept
-{
-    if(upper.validate() != Status::Ok || grant.validate() != Status::Ok)
-    {
-        return {};
-    }
-
-    return from_limits(std::min(upper.max_frame_bytes, grant.max_frame_bytes),
-                       std::min(upper.ring_depth, grant.ring_depth),
-                       std::min(upper.credit_window, grant.credit_window));
-}
-
-ReceivePlan ReceivePlan::intersect(const ReceivePlan &upper, const StreamOffer &offer) noexcept
-{
-    if(offer.validate() != Status::Ok)
-    {
-        return {};
-    }
-
-    return intersect(upper, offer.geometry);
-}
-
-ReceivePlan ReceivePlan::derive(const Geometry &geometry,
-                                std::uint64_t pinned_memory_limit_bytes) noexcept
-{
-    if(geometry.validate() != Status::Ok)
-    {
-        return {};
-    }
-
-    ReceivePlan out = from_limits(
-        geometry.max_frame_bytes, geometry.ring_depth, geometry.credit_window);
-
-    if(out.max_frame_bytes == 0)
-    {
-        return out;
-    }
-
-    const std::uint64_t budget_depth = pinned_memory_limit_bytes / out.max_frame_bytes;
-    out.ring_depth = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-        out.ring_depth, std::numeric_limits<std::uint32_t>::max()));
-    out.ring_depth = static_cast<std::uint32_t>(std::min<std::uint64_t>(out.ring_depth,
-                                                                         budget_depth));
-    if(out.ring_depth < k_min_ring_depth)
-    {
-        return {};
-    }
-    out.credit_window = std::min(out.credit_window, out.ring_depth);
-    return from_limits(out.max_frame_bytes, out.ring_depth, out.credit_window);
-}
-
-ReceivePlan ReceivePlan::derive(const StreamOffer &offer,
-                                std::uint64_t pinned_memory_limit_bytes) noexcept
-{
-    if(offer.validate() != Status::Ok)
-    {
-        return {};
-    }
-
-    return derive(offer.geometry, pinned_memory_limit_bytes);
+    return bytes;
 }
 
 bool operator==(const ReceivePlan &left, const ReceivePlan &right) noexcept
 {
     return left.max_frame_bytes == right.max_frame_bytes &&
-           left.ring_depth == right.ring_depth && left.credit_window == right.credit_window &&
-           left.pinned_bytes == right.pinned_bytes;
+           left.ring_depth == right.ring_depth && left.credit_window == right.credit_window;
 }
 
 bool operator!=(const ReceivePlan &left, const ReceivePlan &right) noexcept

@@ -1367,19 +1367,18 @@ int main(int argc, char *argv[])
         if(options.frames_per_block > credit_window)
             throw std::runtime_error("--frames-per-block exceeds the available credit window");
 
-        const TangoBulk::ReceivePlan receive_plan = TangoBulk::ReceivePlan::from_limits(
-            offer.geometry.max_frame_bytes, ring_depth, credit_window);
+        const TangoBulk::ReceivePlan receive_plan{
+            offer.geometry.max_frame_bytes, ring_depth, credit_window};
         config.receive_plan = receive_plan;
-        config.discovery_offer = offer;
         config.delivery_mode = TangoBulk::DeliveryMode::Pull;
         config.drop_policy = TangoBulk::DropPolicy::DropNewest;
-        config.reconnect_policy = TangoBulk::ReconnectPolicy::BoundedRetry;
+        config.recovery_policy = TangoBulk::RecoveryPolicy::Reconnect;
         config.delivery_queue_depth = ring_depth;
         if(const TangoBulk::Status status = config.validate(); status != TangoBulk::Status::Ok)
             throw TangoBulk::BulkException(
                 {status, "discovery geometry cannot satisfy the receive plan", "tango"});
 
-        const std::uint64_t receive_bytes = receive_plan.pinned_bytes;
+        const std::uint64_t receive_bytes = receive_plan.pinned_bytes();
         SharedReceiveRing receive_ring(receive_bytes);
         config.receive_buffer = receive_ring.memory();
         config.receive_buffer_bytes = receive_bytes;

@@ -35,7 +35,7 @@ struct TransportFixture
         delivery(std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
                                                          config.drop_policy)),
         ingress(delivery->make_ingress()),
-        engine(config, ingress)
+        engine(*config.receive_plan, config, ingress)
     {
     }
 
@@ -48,9 +48,9 @@ struct TransportFixture
         request.version_max = Protocol::k_version_major;
         request.requested_caps = Protocol::k_caps_credit_coalescing | Protocol::k_caps_probe;
         request.client_instance_id = Protocol::generate_client_instance_id();
-        request.requested_max_frame_bytes = config.max_frame_bytes;
-        request.requested_ring_depth = config.ring_depth;
-        request.requested_credit_window = config.credit_window;
+        request.requested_max_frame_bytes = config.receive_plan->max_frame_bytes;
+        request.requested_ring_depth = config.receive_plan->ring_depth;
+        request.requested_credit_window = config.receive_plan->credit_window;
         request.requested_memory_kind = config.receive_memory_kind;
         request.requested_transport = Protocol::Transport::ActiveMessage;
         request.drop_policy = config.drop_policy;

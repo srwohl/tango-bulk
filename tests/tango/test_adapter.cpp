@@ -44,9 +44,7 @@ SubscriberConfig subscriber_config()
 {
     SubscriberConfig config;
     config.stream_name = "bulk.tango";
-    config.max_frame_bytes = k_frame_bytes;
-    config.ring_depth = 8;
-    config.credit_window = 4;
+    config.receive_plan = ReceivePlan{k_frame_bytes, 8, 4};
     config.delivery_queue_depth = 32;
     config.command_timeout_ms = 5'000;
     return config;
@@ -334,8 +332,8 @@ TEST_CASE("The granted geometry reaches the application", "[tango][m4]")
     CHECK(granted.shape[0] == k_frame_bytes);
     CHECK(granted.strides[0] == 1);
 
-    CHECK(granted.max_frame_bytes <= subscriber_config().max_frame_bytes);
-    CHECK(granted.ring_depth <= subscriber_config().ring_depth);
+    CHECK(granted.max_frame_bytes <= subscriber_config().receive_plan->max_frame_bytes);
+    CHECK(granted.ring_depth <= subscriber_config().receive_plan->ring_depth);
     CHECK(granted.credit_window <= granted.ring_depth);
 
     CHECK(granted.validate() == Status::Ok);
@@ -431,7 +429,7 @@ TEST_CASE("A device with no publisher answers, and does not throw", "[tango][m4]
     CHECK(detached_error.status == Status::UnknownStream);
 
     SubscriberConfig config = subscriber_config();
-    config.reconnect_policy = ReconnectPolicy::FailFast;
+    config.recovery_policy = RecoveryPolicy::Fail;
 
     Sink sink;
 
@@ -476,9 +474,7 @@ TEST_CASE("A subscriber reopens its session after the stream comes back", "[tang
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
     SubscriberConfig config = subscriber_config();
-    config.reconnect_policy = ReconnectPolicy::BoundedRetry;
-    config.reconnect_backoff_ms = 200;
-    config.reconnect_max_attempts = 20;
+    config.recovery_policy = RecoveryPolicy::Reconnect;
 
     Sink sink;
     auto subscriber = subscribe(proxy, config, sink.callbacks());
@@ -499,7 +495,7 @@ TEST_CASE("A subscriber reopens its session after the stream comes back", "[tang
 
     proxy.command_inout("Attach");
 
-    // 4.1's BoundedRetry: back off, try again, and stop being broken when the
+    // Recovery backs off, tries again, and stops being broken when the
     // world stops being broken.  Nothing had to restart.
     REQUIRE(eventually([&subscriber] { return subscriber->state() == SubscriberState::Active; }));
     CHECK(subscriber->counters().reconnects >= 1);
@@ -526,7 +522,7 @@ TEST_CASE("The command names given at subscribe are the ones used", "[tango][m4]
     Tango::DeviceProxy proxy(DeviceServer::instance().device());
 
     SubscriberConfig config = subscriber_config();
-    config.reconnect_policy = ReconnectPolicy::FailFast;
+    config.recovery_policy = RecoveryPolicy::Fail;
 
     Sink wrong;
     CHECK_THROWS_AS(

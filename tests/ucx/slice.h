@@ -6,7 +6,7 @@
 #define TANGO_BULK_TESTS_UCX_SLICE_H
 
 #include <core/publisher_internal.h>
-#include <core/subscription_internal.h>
+#include <core/subscriber_transport.h>
 
 #include <tango-bulk/publisher.h>
 #include <tango-bulk/subscription.h>
@@ -49,9 +49,7 @@ inline SubscriberConfig subscriber_config()
 {
     SubscriberConfig config;
     config.stream_name = "bulk.slice";
-    config.max_frame_bytes = k_frame_bytes;
-    config.ring_depth = k_ring_depth;
-    config.credit_window = k_credit_window;
+    config.receive_plan = ReceivePlan{k_frame_bytes, k_ring_depth, k_credit_window};
     config.delivery_queue_depth = 32;
     config.delivery_mode = DeliveryMode::Pull;
     return config;
@@ -84,8 +82,10 @@ inline std::unique_ptr<Subscription> open_subscription(
     CoordinationReplyTransform transform = {})
 {
     config.delivery_mode = DeliveryMode::Pull;
-    return detail::SubscriptionFactory::open_default(
+    detail::TransportFactory transport = detail::make_subscriber_transport_factory(config);
+    return detail::open_subscription(
         std::move(config),
+        publisher.snapshot().stream_offer(),
         [&publisher, observer = std::move(observer), transform = std::move(transform)](
             Protocol::CoordType type,
             const std::vector<std::byte> &request,
@@ -103,7 +103,9 @@ inline std::unique_ptr<Subscription> open_subscription(
             }
             return reply;
         },
-        SubscriptionCallbacks{});
+        std::move(transport),
+        SubscriptionCallbacks{},
+        std::chrono::steady_clock::time_point::max());
 }
 
 inline std::size_t drain(Subscription &subscription,

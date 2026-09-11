@@ -115,7 +115,9 @@ class ReceiveArena : public CreditSink
 class SubscriberEngine final : public SubscriberTransport
 {
   public:
-    SubscriberEngine(SubscriberConfig config, std::shared_ptr<DeliveryIngress> delivery);
+    SubscriberEngine(ReceivePlan plan,
+                     const SubscriberConfig &config,
+                     std::shared_ptr<DeliveryIngress> delivery);
     ~SubscriberEngine() override;
 
     const std::vector<std::byte> &local_address() const noexcept override
@@ -222,7 +224,8 @@ class SubscriberEngine final : public SubscriberTransport
 
     void fail(Status status, const char *reason) noexcept;
 
-    SubscriberConfig config_;
+    MemoryKind memory_kind_;
+    int engine_cpu_affinity_;
     std::shared_ptr<UcxContext> context_;
     std::unique_ptr<UcxWorker> worker_;
     std::shared_ptr<ReceiveArena> arena_;

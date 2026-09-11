@@ -5,7 +5,7 @@
 #include "oob.h"
 
 #include <core/publisher_internal.h>
-#include <core/subscription_internal.h>
+#include <core/subscriber_transport.h>
 
 #include <tango-bulk/publisher.h>
 #include <tango-bulk/subscription.h>
@@ -446,9 +446,7 @@ int run_subscriber(const Options &options)
 {
     SubscriberConfig config;
     config.stream_name = options.stream;
-    config.max_frame_bytes = options.size;
-    config.ring_depth = options.ring_depth;
-    config.credit_window = options.credit_window;
+    config.receive_plan = ReceivePlan{options.size, options.ring_depth, options.credit_window};
     config.delivery_queue_depth = std::max<std::uint32_t>(64, options.ring_depth * 2);
     config.delivery_mode = DeliveryMode::Pull;
     config.ucx_tls = options.tls;
@@ -480,8 +478,23 @@ int run_subscriber(const Options &options)
         }
     };
 
-    auto subscription = detail::SubscriptionFactory::open_default(
+    StreamOffer offer;
+    offer.status = Status::Ok;
+    offer.stream_name = options.stream;
+    offer.geometry.generation = 1;
+    offer.geometry.element_type = ElementType::UInt8;
+    offer.geometry.element_size = 1;
+    offer.geometry.rank = 1;
+    offer.geometry.max_frame_bytes = options.size;
+    offer.geometry.ring_depth = options.ring_depth;
+    offer.geometry.credit_window = options.credit_window;
+    offer.geometry.shape[0] = options.size;
+    offer.geometry.strides[0] = 1;
+
+    detail::TransportFactory transport = detail::make_subscriber_transport_factory(config);
+    auto subscription = detail::open_subscription(
         config,
+        std::move(offer),
         [&oob](Protocol::CoordType,
                const std::vector<std::byte> &request,
                std::chrono::steady_clock::time_point deadline)
@@ -489,7 +502,9 @@ int run_subscriber(const Options &options)
             oob.send(request, deadline);
             return oob.recv(deadline);
         },
-        SubscriptionCallbacks{});
+        std::move(transport),
+        SubscriptionCallbacks{},
+        std::chrono::steady_clock::time_point::max());
 
     const ReceivePlan plan = subscription->plan();
 
@@ -498,7 +513,7 @@ int run_subscriber(const Options &options)
                 plan.ring_depth,
                 plan.max_frame_bytes,
                 plan.credit_window,
-                static_cast<double>(plan.pinned_bytes) / (1024.0 * 1024.0),
+                static_cast<double>(plan.pinned_bytes()) / (1024.0 * 1024.0),
                 options.verify ? "on" : "off");
 
     const std::uint64_t total = options.warmup + options.iters;

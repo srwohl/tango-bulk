@@ -7,7 +7,10 @@
 
 #include <core/delivery_queue.h>
 #include <core/frame_fields.h>
-#include <core/subscription_internal.h>
+#include <core/subscriber_transport.h>
+
+#include <tango-bulk/protocol.h>
+#include <tango-bulk/subscription.h>
 
 #include <algorithm>
 #include <array>
@@ -300,18 +303,12 @@ class FakeTransport final : public detail::SubscriberTransport
     std::atomic<bool> failed_{false};
 };
 
-inline detail::TransportFactory fake_factory(Script &script,
-                                             std::shared_ptr<FakeTransport *> latest = nullptr)
+inline detail::TransportFactory fake_factory(Script &script)
 {
-    return [&script, latest](const SubscriberConfig &,
-                             std::shared_ptr<detail::DeliveryIngress> delivery)
+    return [&script](const ReceivePlan &, std::shared_ptr<detail::DeliveryIngress> delivery)
         -> std::unique_ptr<detail::SubscriberTransport>
     {
-        auto transport = std::make_unique<FakeTransport>(script, std::move(delivery));
-        if(latest)
-        {
-        }
-        return transport;
+        return std::make_unique<FakeTransport>(script, std::move(delivery));
     };
 }
 
@@ -383,16 +380,46 @@ inline SubscriberConfig subscription_config()
 {
     SubscriberConfig config;
     config.stream_name = "bulk.unit";
-    config.max_frame_bytes = 64u << 10;
-    config.ring_depth = 4;
-    config.credit_window = 2;
+    config.receive_plan = ReceivePlan{64u << 10, 4, 2};
     config.delivery_queue_depth = 8;
     config.delivery_mode = DeliveryMode::Push;
-    config.reconnect_backoff_ms = 5;
-    config.reconnect_max_attempts = 3;
     config.command_timeout_ms = 500;
     config.probe_timeout_ms = 60;
     return config;
+}
+
+inline StreamOffer subscription_offer(const std::string &stream_name = "bulk.unit")
+{
+    StreamOffer offer;
+    offer.stream_name = stream_name;
+    offer.status = Status::Ok;
+    offer.geometry.generation = 1;
+    offer.geometry.element_type = ElementType::UInt16;
+    offer.geometry.element_size = 2;
+    offer.geometry.rank = 2;
+    offer.geometry.max_frame_bytes = 64u << 10;
+    offer.geometry.ring_depth = 4;
+    offer.geometry.credit_window = 2;
+    offer.geometry.shape = {8, 8, 0, 0};
+    offer.geometry.strides = {16, 2, 0, 0};
+    return offer;
+}
+
+inline std::unique_ptr<Subscription> open_test_subscription(
+    SubscriberConfig config,
+    detail::CoordinationChannel channel,
+    detail::TransportFactory factory,
+    SubscriptionCallbacks callbacks,
+    std::chrono::steady_clock::time_point establishment_deadline =
+        std::chrono::steady_clock::time_point::max())
+{
+    StreamOffer offer = subscription_offer(config.stream_name);
+    return detail::open_subscription(std::move(config),
+                                     std::move(offer),
+                                     std::move(channel),
+                                     std::move(factory),
+                                     std::move(callbacks),
+                                     establishment_deadline);
 }
 
 inline SubscriptionCallbacks noop_callbacks()

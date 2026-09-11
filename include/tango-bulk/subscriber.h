@@ -35,36 +35,16 @@ const char *to_string(SubscriberState state) noexcept;
 /// The receive dimensions selected for a subscription.
 ///
 /// A value supplied in SubscriberConfig is a complete upper limit. A value
-/// returned by Subscription::plan() is the actual grant-backed plan. In both
-/// cases the byte count is derived here so every storage adapter shares one
-/// interpretation of the ring.
+/// returned by Subscription::plan() is the actual grant-backed plan. The byte
+/// count is derived so it cannot disagree with the dimensions.
 struct ReceivePlan
 {
     std::uint64_t max_frame_bytes{0};
     std::uint32_t ring_depth{0};
     std::uint32_t credit_window{0};
-    std::uint64_t pinned_bytes{0};
 
     Status validate() const noexcept;
-
-    static ReceivePlan from_limits(std::uint64_t max_frame_bytes,
-                                   std::uint32_t ring_depth,
-                                   std::uint32_t credit_window) noexcept;
-
-    static ReceivePlan intersect(const ReceivePlan &upper,
-                                 const Geometry &grant) noexcept;
-
-    static ReceivePlan intersect(const ReceivePlan &upper,
-                                 const ReceivePlan &grant) noexcept;
-
-    static ReceivePlan intersect(const ReceivePlan &upper,
-                                 const StreamOffer &offer) noexcept;
-
-    static ReceivePlan derive(const Geometry &geometry,
-                              std::uint64_t pinned_memory_limit_bytes) noexcept;
-
-    static ReceivePlan derive(const StreamOffer &offer,
-                              std::uint64_t pinned_memory_limit_bytes) noexcept;
+    std::uint64_t pinned_bytes() const noexcept;
 };
 
 bool operator==(const ReceivePlan &left, const ReceivePlan &right) noexcept;
@@ -76,24 +56,19 @@ enum class DeliveryMode : std::uint32_t
     Pull = 1, ///< the application claims frames with Subscription::read_for()
 };
 
-enum class ReconnectPolicy : std::uint32_t
+enum class RecoveryPolicy : std::uint32_t
 {
-    FailFast = 0,
-    BoundedRetry = 1,
+    Fail = 0,
+    Reconnect = 1,
 };
 
 struct SubscriberConfig
 {
     std::string stream_name;
-    std::uint64_t max_frame_bytes{8ull << 20};
-    std::uint32_t ring_depth{32};
-    std::uint32_t credit_window{16};
     std::uint32_t delivery_queue_depth{64};
     DeliveryMode delivery_mode{DeliveryMode::Push};
     DropPolicy drop_policy{DropPolicy::DropNewest};
-    ReconnectPolicy reconnect_policy{ReconnectPolicy::BoundedRetry};
-    std::uint32_t reconnect_max_attempts{10};
-    std::uint32_t reconnect_backoff_ms{500}; ///< exponential, capped at lease TTL
+    RecoveryPolicy recovery_policy{RecoveryPolicy::Reconnect};
     std::uint32_t command_timeout_ms{5'000}; ///< one Tango command round trip
     std::uint32_t establishment_timeout_ms{30'000}; ///< total initial subscribe budget
 
@@ -119,17 +94,10 @@ struct SubscriberConfig
     std::uint64_t receive_buffer_bytes{0};
     MemoryKind receive_memory_kind{MemoryKind::Host};
 
-    /// Optional complete upper plan. When present it replaces the individual
-    /// sizing fields for preparation and Open, and is still intersected with
-    /// discovery and the pinned budget.
+    /// Optional complete upper plan, intersected with discovery and the pinned
+    /// budget before Open. When absent those dimensions are derived entirely
+    /// from discovery and the pinned budget.
     std::optional<ReceivePlan> receive_plan;
-
-    /// Optional conservative pre-Open discovery. The offer is only used to
-    /// choose a safe upper request; OpenReply remains authoritative for the
-    /// actual geometry and lease.
-    std::optional<StreamOffer> discovery_offer;
-
-    ReceivePlan upper_receive_plan() const noexcept;
     Status validate() const noexcept;
 };
 

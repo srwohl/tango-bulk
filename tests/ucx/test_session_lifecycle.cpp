@@ -227,11 +227,13 @@ TEST_CASE("An unrenewed session expires on schedule with no frames in flight", "
 {
     BulkPublisher publisher(short_lease_config());
     SubscriberConfig config = subscriber_config();
-    config.reconnect_policy = ReconnectPolicy::FailFast;
+    config.recovery_policy = RecoveryPolicy::Fail;
 
     std::vector<Protocol::OpenReply> grants;
-    std::unique_ptr<Subscription> subscription = detail::SubscriptionFactory::open_default(
+    detail::TransportFactory transport = detail::make_subscriber_transport_factory(config);
+    std::unique_ptr<Subscription> subscription = detail::open_subscription(
         config,
+        publisher.snapshot().stream_offer(),
         [&publisher, &grants](Protocol::CoordType type,
                               const std::vector<std::byte> &request,
                               std::chrono::steady_clock::time_point /*deadline*/)
@@ -248,7 +250,9 @@ TEST_CASE("An unrenewed session expires on schedule with no frames in flight", "
                 grants.push_back(decode_open_reply(reply));
             return reply;
         },
-        SubscriptionCallbacks{});
+        std::move(transport),
+        SubscriptionCallbacks{},
+        std::chrono::steady_clock::time_point::max());
     REQUIRE(grants.size() == 1);
     const Protocol::OpenReply &granted = grants.front();
 
@@ -459,7 +463,7 @@ TEST_CASE("A publisher admits no more sessions than it was configured for", "[m3
 
     BulkPublisher publisher(config);
     SubscriberConfig subscriber = subscriber_config();
-    subscriber.reconnect_policy = ReconnectPolicy::FailFast;
+    subscriber.recovery_policy = RecoveryPolicy::Fail;
     std::vector<Protocol::OpenReply> grants;
     const auto record_open = [&grants](Protocol::CoordType type,
                                        const std::vector<std::byte> &reply)
@@ -480,16 +484,7 @@ TEST_CASE("A publisher admits no more sessions than it was configured for", "[m3
     BulkError refusal;
     try
     {
-        (void)detail::SubscriptionFactory::open_default(
-            subscriber,
-            [&publisher](Protocol::CoordType type,
-                         const std::vector<std::byte> &request,
-                         std::chrono::steady_clock::time_point)
-            {
-                return detail::PublisherAccess::coordination(
-                    publisher, request.data(), request.size(), type);
-            },
-            SubscriptionCallbacks{});
+        (void)open_subscription(publisher, subscriber);
         FAIL("a third subscription should be refused");
     }
     catch(const BulkException &error)

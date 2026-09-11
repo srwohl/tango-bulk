@@ -2,9 +2,11 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include <core/subscription_internal.h>
-
+#include <core/delivery_queue.h>
 #include <core/geometry_conversion.h>
+#include <core/subscriber_transport.h>
+
+#include <tango-bulk/subscription.h>
 
 #include <algorithm>
 #include <atomic>
@@ -24,6 +26,59 @@ using namespace std::chrono_literals;
 constexpr auto k_control_quantum = 100ms;
 
 constexpr auto k_dispatch_quantum = 20ms;
+constexpr auto k_reconnect_backoff = 50ms;
+constexpr std::uint32_t k_reconnect_max_attempts = 10;
+
+ReceivePlan plan_receive(const SubscriberConfig &config, const StreamOffer &offer) noexcept
+{
+    if(offer.stream_name != config.stream_name || offer.validate() != Status::Ok)
+    {
+        return {};
+    }
+
+    ReceivePlan planned{offer.geometry.max_frame_bytes,
+                        offer.geometry.ring_depth,
+                        offer.geometry.credit_window};
+    if(config.receive_plan)
+    {
+        const ReceivePlan &upper = *config.receive_plan;
+        planned.max_frame_bytes = std::min(planned.max_frame_bytes, upper.max_frame_bytes);
+        planned.ring_depth = std::min(planned.ring_depth, upper.ring_depth);
+        planned.credit_window = std::min(planned.credit_window, upper.credit_window);
+    }
+
+    if(planned.max_frame_bytes == 0)
+    {
+        return {};
+    }
+
+    const std::uint64_t budget_depth =
+        config.pinned_memory_limit_bytes / planned.max_frame_bytes;
+    planned.ring_depth = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(planned.ring_depth, budget_depth));
+    planned.credit_window = std::min(planned.credit_window, planned.ring_depth);
+
+    if(planned.validate() != Status::Ok ||
+       planned.pinned_bytes() > config.pinned_memory_limit_bytes ||
+       (config.receive_buffer && config.receive_buffer_bytes < planned.pinned_bytes()))
+    {
+        return {};
+    }
+    return planned;
+}
+
+std::chrono::milliseconds backoff_delay(std::uint32_t attempt,
+                                        std::uint32_t lease_ttl_ms) noexcept
+{
+    std::uint64_t delay = static_cast<std::uint64_t>(k_reconnect_backoff.count());
+    for(std::uint32_t i = 0; i < attempt && delay < lease_ttl_ms; ++i)
+    {
+        delay *= 2;
+    }
+
+    delay = std::min<std::uint64_t>(delay, std::max<std::uint32_t>(lease_ttl_ms, 1));
+    return std::chrono::milliseconds(delay);
+}
 
 void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexcept
 {
@@ -78,22 +133,6 @@ void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexc
 
 } // namespace
 
-
-std::chrono::milliseconds detail::backoff_delay(std::uint32_t attempt,
-                                                std::uint32_t backoff_ms,
-                                                std::uint32_t lease_ttl_ms) noexcept
-{
-    std::uint64_t delay = backoff_ms;
-    for(std::uint32_t i = 0; i < attempt && delay < lease_ttl_ms; ++i)
-    {
-        delay *= 2;
-    }
-
-    delay = std::min<std::uint64_t>(delay, std::max<std::uint32_t>(lease_ttl_ms, 1));
-    return std::chrono::milliseconds(delay);
-}
-
-
 struct Subscription::Impl
 {
     /// The wire-level session is implementation state of a Subscription.  It
@@ -102,7 +141,10 @@ struct Subscription::Impl
     /// second lifecycle owner.
     struct SessionState
     {
-        std::vector<std::byte> make_open_request(const SubscriberConfig &config,
+        std::vector<std::byte> make_open_request(const std::string &stream_name,
+                                                 const ReceivePlan &upper_plan,
+                                                 MemoryKind memory_kind,
+                                                 DropPolicy drop_policy,
                                                  const std::vector<std::byte> &client_address,
                                                  std::uint64_t correlation_id) const
         {
@@ -114,15 +156,13 @@ struct Subscription::Impl
             // this side cannot honour is worse than not having it.
             request.requested_caps = Protocol::k_caps_credit_coalescing | Protocol::k_caps_probe;
             request.client_instance_id = Protocol::generate_client_instance_id();
-            const ReceivePlan upper = ReceivePlan::from_limits(
-                config.max_frame_bytes, config.ring_depth, config.credit_window);
-            request.requested_max_frame_bytes = upper.max_frame_bytes;
-            request.requested_ring_depth = upper.ring_depth;
-            request.requested_credit_window = upper.credit_window;
-            request.requested_memory_kind = config.receive_memory_kind;
+            request.requested_max_frame_bytes = upper_plan.max_frame_bytes;
+            request.requested_ring_depth = upper_plan.ring_depth;
+            request.requested_credit_window = upper_plan.credit_window;
+            request.requested_memory_kind = memory_kind;
             request.requested_transport = Protocol::Transport::ActiveMessage;
-            request.drop_policy = config.drop_policy;
-            request.stream_name = config.stream_name;
+            request.drop_policy = drop_policy;
+            request.stream_name = stream_name;
             request.client_ucx_address = client_address;
 
             return Protocol::encode(request, correlation_id);
@@ -130,7 +170,7 @@ struct Subscription::Impl
 
         Status adopt_open_reply(const std::byte *data,
                                 std::size_t size,
-                                const SubscriberConfig &config,
+                                const ReceivePlan &upper_plan,
                                 std::uint64_t expected_correlation)
         {
             Protocol::Envelope envelope;
@@ -171,9 +211,9 @@ struct Subscription::Impl
             // A grant is only ever clamped downward, so a ring registered at
             // the requested geometry is large enough for the granted one.
             // Check anyway because that depends on peer behaviour.
-            if(reply.geometry.max_frame_bytes > config.max_frame_bytes ||
-               reply.geometry.ring_depth > config.ring_depth ||
-               reply.geometry.credit_window > config.credit_window)
+            if(reply.geometry.max_frame_bytes > upper_plan.max_frame_bytes ||
+               reply.geometry.ring_depth > upper_plan.ring_depth ||
+               reply.geometry.credit_window > upper_plan.credit_window)
             {
                 return Status::GeometryMismatch;
             }
@@ -325,15 +365,24 @@ struct Subscription::Impl
     };
 
     Impl(SubscriberConfig cfg,
+         ReceivePlan plan,
          detail::CoordinationChannel coordination,
          detail::TransportFactory transport_factory,
          SubscriptionCallbacks cbs) :
-        config(std::move(cfg)),
+        stream_name(std::move(cfg.stream_name)),
+        upper_plan(plan),
+        memory_kind(cfg.receive_memory_kind),
+        drop_policy(cfg.drop_policy),
+        delivery_mode(cfg.delivery_mode),
+        recovery_policy(cfg.recovery_policy),
+        command_timeout_ms(cfg.command_timeout_ms),
+        probe_timeout_ms(cfg.probe_timeout_ms),
+        establishment_timeout_ms(cfg.establishment_timeout_ms),
         channel(std::move(coordination)),
         factory(std::move(transport_factory)),
         frame_callback(std::move(cbs.on_frame)),
-        delivery(std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
-                                                 config.drop_policy))
+        delivery(std::make_shared<detail::DeliveryQueue>(cfg.delivery_queue_depth,
+                                                         drop_policy))
     {
     }
 
@@ -365,7 +414,7 @@ struct Subscription::Impl
 
         try
         {
-            fresh = factory(config, delivery->make_ingress());
+            fresh = factory(upper_plan, delivery->make_ingress());
         }
         catch(const BulkException &e)
         {
@@ -394,12 +443,18 @@ struct Subscription::Impl
         {
             const std::uint64_t correlation_id = next_correlation_id();
             const std::vector<std::byte> request = candidate.make_open_request(
-                config, fresh->local_address(), correlation_id);
+                stream_name,
+                upper_plan,
+                memory_kind,
+                drop_policy,
+                fresh->local_address(),
+                correlation_id);
             const std::vector<std::byte> reply =
                 channel(Protocol::CoordType::Open, request, establishment_deadline);
 
             const Status status =
-                candidate.adopt_open_reply(reply.data(), reply.size(), config, correlation_id);
+                candidate.adopt_open_reply(
+                    reply.data(), reply.size(), upper_plan, correlation_id);
             if(status != Status::Ok)
             {
                 delivery->retire_ingress();
@@ -443,9 +498,9 @@ struct Subscription::Impl
             std::lock_guard<std::mutex> lock(observation);
             session = candidate;
             current_geometry = granted;
-            actual_plan = ReceivePlan::from_limits(granted.max_frame_bytes,
-                                                    granted.ring_depth,
-                                                    granted.credit_window);
+            actual_plan = ReceivePlan{granted.max_frame_bytes,
+                                      granted.ring_depth,
+                                      granted.credit_window};
         }
 
         delivered_at_open = delivery->stats().taken;
@@ -476,7 +531,7 @@ struct Subscription::Impl
         transition(SubscriberState::Probing, BulkError{});
 
         const auto probe_deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(config.probe_timeout_ms);
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(probe_timeout_ms);
         const auto deadline = std::min(probe_deadline, establishment_deadline);
 
         for(;;)
@@ -691,7 +746,7 @@ struct Subscription::Impl
             }
         }
         return std::chrono::steady_clock::now() +
-               std::chrono::milliseconds(config.command_timeout_ms);
+               std::chrono::milliseconds(command_timeout_ms);
     }
 
 
@@ -749,7 +804,7 @@ struct Subscription::Impl
 
     bool reconnect(std::uint32_t &attempt, BulkError error) noexcept
     {
-        if(config.reconnect_policy != ReconnectPolicy::BoundedRetry)
+        if(recovery_policy != RecoveryPolicy::Reconnect)
         {
             transition(SubscriberState::Failed, error);
             return false;
@@ -757,7 +812,7 @@ struct Subscription::Impl
 
         while(running.load(std::memory_order_acquire))
         {
-            if(attempt >= config.reconnect_max_attempts)
+            if(attempt >= k_reconnect_max_attempts)
             {
                 transition(SubscriberState::Failed,
                            BulkError{error.status,
@@ -798,8 +853,7 @@ struct Subscription::Impl
         std::chrono::steady_clock::time_point deadline =
             std::chrono::steady_clock::time_point::max()) noexcept
     {
-        auto delay =
-            detail::backoff_delay(attempt, config.reconnect_backoff_ms, last_lease_ttl_ms);
+        auto delay = backoff_delay(attempt, last_lease_ttl_ms);
         const auto remaining = deadline - std::chrono::steady_clock::now();
         if(remaining < delay)
         {
@@ -976,7 +1030,7 @@ struct Subscription::Impl
     void shutdown(bool announce_closed) noexcept
     {
         const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(config.command_timeout_ms);
+                              std::chrono::milliseconds(command_timeout_ms);
         {
             std::unique_lock<std::mutex> lock(shutdown_mutex);
             if(shutdown_complete)
@@ -1075,7 +1129,15 @@ struct Subscription::Impl
     }
 
 
-    SubscriberConfig config;
+    std::string stream_name;
+    ReceivePlan upper_plan;
+    MemoryKind memory_kind;
+    DropPolicy drop_policy;
+    DeliveryMode delivery_mode;
+    RecoveryPolicy recovery_policy;
+    std::uint32_t command_timeout_ms;
+    std::uint32_t probe_timeout_ms;
+    std::uint32_t establishment_timeout_ms;
     detail::CoordinationChannel channel;
     detail::TransportFactory factory;
 
@@ -1155,7 +1217,7 @@ std::optional<FrameView> Subscription::try_read()
 {
     Impl &impl = *impl_;
 
-    if(impl.config.delivery_mode != DeliveryMode::Pull)
+    if(impl.delivery_mode != DeliveryMode::Pull)
     {
         throw BulkException(BulkError{Status::Internal,
                                       "try_read() requires DeliveryMode::Pull",
@@ -1178,7 +1240,7 @@ std::optional<FrameView> Subscription::read_for(std::chrono::milliseconds timeou
 {
     Impl &impl = *impl_;
 
-    if(impl.config.delivery_mode != DeliveryMode::Pull)
+    if(impl.delivery_mode != DeliveryMode::Pull)
     {
         throw BulkException(BulkError{Status::Internal,
                                       "read_for() requires DeliveryMode::Pull",
@@ -1199,8 +1261,9 @@ std::optional<FrameView> Subscription::read_for(std::chrono::milliseconds timeou
     throw_delivery_terminal(result);
 }
 
-std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
+std::unique_ptr<Subscription> detail::open_subscription(
     SubscriberConfig config,
+    StreamOffer offer,
     detail::CoordinationChannel channel,
     detail::TransportFactory factory,
     SubscriptionCallbacks callbacks,
@@ -1213,13 +1276,27 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
             status, std::string("invalid SubscriberConfig: ") + to_string(status), "subscriber"});
     }
 
-    // Normalize all caller intent before constructing a transport. The
-    // transport allocates the receive ring before Open, so it must see the
-    // exact same upper plan that the coordination request advertises.
-    const ReceivePlan upper = config.upper_receive_plan();
-    config.max_frame_bytes = upper.max_frame_bytes;
-    config.ring_depth = upper.ring_depth;
-    config.credit_window = upper.credit_window;
+    if(offer.stream_name != config.stream_name)
+    {
+        throw BulkException(BulkError{Status::UnknownStream,
+                                      "discovery returned a different stream",
+                                      "subscriber"});
+    }
+    if(const Status offer_status = offer.validate(); offer_status != Status::Ok)
+    {
+        throw BulkException(BulkError{offer_status,
+                                      offer.message.empty() ? "stream discovery failed"
+                                                            : std::move(offer.message),
+                                      "subscriber"});
+    }
+
+    const ReceivePlan upper = plan_receive(config, offer);
+    if(upper.validate() != Status::Ok)
+    {
+        throw BulkException(BulkError{Status::ResourceExhausted,
+                                      "the pinned budget cannot hold a valid ReceivePlan",
+                                      "subscriber"});
+    }
 
     if(!channel || !factory)
     {
@@ -1237,7 +1314,7 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
     }
 
     auto impl = std::make_shared<Subscription::Impl>(
-        std::move(config), std::move(channel), std::move(factory), std::move(callbacks));
+        std::move(config), upper, std::move(channel), std::move(factory), std::move(callbacks));
 
     impl->running.store(true, std::memory_order_release);
 
@@ -1248,11 +1325,11 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
     {
         establishment_deadline =
             std::chrono::steady_clock::now() +
-            std::chrono::milliseconds(impl->config.establishment_timeout_ms);
+            std::chrono::milliseconds(impl->establishment_timeout_ms);
     }
     if(impl->open_subscription(error, establishment_deadline))
     {
-        if(impl->config.delivery_mode == DeliveryMode::Push)
+        if(impl->delivery_mode == DeliveryMode::Push)
         {
             impl->dispatch = std::thread([worker = impl] { worker->dispatch_loop(); });
         }
@@ -1261,11 +1338,10 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
         return std::unique_ptr<Subscription>(new Subscription(std::move(impl)));
     }
 
-    if(impl->config.reconnect_policy == ReconnectPolicy::BoundedRetry)
+    if(impl->recovery_policy == RecoveryPolicy::Reconnect)
     {
         bool opened = false;
-        for(std::uint32_t attempt = 0; attempt < impl->config.reconnect_max_attempts;
-            ++attempt)
+        for(std::uint32_t attempt = 0; attempt < k_reconnect_max_attempts; ++attempt)
         {
             if(!Subscription::Impl::retryable_establishment(error.status) ||
                std::chrono::steady_clock::now() >= establishment_deadline)
@@ -1291,7 +1367,7 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
 
         if(opened)
         {
-            if(impl->config.delivery_mode == DeliveryMode::Push)
+            if(impl->delivery_mode == DeliveryMode::Push)
             {
                 impl->dispatch = std::thread([worker = impl] { worker->dispatch_loop(); });
             }
@@ -1313,7 +1389,7 @@ SubscriberState Subscription::state() const noexcept
 
 int Subscription::fd() const noexcept
 {
-    return impl_->config.delivery_mode == DeliveryMode::Pull ? impl_->delivery->fd() : -1;
+    return impl_->delivery_mode == DeliveryMode::Pull ? impl_->delivery->fd() : -1;
 }
 
 Geometry Subscription::geometry() const noexcept

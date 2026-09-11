@@ -24,8 +24,18 @@ them. Interpreting a frame never requires a Tango round-trip.
 _Avoid_: message, image, event, sample
 
 **Delivered frame**:
-A frame the subscriber has handed to the application, still occupying the slot it landed in.
+A frame the subscriber has handed to the application, either copied or borrowed.
 _Avoid_: received frame, buffer
+
+**Borrowed frame**:
+A delivered frame that still refers to its receive slot. Its last retained view holds the
+credit that prevents that slot from being reused.
+_Avoid_: zero-copy buffer, borrowed lease
+
+**Copied frame**:
+A delivered frame in application-owned memory. Retaining it does not withhold credit for
+the receive slot from which it was copied.
+_Avoid_: detached buffer, fallback frame
 
 **Geometry**:
 The negotiated description of a frame's array shape — element type, rank, shape, strides,
@@ -62,11 +72,31 @@ What the publisher answers an open request with: the geometry, ring depth, credi
 lease terms it will actually honour. Only ever clamped downward from what was asked for.
 _Avoid_: negotiation result, agreement, settings
 
+**Flow policy**:
+Whether one Session is lossy or lossless when it lacks credit. A lossy Session may miss frames;
+a lossless Session contributes backpressure and preserves a frame until application handoff or
+until its Lease requires eviction. For a copied frame, handoff is when the application takes it;
+for a borrowed frame, slot ownership continues until the last view is released.
+_Avoid_: loss policy, fan-out mode (that is the current publisher-wide implementation)
+
+**Recovery policy**:
+Whether a Subscription tries to establish a replacement Session after a transient coordination
+or transport failure, or fails immediately. It does not change whether frames may be lost.
+_Avoid_: loss policy, reconnect policy
+
+**Queue policy**:
+Which delivered frame a Subscription preserves when its local delivery queue is full.
+`PreserveOrder` keeps frames already queued; `PreferFresh` replaces the oldest queued copied frame
+and is invalid for borrowed or lossless delivery. It does not change a Session's flow policy.
+_Avoid_: drop policy, flow policy
+
 **Subscription**:
-One client's side of a session: the act of asking for one, the memory pinned for it, and the
-state it is in. A session is what the publisher granted; a subscription is what the client
-holds. Their states are named separately for that reason — the publisher's wire-level view of a
-session is not the client's view of its subscription.
+One client's continuing attachment to one bulk stream: the act of asking for sessions, the
+memory pinned for receiving them, and the client-visible state and delivery lifetime. A
+subscription may span successive sessions when reconnect replaces one that was lost or expired.
+A session is what the publisher granted; a subscription is what the client holds. Their states
+are named separately for that reason — the publisher's wire-level view of a session is not the
+client's view of its subscription.
 _Avoid_: subscriber (that is the party, not the thing it holds)
 
 **Probe**:
@@ -86,14 +116,24 @@ One frame-sized division of a receive ring. Which slot a frame lands in is its s
 the ring depth.
 _Avoid_: cell, entry, bucket
 
+**Publisher slot**:
+One frame-sized region the publisher makes available for an application to fill and publish.
+It remains occupied until every session that received its frame has relinquished it.
+_Avoid_: producer buffer, source buffer
+
+**Slot handle**:
+An application's exclusive hold on a publisher slot before publication. It keeps that
+storage valid even after the publisher closes; releasing it gives up the hold.
+_Avoid_: producer lease, buffer token
+
 **Credit**:
 A subscriber's permission for the publisher to reuse one slot, returned when the last view of
 that frame is released. Withholding credit is backpressure, not a leak.
 _Avoid_: ack, token, permit
 
 **Pinned budget**:
-How much registered memory one subscription may hold. Ring depth and maximum frame size are
-derived from it, not asked for separately.
+How much registered memory one subscription may hold, including receive rings retained
+from earlier sessions. Ring depth and maximum frame size are derived from it.
 _Avoid_: memory limit, quota
 
 ### The control plane's structure

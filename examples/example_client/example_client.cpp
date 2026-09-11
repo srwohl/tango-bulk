@@ -62,8 +62,8 @@ int main(int argc, char *argv[])
         // shaped preflight. This is conservative but safe for any valid peer.
         TangoBulk::SubscriberConfig config;
         config.stream_name = stream;
-        config.receive_plan = TangoBulk::ReceivePlan::from_limits(
-            TangoBulk::k_max_frame_bytes_hard_cap, TangoBulk::k_min_ring_depth, 2);
+        config.receive_plan = TangoBulk::ReceivePlan{
+            TangoBulk::k_max_frame_bytes_hard_cap, TangoBulk::k_min_ring_depth, 2};
 
         // The default Push mode. A library-owned dispatch thread invokes the callback, so
         // it never runs on the UCX engine thread (5.2) -- which is what lets a
@@ -73,7 +73,7 @@ int main(int argc, char *argv[])
 
         // 4.1: keep trying when the link drops, up to ten times with an
         // exponential backoff capped at the lease TTL.
-        config.reconnect_policy = TangoBulk::ReconnectPolicy::BoundedRetry;
+        config.recovery_policy = TangoBulk::RecoveryPolicy::Reconnect;
 
         std::atomic<std::uint64_t> frames{0};
         std::atomic<std::uint64_t> bytes{0};

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include <core/subscription_internal.h>
+#include <core/subscriber_transport.h>
 
 #include <tango-bulk/protocol.h>
 #include <tango-bulk/tango.h>
@@ -374,41 +374,32 @@ std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
                                         SubscriptionCallbacks callbacks,
                                         const CommandNames &names)
 {
-    // Reject local configuration before spending the shared establishment
-    // budget on a Tango discovery read.
-    if(const Status status = config.validate(); status != Status::Ok)
-    {
-        throw BulkException(BulkError{
-            status, std::string("invalid SubscriberConfig: ") + to_string(status), "tango"});
-    }
-
     const auto discovery_deadline =
         std::chrono::steady_clock::now() +
         std::chrono::milliseconds(config.establishment_timeout_ms);
-    if(!config.discovery_offer)
+    TangoStreamDiscovery discovery(proxy, config.command_timeout_ms);
+    StreamOffer offer = discovery.discover(config.stream_name, discovery_deadline);
+    if(!offer.available())
     {
-        TangoStreamDiscovery discovery(proxy, config.command_timeout_ms);
-        const StreamOffer offer = discovery.discover(config.stream_name, discovery_deadline);
-        if(!offer.available())
-        {
-            const Status status = discovery_failure_status(offer);
-            throw BulkException(BulkError{status,
-                                          offer.message.empty() ? "BulkStreams discovery failed"
-                                                                : offer.message,
-                                          "tango"});
-        }
-        config.discovery_offer = offer;
-
+        const Status status = discovery_failure_status(offer);
+        throw BulkException(BulkError{status,
+                                      offer.message.empty() ? "BulkStreams discovery failed"
+                                                            : offer.message,
+                                      "tango"});
     }
 
     const auto adapter = std::make_shared<CommandChannel>(proxy, names, config.command_timeout_ms);
+    detail::TransportFactory transport_factory =
+        detail::make_subscriber_transport_factory(config);
 
-    return detail::SubscriptionFactory::open_default(
+    return detail::open_subscription(
         std::move(config),
+        std::move(offer),
         [adapter](Protocol::CoordType kind,
                   const std::vector<std::byte> &request,
                   std::chrono::steady_clock::time_point deadline)
         { return adapter->command(kind, request, deadline); },
+        std::move(transport_factory),
         std::move(callbacks),
         discovery_deadline);
 }
