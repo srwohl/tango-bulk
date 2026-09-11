@@ -474,10 +474,9 @@ TEST_CASE("A publisher admits no more sessions than it was configured for", "[m3
     std::unique_ptr<Subscription> first = open_subscription(publisher, subscriber, record_open);
     std::unique_ptr<Subscription> second = open_subscription(publisher, subscriber, record_open);
     REQUIRE(grants.size() == 2);
-    const Protocol::OpenReply &a = grants[0];
-    const Protocol::OpenReply &b = grants[1];
-    CHECK(b.status == Status::Ok);
-    CHECK(a.session_id != b.session_id);
+    const Protocol::SessionId first_session_id = grants[0].session_id;
+    CHECK(grants[1].status == Status::Ok);
+    CHECK(first_session_id != grants[1].session_id);
 
     // 6.1 bounds sessions per publisher, and 4.4 says a client that leaks them
     // "hits TooManySessions and that is correct feedback".
@@ -500,8 +499,7 @@ TEST_CASE("A publisher admits no more sessions than it was configured for", "[m3
 
     std::unique_ptr<Subscription> third = open_subscription(publisher, subscriber, record_open);
     REQUIRE(grants.size() == 3);
-    const Protocol::OpenReply &c = grants[2];
-    CHECK(c.session_id != a.session_id);
+    CHECK(grants[2].session_id != first_session_id);
 
     second->close();
     third->close();

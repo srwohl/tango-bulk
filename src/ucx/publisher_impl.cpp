@@ -331,6 +331,12 @@ struct BulkPublisher::Impl
         std::uint64_t processed_ordinal{0};
         std::size_t sends_inflight{0};
         std::atomic<std::uint64_t> observed_lag_frames{0};
+
+        // A successful CloseReply is the subscriber's permission to destroy its
+        // transport. Keep it waiting until the engine has closed this endpoint,
+        // otherwise a burst can strand rendezvous sends when the peer disappears.
+        std::mutex teardown_mutex;
+        std::condition_variable teardown_done;
     };
 
     /// Endpoint creation is a `ucp_*` call, so it belongs to the engine thread
@@ -1151,6 +1157,7 @@ struct BulkPublisher::Impl
         // which of the two things happened (3.7), and is only reused when a new
         // Open has nowhere else to go.
         session.state.store(SessionState::Closed, std::memory_order_release);
+        session.teardown_done.notify_all();
 
         refresh_gauges();
     }
@@ -1984,8 +1991,22 @@ CoordinationReply BulkPublisher::Impl::handle_close(const Protocol::CloseRequest
     }
 
     // Teardown itself belongs to the engine: steps 2 and 3 of 4.2 are ucp_*
-    // calls on the worker.  The reply does not wait for it -- the counters it
-    // carries are diagnostics, and 3.8 asks for idempotence, not synchrony.
+    // calls on the worker. Close is synchronous and bounded; returning before
+    // the endpoint is closed lets the subscriber destroy the peer while sends
+    // are still in flight.
+    {
+        std::unique_lock<std::mutex> teardown_lock(session->teardown_mutex);
+        (void)session->teardown_done.wait_for(
+            teardown_lock,
+            k_teardown_budget,
+            [session]
+            {
+                return session->state.load(std::memory_order_acquire) == SessionState::Closed;
+            });
+    }
+
+    reply.frames_credited_final =
+        static_cast<std::uint32_t>(counters.frames_credited.load(std::memory_order_relaxed));
     reply.status = Status::Ok;
     return typed_reply(std::move(reply));
 }

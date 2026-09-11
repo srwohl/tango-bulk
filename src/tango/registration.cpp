@@ -165,7 +165,7 @@ class ScalarObservationAttribute final : public Tango::Attr
             value = snapshot.worst_lag_frames;
             break;
         }
-        attribute.set_value(&value);
+        attribute.set_value(new Tango::DevULong64(value), 1, 0, true);
     }
 
   private:
@@ -183,12 +183,8 @@ class BulkTransportAttribute final : public Tango::Attr
     void read(Tango::DeviceImpl *device, Tango::Attribute &attribute) override
     {
         const PublisherSnapshot snapshot = snapshot_for(device);
-        // Tango retains scalar string storage until the read is serialized;
-        // thread-local backing keeps separate device reads independent.
-        thread_local std::string value;
-        value = snapshot.transport;
-        Tango::DevString raw_value = const_cast<char *>(value.c_str());
-        attribute.set_value(&raw_value);
+        auto *value = new Tango::DevString(Tango::string_dup(snapshot.transport.c_str()));
+        attribute.set_value(value, 1, 0, true);
     }
 };
 

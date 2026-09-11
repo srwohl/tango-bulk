@@ -306,6 +306,11 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
 
     REQUIRE(saw_queue_full);
     CHECK(slice.publisher.counters().dropped_queue_full >= 1);
+
+    slice.subscription->close();
+    REQUIRE(eventually([&] { return slice.publisher.counters().sessions_closed == 1; }));
+    CHECK(slice.publisher.counters().frames_completed ==
+          slice.publisher.counters().frames_submitted);
 }
 
 TEST_CASE("A consumer can wait on the transport's descriptor from its own loop",
