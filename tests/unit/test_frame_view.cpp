@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include <tango-bulk/frame.h>
-#include <core/frame_fields.h>
+#include <core/frame_description.h>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -20,7 +20,7 @@ namespace
 struct Frame
 {
     std::shared_ptr<std::vector<std::uint16_t>> pixels;
-    detail::FrameFields fields;
+    detail::FrameDescription fields;
 };
 
 Frame make_frame(std::uint64_t height, std::uint64_t width)
@@ -154,7 +154,7 @@ TEST_CASE("a detached view accepts a null owner and an unreadable pointer",
     // A device pointer is the case this supports: detached() must not
     // dereference `data`, so a caller can build a view over GPU memory to
     // exercise a callback without a GPU present.
-    detail::FrameFields fields;
+    detail::FrameDescription fields;
     fields.rank = 2;
     fields.shape = {2208, 3216, 0, 0};
     fields.strides = {3216 * 2, 2, 0, 0};
@@ -175,13 +175,12 @@ TEST_CASE("a detached view accepts a null owner and an unreadable pointer",
     CHECK(view.memory_kind() == MemoryKind::Cuda);
 }
 
-TEST_CASE("a copied view is not borrowed, whatever its fields said", "[frame]")
+TEST_CASE("a copied view is not borrowed", "[frame]")
 {
-    Frame frame = make_frame(2, 2);
-    frame.fields.borrowed = true;
-    const FrameView view = detach(frame);
+    const FrameView view = detach(make_frame(2, 2));
     CHECK(view);
     CHECK_FALSE(view.borrowed());
+    CHECK_FALSE(FrameView{}.borrowed());
 }
 
 TEST_CASE("a default-constructed view is disengaged", "[frame]")

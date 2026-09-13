@@ -6,10 +6,10 @@
 #define TANGO_BULK_TESTS_UNIT_FAKE_TRANSPORT_H
 
 #include <core/delivery_queue.h>
-#include <core/frame_fields.h>
+#include <core/frame_description.h>
 #include <core/subscription_internal.h>
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 #include <tango-bulk/subscription.h>
 
 #include <algorithm>
@@ -33,7 +33,7 @@ using namespace std::chrono_literals;
 struct ScriptedFrame
 {
     std::shared_ptr<std::vector<std::uint16_t>> payload;
-    detail::FrameFields fields;
+    detail::FrameDescription fields;
 
     const std::byte *bytes() const noexcept
     {
@@ -158,12 +158,12 @@ struct Script
         return Protocol::encode(reply, correlation_id);
     }
 
-    Protocol::GeometryBlock grant_locked()
+    Geometry grant_locked()
     {
         const bool reshaped = reshape_after_first && grants_made > 0;
         ++grants_made;
 
-        Protocol::GeometryBlock granted;
+        Geometry granted;
         granted.generation = 1;
         granted.element_type = ElementType::UInt16;
         granted.element_size = 2;
@@ -180,7 +180,7 @@ struct Script
         return granted;
     }
 
-    Protocol::GeometryBlock last_grant{};
+    Geometry last_grant{};
 
     static Status next_status(std::deque<Status> &scripted)
     {
@@ -285,7 +285,7 @@ class FakeTransport final : public detail::SubscriberTransport
     }
 
     Status activate(Protocol::StreamId,
-                    const Protocol::GeometryBlock &,
+                    const Geometry &,
                     const std::vector<std::byte> &) override
     {
         script_.activations.fetch_add(1, std::memory_order_relaxed);

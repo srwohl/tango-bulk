@@ -10,7 +10,7 @@
 
 #include "wire_helpers.h"
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -21,9 +21,9 @@ using namespace TangoBulk::test;
 namespace
 {
 
-GeometryBlock filled_geometry()
+Geometry filled_geometry()
 {
-    GeometryBlock g;
+    Geometry g;
     g.generation = 12;
     g.element_type = ElementType::Float32;
     g.element_size = 4;

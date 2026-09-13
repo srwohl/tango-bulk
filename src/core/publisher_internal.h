@@ -5,7 +5,7 @@
 #ifndef TANGO_BULK_SRC_CORE_PUBLISHER_INTERNAL_H
 #define TANGO_BULK_SRC_CORE_PUBLISHER_INTERNAL_H
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 #include <tango-bulk/publisher.h>
 
 #include <cstddef>

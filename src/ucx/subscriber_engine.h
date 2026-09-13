@@ -17,7 +17,7 @@
 #include <core/receive_slot.h>
 #include <core/subscriber_transport.h>
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 #include <tango-bulk/subscriber.h>
 
 #include <atomic>
@@ -147,7 +147,7 @@ class SubscriberEngine final : public SubscriberTransport
     }
 
     Status activate(Protocol::StreamId stream_id,
-                    const Protocol::GeometryBlock &granted,
+                    const Geometry &granted,
                     const std::vector<std::byte> &server_address) override;
 
     BulkError last_error() const noexcept override;
@@ -291,7 +291,7 @@ class SubscriberEngine final : public SubscriberTransport
     ucp_ep_h endpoint_{nullptr};
 
     Protocol::StreamId stream_id_{0};
-    Protocol::GeometryBlock granted_{};
+    Geometry granted_{};
 
     /// Where this subscriber's ring, NIC and engine landed.  Engine thread
     /// writes it when the probe is answered; read for diagnostics only.

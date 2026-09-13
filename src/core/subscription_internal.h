@@ -7,7 +7,7 @@
 
 #include <core/subscriber_transport.h>
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 #include <tango-bulk/subscription.h>
 
 #include <chrono>

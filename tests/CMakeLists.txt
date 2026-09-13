@@ -94,8 +94,10 @@ if(TANGO_BULK_BUILD_TANGO_ADAPTER)
     target_link_libraries(tango-bulk-tango-tests PRIVATE tango-bulk::tango
                                                          Catch2::Catch2WithMain)
 
+    # src for the coordination codec the adapter tests speak directly.
     target_include_directories(tango-bulk-tango-tests
-                               PRIVATE ${PROJECT_SOURCE_DIR}/src/tango)
+                               PRIVATE ${PROJECT_SOURCE_DIR}/src
+                                       ${PROJECT_SOURCE_DIR}/src/tango)
 
     # The test spawns the fixture, so it needs to know where it landed.  A
     # generator expression rather than a guessed path: multi-config generators

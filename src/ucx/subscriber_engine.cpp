@@ -8,7 +8,7 @@
 #include <ucx/locality.h>
 
 #include <core/cpu_topology.h>
-#include <core/frame_fields.h>
+#include <core/frame_description.h>
 
 #include <cassert>
 #include <cstdio>
@@ -291,7 +291,7 @@ void SubscriberEngine::register_am_handlers()
 // without a NIC.
 
 Status SubscriberEngine::activate(Protocol::StreamId stream_id,
-                                  const Protocol::GeometryBlock &granted,
+                                  const Geometry &granted,
                                   const std::vector<std::byte> &server_address)
 {
     stream_id_ = stream_id;
@@ -723,21 +723,15 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
         return UCS_OK;
     }
 
-    const Protocol::GeometryBlock &granted = granted_;
-    if(granted.rank != 0)
+    if(granted_.rank != 0 && !describes_same_array(frame, granted_))
     {
-        if(frame.element_type != granted.element_type ||
-           frame.element_size != granted.element_size || frame.rank != granted.rank ||
-           frame.shape != granted.shape || frame.strides != granted.strides)
-        {
-            dropped_geometry_mismatch_.fetch_add(1, std::memory_order_relaxed);
-            tracker_.release(frame.sequence);
+        dropped_geometry_mismatch_.fetch_add(1, std::memory_order_relaxed);
+        tracker_.release(frame.sequence);
 
-            fail(Status::GeometryMismatch,
-                 "a frame described a different array from the one this session "
-                 "granted; the publisher changed a contract term without reopening");
-            return UCS_OK;
-        }
+        fail(Status::GeometryMismatch,
+             "a frame described a different array from the one this session "
+             "granted; the publisher changed a contract term without reopening");
+        return UCS_OK;
     }
 
     // Past here the sequence is in *this* window, so dropping the frame has to
@@ -775,23 +769,10 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
     }
 
     slot.occupied = true;
-    slot.fields.shape = frame.shape;
-    slot.fields.strides = frame.strides;
-    slot.fields.sequence = frame.sequence;
-    slot.fields.event_counter = frame.event_counter;
-    slot.fields.timestamp_ns = frame.timestamp_ns;
-    slot.fields.dropped_before = frame.dropped_before;
-    slot.fields.payload_bytes = frame.payload_bytes;
-    slot.fields.element_type = frame.element_type;
-    slot.fields.element_size = frame.element_size;
-    slot.fields.rank = frame.rank;
-    slot.fields.quality = frame.quality;
-    slot.fields.generation = frame.generation;
+    slot.fields = frame;
     // FrameView describes the memory the application receives, not the
     // publisher's source allocation. They differ for GPUDirect receives.
     slot.fields.memory_kind = memory_kind_;
-    slot.fields.endian = frame.endian;
-    slot.fields.borrowed = true;
 
     if((param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) != 0)
     {

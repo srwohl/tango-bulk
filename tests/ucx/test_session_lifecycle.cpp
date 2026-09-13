@@ -4,7 +4,7 @@
 
 #include "slice.h"
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include <catch2/catch_test_macros.hpp>
 

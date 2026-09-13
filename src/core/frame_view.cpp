@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include <core/receive_slot.h>
-#include <core/frame_fields.h>
+#include <core/frame_description.h>
 
 #include <tango-bulk/frame.h>
 
@@ -18,9 +18,9 @@ namespace
 /// delivery operation can return one when there is nothing to deliver -- so every accessor has to
 /// answer something. Zeroes throughout, and `operator bool` is the way to tell
 /// the two cases apart.
-const detail::FrameFields &empty_fields() noexcept
+const detail::FrameDescription &empty_fields() noexcept
 {
-    static const detail::FrameFields k_empty{};
+    static const detail::FrameDescription k_empty{};
     return k_empty;
 }
 
@@ -41,11 +41,10 @@ class CopiedFrameSink final : public detail::CreditSink
 {
   public:
     CopiedFrameSink(std::shared_ptr<const void> owner,
-                    const detail::FrameFields &fields) :
+                    const detail::FrameDescription &fields) :
         owner_(std::move(owner)),
         fields_(fields)
     {
-        fields_.borrowed = false;
     }
 
     void return_credit(std::uint64_t) noexcept override
@@ -54,24 +53,26 @@ class CopiedFrameSink final : public detail::CreditSink
         // empty; the owner is released by the destructor.
     }
 
-    const detail::FrameFields *fields() const noexcept
+    const detail::FrameDescription *fields() const noexcept
     {
         return &fields_;
     }
 
   private:
     std::shared_ptr<const void> owner_;
-    detail::FrameFields fields_;
+    detail::FrameDescription fields_;
 };
 
 } // namespace
 
 FrameView::FrameView(std::shared_ptr<detail::ReceiveSlotLease> lease,
                      const std::byte *data,
-                     const detail::FrameFields *fields) noexcept :
+                     const detail::FrameDescription *fields,
+                     bool borrowed) noexcept :
     lease_(std::move(lease)),
     data_(data),
-    fields_(fields)
+    fields_(fields),
+    borrowed_(borrowed)
 {
 }
 
@@ -80,19 +81,19 @@ namespace detail
 
 FrameView CopiedFrameFactory::make(std::shared_ptr<const void> owner,
                                    const std::byte *data,
-                                   const FrameFields &fields)
+                                   const FrameDescription &fields)
 {
     auto sink = std::make_shared<CopiedFrameSink>(std::move(owner), fields);
 
     // The Fields pointer must outlive every copy of the view, so it is taken
     // from the sink -- which the lease owns and the view holds -- and never
     // from the caller's argument.
-    const detail::FrameFields *stored = sink->fields();
+    const detail::FrameDescription *stored = sink->fields();
 
     auto lease = std::make_shared<detail::ReceiveSlotLease>(std::move(sink),
                                                             fields.sequence);
 
-    return FrameView(std::move(lease), data, stored);
+    return FrameView(std::move(lease), data, stored, false);
 }
 
 } // namespace detail
@@ -189,7 +190,7 @@ Endian FrameView::endian() const noexcept
 
 bool FrameView::borrowed() const noexcept
 {
-    return fields_ != nullptr && fields_->borrowed;
+    return lease_ != nullptr && borrowed_;
 }
 
 long FrameView::use_count() const noexcept
@@ -205,6 +206,7 @@ void FrameView::reset() noexcept
     // engaged while its slot is already recyclable.
     data_ = nullptr;
     fields_ = nullptr;
+    borrowed_ = false;
     lease_.reset();
 }
 
@@ -230,9 +232,9 @@ ReceiveSlotLease::~ReceiveSlotLease()
 
 FrameView ReceiveSlotLease::make_view(std::shared_ptr<ReceiveSlotLease> lease,
                                       const std::byte *data,
-                                      const FrameFields *fields) noexcept
+                                      const FrameDescription *fields) noexcept
 {
-    return FrameView(std::move(lease), data, fields);
+    return FrameView(std::move(lease), data, fields, true);
 }
 
 } // namespace detail

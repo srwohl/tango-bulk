@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include <core/delivery_queue.h>
-#include <core/geometry_conversion.h>
 #include <core/subscription_internal.h>
 
 #include <algorithm>
@@ -384,7 +383,7 @@ struct Subscription::Impl
             return session_id;
         }
 
-        const Protocol::GeometryBlock &granted_geometry() const noexcept
+        const Geometry &granted_geometry() const noexcept
         {
             return granted;
         }
@@ -403,7 +402,7 @@ struct Subscription::Impl
         Protocol::SessionId session_id{};
         Protocol::StreamId stream_id{0};
         std::vector<std::byte> server_address;
-        Protocol::GeometryBlock granted{};
+        Geometry granted{};
         std::uint32_t lease_ttl_ms{0};
         std::uint32_t renew_interval_ms{0};
     };
@@ -605,7 +604,7 @@ struct Subscription::Impl
             return false;
         }
 
-        const Geometry granted = detail::to_geometry(candidate.granted_geometry());
+        const Geometry &granted = candidate.granted_geometry();
 
         if(expect.check(granted) != Status::Ok)
         {

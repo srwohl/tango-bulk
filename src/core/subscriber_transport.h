@@ -7,7 +7,7 @@
 
 #include <tango-bulk/counters.h>
 #include <tango-bulk/errors.h>
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 #include <tango-bulk/subscription.h>
 
 #include <cstddef>
@@ -33,7 +33,7 @@ class SubscriberTransport
     virtual const std::vector<std::byte> &local_address() const noexcept = 0;
 
     virtual Status activate(Protocol::StreamId stream_id,
-                            const Protocol::GeometryBlock &granted,
+                            const Geometry &granted,
                             const std::vector<std::byte> &server_address) = 0;
 
     virtual BulkError last_error() const noexcept = 0;

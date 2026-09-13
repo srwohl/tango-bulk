@@ -5,7 +5,7 @@
 #ifndef TANGO_BULK_TESTS_UNIT_WIRE_HELPERS_H
 #define TANGO_BULK_TESTS_UNIT_WIRE_HELPERS_H
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include <catch2/catch_test_macros.hpp>
 

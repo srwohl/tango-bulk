@@ -14,25 +14,22 @@
 namespace TangoBulk
 {
 
-/// The immutable array contract negotiated for a stream.
-///
-/// This is the application-facing projection of the wire geometry.  Keeping
-/// it independent of the protocol codec lets bindings expose schema without
-/// making the wire vocabulary part of their ABI.
-struct Geometry
+/// The immutable array contract negotiated for a stream: the array terms, the
+/// epoch and the sizing terms. It is what OpenReply and RenewReply carry, what
+/// a BulkStreams row offers, and what a Subscription reports.
+struct Geometry : ArrayTerms
 {
-    std::uint32_t generation{0};
-    ElementType element_type{ElementType::Unknown};
-    std::uint32_t element_size{0};
-    std::uint32_t rank{0};
+    std::uint32_t generation{0}; ///< epoch; starts at 1, never zero on the wire
     std::uint64_t max_frame_bytes{0};
     std::uint32_t ring_depth{0};
     std::uint32_t credit_window{0};
-    std::array<std::uint64_t, k_max_rank> shape{};
-    std::array<std::uint64_t, k_max_rank> strides{};
 
+    /// Applied on every receipt, not only on Open. A geometry that fails this
+    /// is never partially adopted. generation == 0 is rejected: zero means
+    /// "never armed" and is legal only as a local sentinel.
     Status validate() const noexcept;
-    std::uint64_t reachable_span() const noexcept;
+
+    /// The array terms alone; see describes_same_array(ArrayTerms, ArrayTerms).
     bool describes_same_array(const Geometry &other) const noexcept;
 };
 

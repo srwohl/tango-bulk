@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include <core/delivery_queue.h>
-#include <core/frame_fields.h>
+#include <core/frame_description.h>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -26,7 +26,7 @@ using namespace std::chrono_literals;
 FrameView frame_over(const std::shared_ptr<std::vector<std::uint16_t>> &payload,
                      std::uint64_t sequence)
 {
-    detail::FrameFields fields;
+    detail::FrameDescription fields;
     fields.element_type = ElementType::UInt16;
     fields.element_size = 2;
     fields.rank = 1;

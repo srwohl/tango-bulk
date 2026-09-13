@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include "core/byte_order.h"
 

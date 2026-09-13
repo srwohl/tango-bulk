@@ -37,9 +37,15 @@ A delivered frame in application-owned memory. Retaining it does not withhold cr
 the receive slot from which it was copied.
 _Avoid_: detached buffer, fallback frame
 
+**Array terms**:
+Element type, element size, rank, shape and strides: what one payload is. A Geometry, a
+producer's frame metadata and a delivered frame all carry the same array terms, and
+"describes the same array" compares only these.
+_Avoid_: array hint, layout, shape tuple
+
 **Geometry**:
-The negotiated description of a frame's array shape — element type, rank, shape, strides,
-maximum size.
+The negotiated description of a stream — its array terms, its epoch, and the sizing terms
+(maximum frame size, ring depth, credit window). It is what the session contract carries.
 _Avoid_: layout, format, schema (reserved for the Python client's view of a geometry)
 
 **Geometry epoch**:

@@ -189,10 +189,16 @@ TEST_CASE("the client instance id is stable across reopen", "[core][subscription
     auto subscription =
         open_test_subscription(subscription_options(), fake_channel(script), fake_factory(script));
 
-    REQUIRE(eventually([&script] { return script.transports_built.load() >= 2; }));
+    // The second Open records its id after its transport is built, so wait on
+    // the ids, not on the transport count.
+    REQUIRE(eventually(
+        [&script]
+        {
+            std::lock_guard<std::mutex> lock(script.mutex);
+            return script.client_ids.size() >= 2;
+        }));
 
     std::lock_guard<std::mutex> lock(script.mutex);
-    REQUIRE(script.client_ids.size() >= 2);
     CHECK_FALSE(script.client_ids.front().is_zero());
     for(const Protocol::ClientInstanceId &id : script.client_ids)
     {

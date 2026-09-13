@@ -6,7 +6,7 @@
 // header inside src/tango/ cannot be spelled <tango/...>.
 #include "bulk_commands.h"
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include <tango/tango.h>
 

@@ -12,7 +12,7 @@
 #include <core/delivery_queue.h>
 #include <core/publisher_internal.h>
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include <memory>
 #include <utility>

@@ -13,8 +13,8 @@
 
 /// The array-description rules, in one place.
 ///
-/// Three call sites need them: a GeometryBlock arriving off the coordination
-/// plane, a FrameMetadata supplied by a producer, and a Frame header arriving in
+/// Three call sites need them: a Geometry arriving off the coordination
+/// plane, a FrameMetadata supplied by a producer, and a FrameHeader arriving in
 /// an AM callback.  One implementation means a bound tightened in review is
 /// tightened for all three, which is the entire reason the spec specifies a
 /// single validator rather than three checks that happen to agree.

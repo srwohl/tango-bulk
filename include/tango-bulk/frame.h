@@ -53,18 +53,33 @@ const char *to_string(MemoryKind kind) noexcept;
 /// Bytes per element, or 0 for ElementType::Unknown.
 std::uint32_t element_size_of(ElementType type) noexcept;
 
+/// The array terms: what a payload is, as far as the protocol knows. Spelled
+/// once; a stream's Geometry, a producer's FrameMetadata and a delivered
+/// frame's description all extend it, so the three never disagree about what
+/// an array is.
+struct ArrayTerms
+{
+    ElementType element_type{ElementType::Unknown};
+    std::uint32_t element_size{0}; ///< bytes; FrameMetadata infers 0 via element_size_of()
+    std::uint32_t rank{0};         ///< 0..k_max_rank
+    std::array<std::uint64_t, k_max_rank> shape{};
+    std::array<std::uint64_t, k_max_rank> strides{}; ///< bytes; FrameMetadata infers 0 as C-contiguous
+};
+
+/// The one "same array?" question. The epoch and the sizing terms are not
+/// array terms. The engine retires a Session on a frame that fails this
+/// against the grant, a reopen fails on a grant that fails it against the
+/// retired Geometry, and a publisher refuses a frame that fails it against
+/// its configured metadata.
+bool describes_same_array(const ArrayTerms &a, const ArrayTerms &b) noexcept;
+
 /// Producer-supplied description of one frame.
 ///
 /// Populated from device state, never derived from an AttributeValue_5 or any
 /// other CDR object.  That is the point: a bulk frame is self-contained, and
 /// nothing about interpreting it requires a Tango round trip.
-struct FrameMetadata
+struct FrameMetadata : ArrayTerms
 {
-    ElementType element_type{ElementType::Unknown};
-    std::uint32_t element_size{0}; ///< 0 => infer via element_size_of()
-    std::uint32_t rank{0};         ///< 0..k_max_rank
-    std::array<std::uint64_t, k_max_rank> shape{};
-    std::array<std::uint64_t, k_max_rank> strides{}; ///< bytes; 0 => infer C-contiguous
     std::uint64_t payload_bytes{0};  ///< 0 => infer from shape x element_size
     std::uint64_t timestamp_ns{0};   ///< CLOCK_REALTIME; 0 => stamp at publish
     std::uint64_t event_counter{0};  ///< producer-defined; opaque to the protocol
@@ -87,12 +102,10 @@ struct FrameMetadata
     Status validate(std::uint64_t max_frame_bytes) const noexcept;
 };
 
-bool describes_same_array(const FrameMetadata &a, const FrameMetadata &b) noexcept;
-
 namespace detail
 {
 class ReceiveSlotLease;
-struct FrameFields;
+struct FrameDescription;
 class CopiedFrameFactory;
 } // namespace detail
 
@@ -153,11 +166,13 @@ class FrameView
 
     FrameView(std::shared_ptr<detail::ReceiveSlotLease> lease,
               const std::byte *data,
-              const detail::FrameFields *fields) noexcept;
+              const detail::FrameDescription *fields,
+              bool borrowed) noexcept;
 
     std::shared_ptr<detail::ReceiveSlotLease> lease_;
     const std::byte *data_{nullptr};
-    const detail::FrameFields *fields_{nullptr};
+    const detail::FrameDescription *fields_{nullptr};
+    bool borrowed_{false};
 };
 
 } // namespace TangoBulk

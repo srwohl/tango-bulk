@@ -4,7 +4,7 @@
 
 // Identifier generation and rendering (spec 3.2).
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>

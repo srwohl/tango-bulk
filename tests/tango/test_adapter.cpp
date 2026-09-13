@@ -5,7 +5,7 @@
 #include "command_discovery.h"
 #include "device_server.h"
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 #include <tango-bulk/tango.h>
 
 #include <tango/tango.h>

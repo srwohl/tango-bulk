@@ -3,9 +3,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include <tango-bulk/frame.h>
-#include <tango-bulk/limits.h>
-#include <tango-bulk/protocol.h>
 #include <tango-bulk/geometry.h>
+#include <tango-bulk/limits.h>
 
 #include "core/byte_order.h"
 #include "core/geometry_rules.h"
@@ -122,70 +121,54 @@ Status validate_element_size(ElementType type, std::uint32_t element_size) noexc
 
 } // namespace detail
 
-Status Geometry::validate() const noexcept
+bool describes_same_array(const ArrayTerms &a, const ArrayTerms &b) noexcept
 {
-    Protocol::GeometryBlock wire;
-    wire.generation = generation;
-    wire.element_type = element_type;
-    wire.element_size = element_size;
-    wire.rank = rank;
-    wire.max_frame_bytes = max_frame_bytes;
-    wire.ring_depth = ring_depth;
-    wire.credit_window = credit_window;
-    wire.shape = shape;
-    wire.strides = strides;
-    return wire.validate();
+    return a.element_type == b.element_type && a.element_size == b.element_size &&
+           a.rank == b.rank && a.shape == b.shape && a.strides == b.strides;
 }
 
-std::uint64_t Geometry::reachable_span() const noexcept
+Status Geometry::validate() const noexcept
 {
-    if(validate() != Status::Ok)
+    if(generation == 0)
     {
-        return 0;
+        return Status::GeometryMismatch;
     }
 
-    bool empty = false;
-    for(std::uint32_t i = 0; i < rank; ++i)
+    if(const Status status = detail::validate_element_size(element_type, element_size);
+       status != Status::Ok)
     {
-        if(shape[i] == 0)
-        {
-            empty = true;
-            break;
-        }
+        return status;
     }
 
-    if(empty)
+    if(max_frame_bytes < k_min_frame_bytes || max_frame_bytes > k_max_frame_bytes_hard_cap)
     {
-        return 0;
+        return Status::FrameTooLarge;
     }
 
-    std::uint64_t span = element_size;
-    for(std::uint32_t i = 0; i < rank; ++i)
+    if(ring_depth < k_min_ring_depth || ring_depth > k_max_ring_depth)
     {
-        const std::uint64_t reach = (shape[i] - 1) * strides[i];
-        if(span > UINT64_MAX - reach)
-        {
-            return 0;
-        }
-        span += reach;
+        return Status::DepthTooLarge;
     }
-    return span;
+
+    if(credit_window == 0 || credit_window > ring_depth)
+    {
+        return Status::DepthTooLarge;
+    }
+
+    return detail::validate_shape_and_strides(rank, shape, strides, element_size,
+                                              max_frame_bytes);
 }
 
 bool Geometry::describes_same_array(const Geometry &other) const noexcept
 {
-    return element_type == other.element_type && element_size == other.element_size &&
-           rank == other.rank && shape == other.shape && strides == other.strides;
+    return TangoBulk::describes_same_array(*this, other);
 }
 
 bool operator==(const Geometry &left, const Geometry &right) noexcept
 {
-    return left.generation == right.generation && left.element_type == right.element_type &&
-           left.element_size == right.element_size && left.rank == right.rank &&
+    return describes_same_array(left, right) && left.generation == right.generation &&
            left.max_frame_bytes == right.max_frame_bytes &&
-           left.ring_depth == right.ring_depth &&
-           left.credit_window == right.credit_window && left.shape == right.shape &&
-           left.strides == right.strides;
+           left.ring_depth == right.ring_depth && left.credit_window == right.credit_window;
 }
 
 bool operator!=(const Geometry &left, const Geometry &right) noexcept
@@ -450,43 +433,14 @@ std::string StreamOffer::to_bulk_stream_row() const
 bool operator==(const StreamOffer &left, const StreamOffer &right) noexcept
 {
     return left.version == right.version && left.stream_name == right.stream_name &&
-           left.geometry.generation == right.geometry.generation &&
-           left.geometry.element_type == right.geometry.element_type &&
-           left.geometry.element_size == right.geometry.element_size &&
-           left.geometry.rank == right.geometry.rank &&
-           left.geometry.max_frame_bytes == right.geometry.max_frame_bytes &&
-           left.geometry.ring_depth == right.geometry.ring_depth &&
-           left.geometry.credit_window == right.geometry.credit_window &&
-           left.geometry.shape == right.geometry.shape &&
-           left.geometry.strides == right.geometry.strides && left.age_ms == right.age_ms &&
-           left.status == right.status &&
-           left.message == right.message;
+           left.geometry == right.geometry && left.age_ms == right.age_ms &&
+           left.status == right.status && left.message == right.message;
 }
 
 bool operator!=(const StreamOffer &left, const StreamOffer &right) noexcept
 {
     return !(left == right);
 }
-
-namespace detail
-{
-
-Geometry to_geometry(const Protocol::GeometryBlock &wire) noexcept
-{
-    Geometry out;
-    out.generation = wire.generation;
-    out.element_type = wire.element_type;
-    out.element_size = wire.element_size;
-    out.rank = wire.rank;
-    out.max_frame_bytes = wire.max_frame_bytes;
-    out.ring_depth = wire.ring_depth;
-    out.credit_window = wire.credit_window;
-    out.shape = wire.shape;
-    out.strides = wire.strides;
-    return out;
-}
-
-} // namespace detail
 
 namespace
 {
@@ -513,71 +467,6 @@ void fill_contiguous_strides(std::uint32_t rank,
 }
 
 } // namespace
-
-Status Protocol::GeometryBlock::validate() const noexcept
-{
-    // generation == 0 means "never armed" and is legal only as a local sentinel.
-    // On the wire it is always a real epoch.
-    if(generation == 0)
-    {
-        return Status::GeometryMismatch;
-    }
-
-    if(const Status status = detail::validate_element_size(element_type, element_size);
-       status != Status::Ok)
-    {
-        return status;
-    }
-
-    if(max_frame_bytes < k_min_frame_bytes || max_frame_bytes > k_max_frame_bytes_hard_cap)
-    {
-        return Status::FrameTooLarge;
-    }
-
-    if(ring_depth < k_min_ring_depth || ring_depth > k_max_ring_depth)
-    {
-        return Status::DepthTooLarge;
-    }
-
-    if(credit_window == 0 || credit_window > ring_depth)
-    {
-        return Status::DepthTooLarge;
-    }
-
-    return detail::validate_shape_and_strides(rank, shape, strides, element_size,
-                                              max_frame_bytes);
-}
-
-namespace Protocol
-{
-
-bool operator==(const GeometryBlock &a, const GeometryBlock &b) noexcept
-{
-    return a.generation == b.generation && a.element_type == b.element_type &&
-           a.element_size == b.element_size && a.rank == b.rank &&
-           a.max_frame_bytes == b.max_frame_bytes && a.ring_depth == b.ring_depth &&
-           a.credit_window == b.credit_window && a.shape == b.shape &&
-           a.strides == b.strides;
-}
-
-bool operator!=(const GeometryBlock &a, const GeometryBlock &b) noexcept
-{
-    return !(a == b);
-}
-
-bool describes_same_array(const GeometryBlock &a, const GeometryBlock &b) noexcept
-{
-    return a.element_type == b.element_type && a.element_size == b.element_size &&
-           a.rank == b.rank && a.shape == b.shape && a.strides == b.strides;
-}
-
-} // namespace Protocol
-
-bool describes_same_array(const FrameMetadata &a, const FrameMetadata &b) noexcept
-{
-    return a.element_type == b.element_type && a.element_size == b.element_size &&
-           a.rank == b.rank && a.shape == b.shape && a.strides == b.strides;
-}
 
 Status FrameMetadata::resolve(std::uint64_t max_frame_bytes) noexcept
 {
@@ -648,7 +537,7 @@ Status FrameMetadata::validate(std::uint64_t max_frame_bytes) const noexcept
         return Status::GeometryMismatch;
     }
 
-    // Unlike a GeometryBlock, a producer-supplied metadata with rank > 0 must
+    // Unlike a Geometry, a producer-supplied metadata with rank > 0 must
     // name its element type: the rank claims the payload is an array of
     // something, and "something" is not a description a consumer can act on.
     if(element_type == ElementType::Unknown && rank > 0)

@@ -44,7 +44,7 @@ inline constexpr std::uint64_t k_min_pinned_bytes = 16ull << 20; // 16 MiB
 
 inline constexpr std::size_t k_max_ucx_address_bytes = 4096;
 
-/// Element size bounds, shared by GeometryBlock validation and FrameMetadata.
+/// Element size bounds, shared by Geometry and FrameMetadata validation.
 inline constexpr std::uint32_t k_max_element_size = 256;
 inline constexpr std::uint32_t k_min_element_size = 1;
 

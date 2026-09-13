@@ -12,7 +12,7 @@
 
 #include "wire_helpers.h"
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -45,9 +45,9 @@ OpenRequest sample_open()
     return msg;
 }
 
-GeometryBlock sample_geometry()
+Geometry sample_geometry()
 {
-    GeometryBlock g;
+    Geometry g;
     g.generation = 7;
     g.element_type = ElementType::UInt16;
     g.element_size = 2;
@@ -112,10 +112,10 @@ TEST_CASE("every message type carries its spec msg_type", "[protocol][layout]")
 }
 
 // ---------------------------------------------------------------------------
-// 3.4 GeometryBlock
+// 3.4 Geometry
 // ---------------------------------------------------------------------------
 
-TEST_CASE("GeometryBlock matches spec 3.4 at its embedded offset", "[protocol][layout]")
+TEST_CASE("Geometry matches spec 3.4 at its embedded offset", "[protocol][layout]")
 {
     RenewReply msg;
     msg.geometry = sample_geometry();

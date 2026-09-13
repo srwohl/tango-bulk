@@ -2,11 +2,12 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-// GeometryBlock validation (spec 3.4) and FrameMetadata (spec 2.2).
+// Geometry validation (spec 3.4), FrameMetadata (spec 2.2), and the one
+// array comparison they share with the frame header.
 
 #include <tango-bulk/frame.h>
 #include <tango-bulk/limits.h>
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -16,9 +17,9 @@ using namespace TangoBulk::Protocol;
 namespace
 {
 
-GeometryBlock valid()
+Geometry valid()
 {
-    GeometryBlock g;
+    Geometry g;
     g.generation = 1;
     g.element_type = ElementType::UInt16;
     g.element_size = 2;
@@ -42,14 +43,14 @@ TEST_CASE("generation zero is never legal on the wire", "[core][geometry]")
 {
     // Zero means "never armed" and is a local sentinel only.  A geometry that
     // arrived carrying it would make "no epoch" and "epoch zero" the same value.
-    GeometryBlock g = valid();
+    Geometry g = valid();
     g.generation = 0;
     CHECK(g.validate() == Status::GeometryMismatch);
 }
 
 TEST_CASE("rank bounds are enforced", "[core][geometry]")
 {
-    GeometryBlock g = valid();
+    Geometry g = valid();
 
     SECTION("above the maximum")
     {
@@ -80,7 +81,7 @@ TEST_CASE("rank bounds are enforced", "[core][geometry]")
 
 TEST_CASE("element_size bounds are enforced", "[core][geometry]")
 {
-    GeometryBlock g = valid();
+    Geometry g = valid();
 
     SECTION("zero")
     {
@@ -123,7 +124,7 @@ TEST_CASE("element_size bounds are enforced", "[core][geometry]")
 
 TEST_CASE("frame-size bounds are enforced", "[core][geometry]")
 {
-    GeometryBlock g = valid();
+    Geometry g = valid();
 
     SECTION("zero")
     {
@@ -146,7 +147,7 @@ TEST_CASE("frame-size bounds are enforced", "[core][geometry]")
 
 TEST_CASE("ring depth and credit window bounds are enforced", "[core][geometry]")
 {
-    GeometryBlock g = valid();
+    Geometry g = valid();
 
     SECTION("depth below the minimum")
     {
@@ -182,7 +183,7 @@ TEST_CASE("ring depth and credit window bounds are enforced", "[core][geometry]"
 
 TEST_CASE("shape and stride products are overflow-checked", "[core][geometry]")
 {
-    GeometryBlock g = valid();
+    Geometry g = valid();
 
     SECTION("the element product exceeds max_frame_bytes")
     {
@@ -269,7 +270,7 @@ TEST_CASE("the reachable span is bounded, not the per-axis extent", "[core][geom
 
     SECTION("an empty axis reaches nothing and does not wrap")
     {
-        GeometryBlock g = valid();
+        Geometry g = valid();
         g.shape = {0, 1024, 0, 0};
         g.strides = {2048, 2, 0, 0};
         CHECK(g.validate() == Status::Ok);
@@ -277,7 +278,7 @@ TEST_CASE("the reachable span is bounded, not the per-axis extent", "[core][geom
 
     SECTION("the span itself is overflow-checked")
     {
-        GeometryBlock g = valid();
+        Geometry g = valid();
         g.rank = 2;
         g.shape = {2, 2, 0, 0};
 
@@ -300,26 +301,26 @@ TEST_CASE("geometry equality compares every field", "[core][geometry]")
 {
     // The epoch interlock compares geometries, so a field left out of the
     // comparison is a field that can change without anyone re-arming.
-    const GeometryBlock base = valid();
+    const Geometry base = valid();
 
     CHECK(base == valid());
 
     const auto differs = [&base](auto mutate)
     {
-        GeometryBlock other = base;
+        Geometry other = base;
         mutate(other);
         return base != other;
     };
 
-    CHECK(differs([](GeometryBlock &g) { g.generation = 2; }));
-    CHECK(differs([](GeometryBlock &g) { g.element_type = ElementType::Int16; }));
-    CHECK(differs([](GeometryBlock &g) { g.element_size = 4; }));
-    CHECK(differs([](GeometryBlock &g) { g.rank = 1; }));
-    CHECK(differs([](GeometryBlock &g) { g.max_frame_bytes = 1; }));
-    CHECK(differs([](GeometryBlock &g) { g.ring_depth = 64; }));
-    CHECK(differs([](GeometryBlock &g) { g.credit_window = 8; }));
-    CHECK(differs([](GeometryBlock &g) { g.shape[1] = 7; }));
-    CHECK(differs([](GeometryBlock &g) { g.strides[1] = 7; }));
+    CHECK(differs([](Geometry &g) { g.generation = 2; }));
+    CHECK(differs([](Geometry &g) { g.element_type = ElementType::Int16; }));
+    CHECK(differs([](Geometry &g) { g.element_size = 4; }));
+    CHECK(differs([](Geometry &g) { g.rank = 1; }));
+    CHECK(differs([](Geometry &g) { g.max_frame_bytes = 1; }));
+    CHECK(differs([](Geometry &g) { g.ring_depth = 64; }));
+    CHECK(differs([](Geometry &g) { g.credit_window = 8; }));
+    CHECK(differs([](Geometry &g) { g.shape[1] = 7; }));
+    CHECK(differs([](Geometry &g) { g.strides[1] = 7; }));
 }
 
 // ---------------------------------------------------------------------------
@@ -329,8 +330,8 @@ TEST_CASE("geometry equality compares every field", "[core][geometry]")
 TEST_CASE("describes_same_array ignores the epoch and the sizing terms",
           "[core][geometry]")
 {
-    GeometryBlock a = valid();
-    GeometryBlock b = valid();
+    Geometry a = valid();
+    Geometry b = valid();
     CHECK(describes_same_array(a, b));
 
     SECTION("a new epoch is not a new array")
@@ -364,6 +365,44 @@ TEST_CASE("describes_same_array ignores the epoch and the sizing terms",
     {
         b.strides = {4096, 2, 0, 0};
         CHECK_FALSE(describes_same_array(a, b));
+    }
+}
+
+TEST_CASE("a frame and a grant compare through the one array comparison",
+          "[core][geometry]")
+{
+    // The engine retires a session on a frame that fails this against the
+    // grant, so the frame header and the geometry must answer through the same
+    // function, not through two lists of fields that can drift apart.
+    const Geometry grant = valid();
+
+    FrameHeader frame;
+    static_cast<ArrayTerms &>(frame) = grant;
+    frame.generation = grant.generation + 1;
+    frame.sequence = 9;
+    frame.payload_bytes = 1;
+    CHECK(describes_same_array(frame, grant));
+
+    SECTION("a producer's metadata answers the same question")
+    {
+        FrameMetadata meta;
+        static_cast<ArrayTerms &>(meta) = grant;
+        CHECK(describes_same_array(meta, grant));
+        CHECK(describes_same_array(meta, frame));
+    }
+
+    SECTION("a different stride is a different array")
+    {
+        frame.strides[1] = 4;
+        CHECK_FALSE(describes_same_array(frame, grant));
+    }
+
+    SECTION("a different rank is a different array")
+    {
+        frame.rank = 1;
+        frame.shape[1] = 0;
+        frame.strides[1] = 0;
+        CHECK_FALSE(describes_same_array(frame, grant));
     }
 }
 
@@ -422,7 +461,7 @@ TEST_CASE("resolve leaves the metadata untouched when it fails", "[core][geometr
 
 TEST_CASE("a rank without an element type is rejected", "[core][geometry]")
 {
-    // Stricter than GeometryBlock on purpose: the rank claims the payload is an
+    // Stricter than Geometry on purpose: the rank claims the payload is an
     // array of something, and a producer is in a position to say what.
     FrameMetadata meta;
     meta.element_type = ElementType::Unknown;

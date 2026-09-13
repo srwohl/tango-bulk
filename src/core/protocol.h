@@ -2,11 +2,14 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#ifndef TANGO_BULK_PROTOCOL_H
-#define TANGO_BULK_PROTOCOL_H
+#ifndef TANGO_BULK_SRC_CORE_PROTOCOL_H
+#define TANGO_BULK_SRC_CORE_PROTOCOL_H
+
+#include <core/frame_description.h>
 
 #include <tango-bulk/errors.h>
 #include <tango-bulk/frame.h>
+#include <tango-bulk/geometry.h>
 #include <tango-bulk/limits.h>
 
 #include <array>
@@ -186,36 +189,11 @@ struct Envelope
 Status decode_envelope(const std::byte *data, std::size_t size, Envelope &out) noexcept;
 
 // ---------------------------------------------------------------------------
-// GeometryBlock -- 96 bytes, embedded in four different messages
+// Geometry on the wire -- 96 bytes, embedded in OpenReply and RenewReply
 // ---------------------------------------------------------------------------
 
-/// One layout, one validator, one set of bounds checks, reused verbatim by
-/// OpenReply, RenewReply, and the data-plane Geometry message.
-struct GeometryBlock
-{
-    std::uint32_t generation{0}; ///< epoch; starts at 1, increments, never wraps
-    ElementType element_type{ElementType::Unknown};
-    std::uint32_t element_size{0};
-    std::uint32_t rank{0};
-    std::uint64_t max_frame_bytes{0};
-    std::uint32_t ring_depth{0};
-    std::uint32_t credit_window{0};
-    std::array<std::uint64_t, k_max_rank> shape{};
-    std::array<std::uint64_t, k_max_rank> strides{};
-
-    /// Applied on every receipt, not only on Open.  A geometry that fails this
-    /// is never partially adopted.
-    ///
-    /// generation == 0 is rejected: zero means "never armed" and is legal only
-    /// as a local sentinel, never on the wire.
-    Status validate() const noexcept;
-
-    friend bool operator==(const GeometryBlock &a, const GeometryBlock &b) noexcept;
-    friend bool operator!=(const GeometryBlock &a, const GeometryBlock &b) noexcept;
-
-    friend bool describes_same_array(const GeometryBlock &a, const GeometryBlock &b) noexcept;
-};
-
+/// The domain `Geometry` is the wire type: one layout, one validator, one set
+/// of bounds checks, reused verbatim by every message that carries it.
 inline constexpr std::size_t k_geometry_block_bytes = 96;
 
 // ---------------------------------------------------------------------------
@@ -254,7 +232,7 @@ struct OpenReply
     /// and MUST discard all cached geometry and sequence state.
     std::uint64_t server_epoch_id{0};
 
-    GeometryBlock geometry{};
+    Geometry geometry{};
     std::vector<std::byte> server_ucx_address;
 };
 
@@ -277,7 +255,7 @@ struct RenewReply
     /// Always the CURRENT epoch.  This is the only mandatory way a client learns
     /// about a geometry change, because the data-plane Geometry message may be
     /// lost or may race a reconnect.
-    GeometryBlock geometry{};
+    Geometry geometry{};
 };
 
 struct CloseRequest
@@ -402,23 +380,11 @@ struct DataPrefix
 Status decode_data_prefix(const std::byte *data, std::size_t size,
                           DataPrefix &out) noexcept;
 
-struct FrameHeader
+/// The frame description on the wire, routed by the session's stream id.
+/// `payload_bytes` must equal the AM data length; the receiver cross-checks.
+struct FrameHeader : detail::FrameDescription
 {
-    std::uint32_t generation{0};
     StreamId stream_id{0};
-    std::uint64_t sequence{0}; ///< monotonic within a session, from 0, never wraps
-    std::uint64_t payload_bytes{0}; ///< == the AM data length; receiver cross-checks
-    std::uint64_t timestamp_ns{0};
-    std::uint64_t event_counter{0};
-    std::uint64_t dropped_before{0};
-    ElementType element_type{ElementType::Unknown};
-    std::uint32_t element_size{0};
-    std::uint32_t rank{0};
-    std::uint32_t quality{0};
-    MemoryKind memory_kind{MemoryKind::Host};
-    Endian endian{Endian::Little}; ///< byte order of payload ELEMENTS
-    std::array<std::uint64_t, k_max_rank> shape{};
-    std::array<std::uint64_t, k_max_rank> strides{};
 };
 
 struct CreditMessage
@@ -464,4 +430,4 @@ Status decode(const std::byte *data, std::size_t size, ProbeAckMessage &out) noe
 
 } // namespace TangoBulk::Protocol
 
-#endif // TANGO_BULK_PROTOCOL_H
+#endif // TANGO_BULK_SRC_CORE_PROTOCOL_H

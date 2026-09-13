@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include "core/byte_order.h"
 #include "core/geometry_rules.h"
@@ -193,10 +193,10 @@ Status check_fixed_body(std::size_t body_size, std::size_t fixed,
 }
 
 // ---------------------------------------------------------------------------
-// GeometryBlock on the wire
+// Geometry on the wire
 // ---------------------------------------------------------------------------
 
-void put_geometry(std::byte *p, const GeometryBlock &g) noexcept
+void put_geometry(std::byte *p, const Geometry &g) noexcept
 {
     wire::put32(p + 0, g.generation);
     wire::put32(p + 4, static_cast<std::uint32_t>(g.element_type));
@@ -213,7 +213,7 @@ void put_geometry(std::byte *p, const GeometryBlock &g) noexcept
     }
 }
 
-void get_geometry(const std::byte *p, GeometryBlock &g) noexcept
+void get_geometry(const std::byte *p, Geometry &g) noexcept
 {
     g.generation = wire::get32(p + 0);
     g.element_type = static_cast<ElementType>(wire::get32(p + 4));

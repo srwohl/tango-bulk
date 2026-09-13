@@ -11,10 +11,9 @@
 #include <core/byte_order.h>
 #include <core/cpu_topology.h>
 #include <core/credit_window.h>
-#include <core/geometry_conversion.h>
 #include <core/publisher_internal.h>
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 #include <tango-bulk/publisher.h>
 
 #include <algorithm>
@@ -295,7 +294,7 @@ struct BulkPublisher::Impl
         Protocol::SessionId id{};
         Protocol::StreamId stream_id{0};
         std::uint64_t probe_token{0};
-        Protocol::GeometryBlock geometry{};
+        Geometry geometry{};
         MemoryKind receive_memory_kind{MemoryKind::Host};
 
         std::atomic<SessionState> state{SessionState::Unknown};
@@ -1238,18 +1237,14 @@ struct BulkPublisher::Impl
     /// The geometry this publisher grants, at the current epoch.
     ///
     /// `Open` clamps it downward per client (3.5 step 5).
-    Protocol::GeometryBlock current_geometry() const noexcept
+    Geometry current_geometry() const noexcept
     {
-        Protocol::GeometryBlock geometry;
+        Geometry geometry;
+        static_cast<ArrayTerms &>(geometry) = config.frame_metadata;
         geometry.generation = generation;
-        geometry.element_type = config.frame_metadata.element_type;
-        geometry.element_size = config.frame_metadata.element_size;
-        geometry.rank = config.frame_metadata.rank;
         geometry.max_frame_bytes = config.max_frame_bytes;
         geometry.ring_depth = config.ring_depth;
         geometry.credit_window = config.credit_window;
-        geometry.shape = config.frame_metadata.shape;
-        geometry.strides = config.frame_metadata.strides;
         return geometry;
     }
 
@@ -1446,19 +1441,12 @@ PublishResult BulkPublisher::publish(SlotHandle &&lease, const FrameMetadata &me
     Impl::PublishItem item;
     item.slot_index = lease.index_;
     item.payload_bytes = resolved.payload_bytes;
+    static_cast<FrameMetadata &>(item.header) = resolved;
+    if(item.header.timestamp_ns == 0)
+    {
+        item.header.timestamp_ns = now_realtime_ns();
+    }
     item.header.generation = impl_->generation;
-    item.header.payload_bytes = resolved.payload_bytes;
-    item.header.timestamp_ns =
-        resolved.timestamp_ns != 0 ? resolved.timestamp_ns : now_realtime_ns();
-    item.header.event_counter = resolved.event_counter;
-    item.header.element_type = resolved.element_type;
-    item.header.element_size = resolved.element_size;
-    item.header.rank = resolved.rank;
-    item.header.quality = resolved.quality;
-    item.header.memory_kind = resolved.memory_kind;
-    item.header.endian = resolved.endian;
-    item.header.shape = resolved.shape;
-    item.header.strides = resolved.strides;
     item.ordinal = admitted;
 
     if(!impl_->publish_queue.try_push(std::move(item)))
@@ -1533,7 +1521,7 @@ PublisherSnapshot BulkPublisher::snapshot() const
 {
     PublisherSnapshot out;
     out.stream_name = impl_->config.stream_name;
-    out.geometry = detail::to_geometry(impl_->current_geometry());
+    out.geometry = impl_->current_geometry();
     out.counters = counters();
     out.transport = "ActiveMessage";
     out.worst_lag_frames = out.counters.credits_outstanding;
@@ -1779,7 +1767,7 @@ CoordinationReply BulkPublisher::Impl::handle_open(const Protocol::OpenRequest &
     // 3.5 step 5: clamp downward.  A grant is never larger than requested and
     // never larger than configured; clamping is normal and is reported in the
     // reply rather than raised as an error.
-    Protocol::GeometryBlock geometry = current_geometry();
+    Geometry geometry = current_geometry();
     geometry.max_frame_bytes = std::min(request.requested_max_frame_bytes, config.max_frame_bytes);
     geometry.ring_depth = std::min(request.requested_ring_depth, config.ring_depth);
     geometry.credit_window = std::min(request.requested_credit_window, config.credit_window);

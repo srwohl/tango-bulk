@@ -4,7 +4,7 @@
 
 #include "bulk_commands.h"
 
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include <tango/tango.h>
 

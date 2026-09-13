@@ -5,7 +5,7 @@
 #include <ucx/ucx_context.h>
 
 #include <tango-bulk/errors.h>
-#include <tango-bulk/protocol.h>
+#include <core/protocol.h>
 
 #include <cstring>
 #include <string>
