@@ -62,6 +62,7 @@ struct Options
     std::string fill{"each"};
     std::uint64_t corrupt_every{0};
     std::string stream{"bulk.bench"};
+    bool copy{false};
 };
 
 void usage()
@@ -91,6 +92,11 @@ void usage()
         "                         checker that always passes looks identical to one\n"
         "                         that works.\n"
         "  --stream <name>        stream name on both sides (bulk.bench)\n"
+        "  --copy                 subscriber: copied delivery. The engine thread copies\n"
+        "                         every frame out of its slot before queueing it, so\n"
+        "                         the measured rate includes that copy. Accepted and\n"
+        "                         ignored by the publisher so one sweep can pass it to\n"
+        "                         both roles.\n"
         "\n"
         "Both roles must agree on --size, --ring-depth, --credit-window and --stream.\n");
 }
@@ -135,6 +141,7 @@ Options parse(int argc, char **argv)
         else if(arg == "--fill") { options.fill = value(i); }
         else if(arg == "--corrupt-every") { options.corrupt_every = std::stoull(value(i)); }
         else if(arg == "--stream") { options.stream = value(i); }
+        else if(arg == "--copy") { options.copy = true; }
         else { fail("unknown option " + arg); }
     }
 
@@ -447,6 +454,7 @@ int run_subscriber(const Options &options)
     SubscriptionOptions config;
     config.stream_name = options.stream;
     config.receive_plan = ReceivePlan{options.size, options.ring_depth, options.credit_window};
+    config.ownership = options.copy ? DeliveryOwnership::Copy : DeliveryOwnership::Borrow;
 
     detail::TransportOptions transport_options;
     transport_options.ucx_tls = options.tls;
@@ -509,12 +517,13 @@ int run_subscriber(const Options &options)
     const ReceivePlan plan = subscription->plan();
 
     std::printf("subscriber  ring %" PRIu32 " x %" PRIu64 " B  window %" PRIu32
-                "  pinned %.1f MiB  verify %s\n",
+                "  pinned %.1f MiB  verify %s  delivery %s\n",
                 plan.ring_depth,
                 plan.max_frame_bytes,
                 plan.credit_window,
                 static_cast<double>(plan.pinned_bytes()) / (1024.0 * 1024.0),
-                options.verify ? "on" : "off");
+                options.verify ? "on" : "off",
+                options.copy ? "copy" : "borrow");
 
     const std::uint64_t total = options.warmup + options.iters;
 
@@ -542,7 +551,15 @@ int run_subscriber(const Options &options)
                                ? 0.0
                                : std::chrono::duration<double>(Clock::now() - start).count();
 
-    const SubscriberCounters counters = subscription->snapshot().counters;
+    // The snapshot's transport counters are sampled on the control thread
+    // (ADR 0004), so give the sample a moment to include the last frame.
+    SubscriberCounters counters = subscription->snapshot().counters;
+    const auto sampled_by = Clock::now() + std::chrono::seconds(1);
+    while(counters.frames_received < received && Clock::now() < sampled_by)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        counters = subscription->snapshot().counters;
+    }
 
     const std::uint64_t dropped_queue_full = counters.frames_dropped_queue_full;
 
@@ -558,15 +575,29 @@ int run_subscriber(const Options &options)
 
     // Credit messages against credits returned is the direct measurement of
     // 3.12 coalescing, and the reason both are counters rather than log lines.
+    // Copied bytes are the zero-copy claim, asserted rather than assumed: for
+    // borrowed rendezvous-sized frames they stay at zero even when every byte
+    // was read back and checked; for copied delivery they are the whole payload.
     std::printf("            credits %" PRIu64 " in %" PRIu64 " messages (%.1fx coalescing)"
-                "  staged-copy bytes %" PRIu64 "\n",
+                "  copied %" PRIu64 " frames, %" PRIu64 " bytes, %" PRIu64
+                " from the heap\n",
                 counters.credits_returned,
                 counters.credit_messages_sent,
                 counters.credit_messages_sent > 0
                     ? static_cast<double>(counters.credits_returned) /
                           static_cast<double>(counters.credit_messages_sent)
                     : 0.0,
-                static_cast<std::uint64_t>(0));
+                counters.frames_copied,
+                counters.bytes_copied,
+                counters.copy_pool_exhausted);
+
+    const std::uint64_t expected_copied_bytes =
+        options.copy ? static_cast<std::uint64_t>(received) * options.size : 0;
+    if(counters.bytes_copied != expected_copied_bytes)
+    {
+        std::printf("            copied bytes %" PRIu64 " differ from the expected %" PRIu64 "\n",
+                    counters.bytes_copied, expected_copied_bytes);
+    }
 
     int status = 0;
 
@@ -579,10 +610,6 @@ int run_subscriber(const Options &options)
 
     if(options.verify)
     {
-        // The zero-copy claim, asserted rather than assumed: bytes_copied()
-        // counts payload that went through an eager staging copy, so for a
-        // rendezvous-sized frame it must stay at zero even when every byte was
-        // read back and checked.
         std::printf("            verified %" PRIu64 " frames: %" PRIu64 " mismatched, %" PRIu64
                     " wrong size\n",
                     received, mismatched, short_frames);

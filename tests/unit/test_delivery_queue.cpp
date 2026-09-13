@@ -35,7 +35,7 @@ FrameView frame_over(const std::shared_ptr<std::vector<std::uint16_t>> &payload,
     fields.payload_bytes = payload->size() * sizeof(std::uint16_t);
     fields.sequence = sequence;
 
-    return detail::DetachedFrameFactory::make(
+    return detail::CopiedFrameFactory::make(
         payload, reinterpret_cast<const std::byte *>(payload->data()), fields);
 }
 

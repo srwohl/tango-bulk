@@ -26,9 +26,14 @@ struct FrameFields
     std::uint32_t generation{0};
     MemoryKind memory_kind{MemoryKind::Host};
     Endian endian{Endian::Little};
+    bool borrowed{false}; ///< the bytes are a receive slot; set by the engine
 };
 
-class DetachedFrameFactory
+/// Builds the view of a copied frame: `owner` keeps `data` alive for as long
+/// as any copy of the view exists, and releasing the view withholds no credit.
+/// The production copied-delivery path and every synthetic test frame come
+/// through here.
+class CopiedFrameFactory
 {
   public:
     static FrameView make(std::shared_ptr<const void> owner,

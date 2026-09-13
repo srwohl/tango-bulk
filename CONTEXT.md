@@ -84,6 +84,12 @@ Whether a Subscription tries to establish a replacement Session after a transien
 or transport failure, or fails immediately. It does not change whether frames may be lost.
 _Avoid_: loss policy, reconnect policy
 
+**Delivery ownership**:
+Whether a Subscription delivers borrowed frames or copied frames. `Borrow` is the C++ default;
+`Copy` makes the copy on the engine thread before the frame is queued, from a pool that falls
+back to the heap, and is refused with a device receive region.
+_Avoid_: copy mode, zero-copy mode
+
 **Queue policy**:
 Which delivered frame a Subscription preserves when its local delivery queue is full.
 `PreserveOrder` keeps frames already queued; `PreferFresh` replaces the oldest queued copied frame

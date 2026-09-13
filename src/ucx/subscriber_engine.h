@@ -10,6 +10,7 @@
 #include <ucx/ucx_context.h>
 
 #include <core/bounded_queue.h>
+#include <core/copy_pool.h>
 #include <core/credit_window.h>
 #include <core/delivery_queue.h>
 #include <core/lease_pool.h>
@@ -47,12 +48,14 @@ class ReceiveArena : public CreditSink
   public:
     /// An empty `region.owner` allocates a host ring; otherwise the caller's
     /// region is registered and its ownership shared for as long as any view
-    /// or in-flight receive refers to it.
+    /// or in-flight receive refers to it. `copy_buffers` above zero builds the
+    /// copied-delivery pool, that many buffers of `slot_bytes`.
     ReceiveArena(std::shared_ptr<UcxContext> context,
                  std::uint64_t slot_bytes,
                  std::uint32_t depth,
                  std::uint64_t pinned_limit,
-                 ReceiveRegion region);
+                 ReceiveRegion region,
+                 std::size_t copy_buffers);
 
     /// 5.5: called from the lease destructor, on any thread.  Pushes and
     /// nothing else -- no blocking, no allocation, no UCX.
@@ -82,9 +85,22 @@ class ReceiveArena : public CreditSink
         return lease_pool_;
     }
 
+    /// Null unless the arena was built for copied delivery.
+    const std::shared_ptr<CopyPool> &copy_pool() const noexcept
+    {
+        return copy_pool_;
+    }
+
     std::uint64_t credits_returned() const noexcept
     {
         return credits_returned_.load(std::memory_order_relaxed);
+    }
+
+    /// A credit that returned on the engine thread at delivery, without a
+    /// lease: copied delivery.
+    void note_credit_returned() noexcept
+    {
+        credits_returned_.fetch_add(1, std::memory_order_relaxed);
     }
 
     std::uint64_t views_outstanding() const noexcept
@@ -109,6 +125,7 @@ class ReceiveArena : public CreditSink
     BoundedQueue<std::uint64_t> credit_returns_;
 
     std::shared_ptr<LeasePool> lease_pool_;
+    std::shared_ptr<CopyPool> copy_pool_;
     std::atomic<std::uint64_t> credits_returned_{0};
     std::atomic<std::uint64_t> views_outstanding_{0};
 };
@@ -117,6 +134,7 @@ class SubscriberEngine final : public SubscriberTransport
 {
   public:
     SubscriberEngine(ReceivePlan plan,
+                     DeliveryOwnership ownership,
                      ReceiveRegion region,
                      std::uint64_t pinned_limit,
                      TransportOptions options,
@@ -146,9 +164,9 @@ class SubscriberEngine final : public SubscriberTransport
     /// The criterion asks for the delivered payload to live inside the
     /// registered receive ring "verified by pointer/registration
     /// instrumentation, not by inspection".  `ring_contains()` is the pointer
-    /// half; `bytes_copied()` is the registration half -- it counts bytes that
-    /// went through a staging copy, and for a rendezvous-sized frame it must
-    /// stay at zero.
+    /// half; `counters().bytes_copied` is the registration half -- it counts
+    /// bytes that went through a CPU copy, and for a borrowed rendezvous-sized
+    /// frame it must stay at zero.
     bool ring_contains(const void *p) const noexcept;
 
     /// Address of receive slot `index`, so a test can assert 3.11's mapping --
@@ -159,11 +177,6 @@ class SubscriberEngine final : public SubscriberTransport
     std::uint32_t granted_ring_depth() const noexcept
     {
         return granted_.ring_depth;
-    }
-
-    std::uint64_t bytes_copied() const noexcept
-    {
-        return bytes_copied_.load(std::memory_order_relaxed);
     }
 
     /// Observed placement, valid once the state reaches `Active`.
@@ -225,9 +238,13 @@ class SubscriberEngine final : public SubscriberTransport
 
     void commit(std::size_t slot_index) noexcept;
 
+    /// Copied delivery: copy the slot out, return its credit, queue the copy.
+    void commit_copied(ReceiveSlot &slot) noexcept;
+
     void fail(Status status, const char *reason) noexcept;
 
     MemoryKind memory_kind_;
+    DeliveryOwnership ownership_;
     int engine_cpu_affinity_;
     std::shared_ptr<UcxContext> context_;
     std::unique_ptr<UcxWorker> worker_;
@@ -289,6 +306,7 @@ class SubscriberEngine final : public SubscriberTransport
     std::atomic<std::uint64_t> dropped_geometry_mismatch_{0};
     std::atomic<std::uint64_t> credit_messages_sent_{0};
     std::atomic<std::uint64_t> transport_errors_{0};
+    std::atomic<std::uint64_t> frames_copied_{0};
     std::atomic<std::uint64_t> bytes_copied_{0};
 };
 

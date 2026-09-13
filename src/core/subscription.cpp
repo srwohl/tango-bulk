@@ -92,6 +92,9 @@ void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexc
     total.frames_dropped_oversize += part.frames_dropped_oversize;
     total.frames_dropped_duplicate_seq += part.frames_dropped_duplicate_seq;
     total.frames_dropped_geometry_mismatch += part.frames_dropped_geometry_mismatch;
+    total.frames_copied += part.frames_copied;
+    total.bytes_copied += part.bytes_copied;
+    total.copy_pool_exhausted += part.copy_pool_exhausted;
     total.credits_returned += part.credits_returned;
     total.credit_messages_sent += part.credit_messages_sent;
     total.sessions_opened += part.sessions_opened;
@@ -412,6 +415,7 @@ struct Subscription::Impl
         stream_name(std::move(opts.stream_name)),
         upper_plan(plan),
         recovery_policy(opts.recovery_policy),
+        ownership(opts.ownership),
         expect(opts.expect),
         establishment_timeout_ms(opts.establishment_timeout_ms),
         allocator(std::move(opts.receive_allocator)),
@@ -494,6 +498,14 @@ struct Subscription::Impl
                 region = ReceiveRegion{};
                 return false;
             }
+            if(ownership == DeliveryOwnership::Copy && region.memory_kind != MemoryKind::Host)
+            {
+                error = BulkError{Status::MalformedMessage,
+                                  "copied delivery needs a host receive region",
+                                  Origin::Subscriber};
+                region = ReceiveRegion{};
+                return false;
+            }
         }
 
         if(!region.owner)
@@ -530,7 +542,7 @@ struct Subscription::Impl
 
         try
         {
-            fresh = factory(upper_plan, region, delivery->make_ingress());
+            fresh = factory(upper_plan, ownership, region, delivery->make_ingress());
         }
         catch(const BulkException &e)
         {
@@ -1307,6 +1319,7 @@ struct Subscription::Impl
     std::string stream_name;
     ReceivePlan upper_plan;
     RecoveryPolicy recovery_policy;
+    DeliveryOwnership ownership;
     GeometryExpectation expect;
     std::uint32_t establishment_timeout_ms;
     ReceiveAllocator allocator;

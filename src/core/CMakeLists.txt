@@ -17,6 +17,7 @@ add_library(
     delivery_queue.cpp
     enums.cpp
     errors.cpp
+    copy_pool.cpp
     frame_view.cpp
     geometry.cpp
     lease_pool.cpp

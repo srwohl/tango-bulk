@@ -50,7 +50,7 @@ Frame make_frame(std::uint64_t height, std::uint64_t width)
 
 FrameView detach(const Frame &frame)
 {
-    return detail::DetachedFrameFactory::make(
+    return detail::CopiedFrameFactory::make(
         frame.pixels,
         reinterpret_cast<const std::byte *>(frame.pixels->data()),
         frame.fields);
@@ -167,12 +167,21 @@ TEST_CASE("a detached view accepts a null owner and an unreadable pointer",
         reinterpret_cast<const std::byte *>(std::uintptr_t{0x7f0000000000ull});
 
     const FrameView view =
-        detail::DetachedFrameFactory::make(nullptr, pretend_device_pointer, fields);
+        detail::CopiedFrameFactory::make(nullptr, pretend_device_pointer, fields);
 
     REQUIRE(static_cast<bool>(view));
     CHECK(view.data() == pretend_device_pointer);
     CHECK(view.size() == 2208ull * 3216ull * 2ull);
     CHECK(view.memory_kind() == MemoryKind::Cuda);
+}
+
+TEST_CASE("a copied view is not borrowed, whatever its fields said", "[frame]")
+{
+    Frame frame = make_frame(2, 2);
+    frame.fields.borrowed = true;
+    const FrameView view = detach(frame);
+    CHECK(view);
+    CHECK_FALSE(view.borrowed());
 }
 
 TEST_CASE("a default-constructed view is disengaged", "[frame]")

@@ -247,11 +247,20 @@ Status SubscriptionOptions::validate() const noexcept
         return Status::MalformedMessage;
     }
 
-    // PreferFresh replaces the oldest queued *copied* frame.  Every delivered
-    // frame is borrowed today, and evicting a borrowed frame would return the
-    // credit for a frame the application never saw, so the policy is refused
-    // until copied delivery exists.
-    if(queue_policy != QueuePolicy::PreserveOrder)
+    if(ownership != DeliveryOwnership::Borrow && ownership != DeliveryOwnership::Copy)
+    {
+        return Status::MalformedMessage;
+    }
+
+    if(queue_policy != QueuePolicy::PreserveOrder && queue_policy != QueuePolicy::PreferFresh)
+    {
+        return Status::MalformedMessage;
+    }
+
+    // PreferFresh evicts a queued frame the application never saw. Evicting a
+    // borrowed frame would return its credit behind the application's back, so
+    // the policy needs copied delivery.
+    if(queue_policy == QueuePolicy::PreferFresh && ownership != DeliveryOwnership::Copy)
     {
         return Status::MalformedMessage;
     }

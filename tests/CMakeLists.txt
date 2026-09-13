@@ -15,6 +15,7 @@ include(Catch)
 
 add_executable(
     tango-bulk-unit-tests
+    unit/test_copy_pool.cpp
     unit/test_cpu_topology.cpp
     unit/test_credit_window.cpp
     unit/test_delivery_queue.cpp
@@ -54,7 +55,8 @@ endif()
 
 # --- tests/ucx: loopback UCX, no Tango process -----------------------------
 
-add_executable(tango-bulk-ucx-tests ucx/test_registered_ring.cpp
+add_executable(tango-bulk-ucx-tests ucx/test_copied_delivery.cpp
+                                    ucx/test_registered_ring.cpp
                                     ucx/test_session_lifecycle.cpp
                                     ucx/test_ucx_support.cpp
                                     ucx/test_transport_invariants.cpp

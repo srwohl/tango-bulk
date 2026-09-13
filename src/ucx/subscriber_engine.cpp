@@ -8,6 +8,7 @@
 #include <ucx/locality.h>
 
 #include <core/cpu_topology.h>
+#include <core/frame_fields.h>
 
 #include <cassert>
 #include <cstdio>
@@ -28,6 +29,10 @@ namespace
 /// destructor open.  4.2 gives the publisher the same bounded-wait shape for the
 /// same reason.
 constexpr std::chrono::milliseconds k_quiesce_budget{2000};
+
+/// Copy buffers beyond the delivery queue's capacity: frames the application
+/// may hold while the queue is full before a copy goes to the heap.
+constexpr std::size_t k_copy_pool_slack = 8;
 
 /// Park a worker that could not be quiesced, for the life of the process.
 ///
@@ -78,7 +83,8 @@ ReceiveArena::ReceiveArena(std::shared_ptr<UcxContext> context,
                            std::uint64_t slot_bytes,
                            std::uint32_t depth,
                            std::uint64_t pinned_limit,
-                           ReceiveRegion region) :
+                           ReceiveRegion region,
+                           std::size_t copy_buffers) :
     context_(std::move(context)),
     // The receive ring never pads its stride: 6.2's extra page exists to break
     // cache-set aliasing on the *copy* the receiver would otherwise do, and this
@@ -99,7 +105,8 @@ ReceiveArena::ReceiveArena(std::shared_ptr<UcxContext> context,
                                         Origin::Subscriber)),
     slots_(depth),
     credit_returns_(static_cast<std::size_t>(depth) * 2),
-    lease_pool_(std::make_shared<LeasePool>(static_cast<std::size_t>(depth) + 8))
+    lease_pool_(std::make_shared<LeasePool>(static_cast<std::size_t>(depth) + 8)),
+    copy_pool_(copy_buffers > 0 ? std::make_shared<CopyPool>(copy_buffers, slot_bytes) : nullptr)
 {
     for(std::uint32_t i = 0; i < depth; ++i)
     {
@@ -150,11 +157,13 @@ struct SubscriberEngine::Pending
 };
 
 SubscriberEngine::SubscriberEngine(ReceivePlan plan,
+                                   DeliveryOwnership ownership,
                                    ReceiveRegion region,
                                    std::uint64_t pinned_limit,
                                    TransportOptions options,
                                    std::shared_ptr<DeliveryIngress> delivery) :
     memory_kind_(region.owner ? region.memory_kind : MemoryKind::Host),
+    ownership_(ownership),
     engine_cpu_affinity_(options.engine_cpu_affinity),
     tracker_(plan.ring_depth),
     delivery_(std::move(delivery)),
@@ -173,8 +182,23 @@ SubscriberEngine::SubscriberEngine(ReceivePlan plan,
     // 4.1, `Opening` entry action, in this order: the ring is allocated,
     // registered and armed *before* Open goes out, because the publisher may
     // send the first frame the moment it replies.
-    arena_ = std::make_shared<ReceiveArena>(
-        context_, plan.max_frame_bytes, plan.ring_depth, pinned_limit, std::move(region));
+    if(ownership_ == DeliveryOwnership::Copy && memory_kind_ != MemoryKind::Host)
+    {
+        throw ConfigurationError(BulkError{Status::MalformedMessage,
+                                           "copied delivery needs a host receive region",
+                                           Origin::Subscriber});
+    }
+
+    // Copied delivery: the queue holds ring_depth frames (ADR 0008) and none of
+    // them is in the ring any more, so the pool covers the queue plus slack.
+    const std::size_t copy_buffers =
+        ownership_ == DeliveryOwnership::Copy ? plan.ring_depth + k_copy_pool_slack : 0;
+    arena_ = std::make_shared<ReceiveArena>(context_,
+                                            plan.max_frame_bytes,
+                                            plan.ring_depth,
+                                            pinned_limit,
+                                            std::move(region),
+                                            copy_buffers);
     sink_ = arena_;
 
     for(std::size_t i = 0; i < pending_.size(); ++i)
@@ -767,6 +791,7 @@ ucs_status_t SubscriberEngine::handle_frame(const std::byte *header,
     // publisher's source allocation. They differ for GPUDirect receives.
     slot.fields.memory_kind = memory_kind_;
     slot.fields.endian = frame.endian;
+    slot.fields.borrowed = true;
 
     if((param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) != 0)
     {
@@ -911,6 +936,12 @@ void SubscriberEngine::commit(std::size_t slot_index) noexcept
     ReceiveSlot &slot = arena_->slot(slot_index);
     frames_received_.fetch_add(1, std::memory_order_relaxed);
 
+    if(ownership_ == DeliveryOwnership::Copy)
+    {
+        commit_copied(slot);
+        return;
+    }
+
     // allocate_shared from the arena's pool, so the control block that *is* the
     // credit interlock (5.5) does not cost a malloc per frame.
     PoolAllocator<ReceiveSlotLease> allocator(arena_->lease_pool());
@@ -918,6 +949,41 @@ void SubscriberEngine::commit(std::size_t slot_index) noexcept
 
     arena_->note_view_issued();
     FrameView view = ReceiveSlotLease::make_view(std::move(lease), slot.data, &slot.fields);
+
+    delivery_->push(std::move(view));
+}
+
+void SubscriberEngine::commit_copied(ReceiveSlot &slot) noexcept
+{
+    // The copy runs here, on the engine thread, so the slot's credit is on its
+    // way back before the frame is queued and however long the application
+    // keeps the copy the publisher never learns of it.
+    const auto bytes = static_cast<std::size_t>(slot.fields.payload_bytes);
+    FrameView view;
+    try
+    {
+        std::shared_ptr<std::byte> buffer = arena_->copy_pool()->acquire();
+        std::memcpy(buffer.get(), slot.data, bytes);
+        const std::byte *data = buffer.get();
+        view = CopiedFrameFactory::make(std::move(buffer), data, slot.fields);
+    }
+    catch(const std::bad_alloc &)
+    {
+        slot.occupied = false;
+        tracker_.release(slot.fields.sequence);
+        transport_errors_.fetch_add(1, std::memory_order_relaxed);
+        fail(Status::ResourceExhausted, "no memory for a copied frame");
+        return;
+    }
+
+    frames_copied_.fetch_add(1, std::memory_order_relaxed);
+    bytes_copied_.fetch_add(bytes, std::memory_order_relaxed);
+
+    // What drain_credit_returns() does for a released lease, done at once: this
+    // is the engine thread and the tracker is its own.
+    slot.occupied = false;
+    tracker_.release(slot.fields.sequence);
+    arena_->note_credit_returned();
 
     delivery_->push(std::move(view));
 }
@@ -944,6 +1010,12 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
     out.frames_dropped_duplicate_seq = dropped_duplicate_seq_.load(std::memory_order_relaxed);
     out.frames_dropped_geometry_mismatch =
         dropped_geometry_mismatch_.load(std::memory_order_relaxed);
+    out.frames_copied = frames_copied_.load(std::memory_order_relaxed);
+    out.bytes_copied = bytes_copied_.load(std::memory_order_relaxed);
+    if(const std::shared_ptr<CopyPool> &pool = arena_->copy_pool())
+    {
+        out.copy_pool_exhausted = pool->exhausted();
+    }
     out.credits_returned = arena_->credits_returned();
     out.credit_messages_sent = credit_messages_sent_.load(std::memory_order_relaxed);
     out.views_outstanding = arena_->views_outstanding();
@@ -958,12 +1030,17 @@ TransportFactory make_subscriber_transport_factory(std::uint64_t pinned_budget_b
 {
     return [pinned_budget_bytes, options = std::move(options)](
                const ReceivePlan &plan,
+               DeliveryOwnership ownership,
                ReceiveRegion region,
                std::shared_ptr<DeliveryIngress> delivery)
                -> std::unique_ptr<SubscriberTransport>
     {
-        return std::make_unique<SubscriberEngine>(
-            plan, std::move(region), pinned_budget_bytes, options, std::move(delivery));
+        return std::make_unique<SubscriberEngine>(plan,
+                                                  ownership,
+                                                  std::move(region),
+                                                  pinned_budget_bytes,
+                                                  options,
+                                                  std::move(delivery));
     };
 }
 

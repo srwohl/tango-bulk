@@ -257,7 +257,7 @@ struct Script
         auto hold = std::make_shared<Hold>();
         hold->payload = frame.payload;
         hold->region = region_owner.lock();
-        delivery->push(detail::DetachedFrameFactory::make(hold, frame.bytes(), frame.fields));
+        delivery->push(detail::CopiedFrameFactory::make(hold, frame.bytes(), frame.fields));
     }
 };
 
@@ -334,6 +334,7 @@ class FakeTransport final : public detail::SubscriberTransport
 inline detail::TransportFactory fake_factory(Script &script)
 {
     return [&script](const ReceivePlan &,
+                     DeliveryOwnership,
                      ReceiveRegion region,
                      std::shared_ptr<detail::DeliveryIngress> delivery)
         -> std::unique_ptr<detail::SubscriberTransport>

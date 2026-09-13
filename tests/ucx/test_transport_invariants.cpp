@@ -24,7 +24,8 @@ TEST_CASE("The transport places a rendezvous payload in its registered ring",
 
     CHECK(transport.engine.ring_contains(views.front().data()));
     CHECK(views.front().data() == transport.engine.slot_address(0));
-    CHECK(transport.engine.bytes_copied() == 0);
+    CHECK(transport.engine.counters().bytes_copied == 0);
+    CHECK(views.front().borrowed());
     CHECK(payload_matches(views.front(), 0x11));
 }
 

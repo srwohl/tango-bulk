@@ -37,6 +37,7 @@ struct TransportFixture
                                                          config.queue_policy)),
         ingress(delivery->make_ingress()),
         engine(*config.receive_plan,
+               config.ownership,
                ReceiveRegion{},
                config.pinned_budget_bytes,
                std::move(transport),

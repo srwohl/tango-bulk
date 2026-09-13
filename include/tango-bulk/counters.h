@@ -59,6 +59,9 @@ struct SubscriberCounters
     std::uint64_t frames_dropped_duplicate_seq{0};
 
     std::uint64_t frames_dropped_geometry_mismatch{0};
+    std::uint64_t frames_copied{0};       ///< delivered as copied frames
+    std::uint64_t bytes_copied{0};        ///< payload through a CPU copy: eager staging or copied delivery
+    std::uint64_t copy_pool_exhausted{0}; ///< copied frames that fell back to the heap
     std::uint64_t credits_returned{0};
     std::uint64_t credit_messages_sent{0};
     std::uint64_t views_outstanding{0};    ///< gauge

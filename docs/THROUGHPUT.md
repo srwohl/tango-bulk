@@ -64,15 +64,45 @@ dropped frames of any kind and no transport errors at any size.
 
 Two results that do hold regardless of transport:
 
-- **Staged-copy bytes are zero at every size.** `bytes_copied()` counts payload
-  that went through an eager staging copy, so a rendezvous-sized frame must leave
-  it at zero. This is §9.3's zero-copy criterion asserted on a two-process session
+- **Copied bytes are zero at every size.** The `bytes_copied` counter counts
+  payload that went through a CPU copy on the receive path, so a borrowed
+  rendezvous-sized frame must leave it at zero. This is §9.3's zero-copy criterion asserted on a two-process session
   rather than in a unit test.
 - **Per-frame overhead is negligible across a 32× size range.** The rate is
   effectively flat from 256 KiB to 8 MiB, which means the credit round trip, the
   header encode, the session-table walk and the engine loop cost nothing
   measurable per frame. The window is not the limiter either: throughput is flat
   from `credit_window` 16 through 128.
+
+### Copied delivery at 13.5 MiB
+
+`--copy` selects `DeliveryOwnership::Copy`: the engine thread copies each frame out of its
+slot before queueing it and the slot's credit returns at once. Measured at the Python design
+document's reference frame, 13.5 MiB (14 155 776 B), against borrowed delivery in the same
+session of runs. `--fill each`, one run per row.
+
+| Delivery | Subscriber | Publisher | credit-stalled | copied |
+|---|---|---|---|---|
+| borrow | 3.70 GiB/s, 281 fps | 3.70 GiB/s | 0 | 0 |
+| copy | 3.50 GiB/s, 266 fps | 3.32 GiB/s | 34 | 450 frames, 6.37 GB, 0 from the heap |
+
+```text
+Date            2026-09-13
+Host            Linux 7.0.0-29-generic x86_64, Intel Core Ultra 5 135H (14C/18T, 18 MB L3)
+UCX             1.22.0 (conda-forge)
+UCX_TLS         unset -- UCX selected sysv/cma
+Geometry        ring_depth 32, credit_window 16, iters 400, warmup 50, --fill each
+Copy pool       40 buffers of 13.5 MiB (ring depth plus 8), none exhausted
+Build           RelWithDebInfo, -Werror
+```
+
+The copy costs about 5% of the borrowed rate here and 34 `CreditStalled` returns on the
+publisher, because a credit now returns after the engine thread's copy instead of at
+arrival. The 100 fps reference point (1.35 GiB/s) is met with a factor of 2.6 to spare, so
+the engine-thread placement stands and no copy stage between the engine and the queue is
+needed. Over CMA the transfer is already a CPU copy, so this row measures a second copy of
+the same bytes against the same memory bandwidth; over RDMA the copy is the only CPU copy on
+the receive side, and this row does not predict that number.
 
 ### The number is bounded by cache residency, not by this library
 
@@ -230,7 +260,7 @@ UD has no rendezvous path, so every byte went through an eager staging copy and
 throughput fell to 15 Gb/s — below the wire, and the only number on this page that
 is. This is the zero-copy criterion of §9.3 shown to be transport-conditional
 rather than always true: the same session, the same geometry, the same code, and
-`bytes_copied()` moving from zero to the entire payload when the transport cannot
+the `bytes_copied` counter moving from zero to the entire payload when the transport cannot
 offer rendezvous.
 
 ## Not measured here

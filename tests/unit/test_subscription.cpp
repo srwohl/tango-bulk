@@ -46,6 +46,36 @@ TEST_CASE("invalid options are refused before anything is built", "[core][subscr
     CHECK(script.opens.load() == 0);
 }
 
+TEST_CASE("PreferFresh needs copied delivery", "[core][subscription]")
+{
+    SubscriptionOptions options = subscription_options();
+    options.queue_policy = QueuePolicy::PreferFresh;
+    CHECK(options.validate() == Status::MalformedMessage);
+
+    options.ownership = DeliveryOwnership::Copy;
+    CHECK(options.validate() == Status::Ok);
+}
+
+TEST_CASE("copied delivery is refused with a device receive region", "[core][subscription]")
+{
+    Script script;
+
+    SubscriptionOptions options = subscription_options();
+    options.recovery_policy = RecoveryPolicy::Fail;
+    options.ownership = DeliveryOwnership::Copy;
+    options.receive_allocator = [](std::uint64_t bytes)
+    {
+        auto storage = std::make_shared<std::vector<std::byte>>(bytes);
+        return ReceiveRegion{
+            std::shared_ptr<void>(storage, storage->data()), bytes, MemoryKind::Cuda};
+    };
+
+    CHECK_THROWS_AS(open_test_subscription(options, fake_channel(script), fake_factory(script)),
+                    EstablishmentError);
+    CHECK(script.transports_built.load() == 0);
+    CHECK(script.opens.load() == 0);
+}
+
 TEST_CASE("a granted session that never probes gives up within its lease",
           "[core][subscription]")
 {

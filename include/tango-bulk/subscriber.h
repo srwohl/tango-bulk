@@ -61,7 +61,20 @@ enum class RecoveryPolicy : std::uint32_t
 enum class QueuePolicy : std::uint32_t
 {
     PreserveOrder = 0, ///< keep the frames already queued; refuse the new one
-    PreferFresh = 1,   ///< evict the oldest queued frame; copied delivery only
+    PreferFresh = 1,   ///< evict the oldest queued frame; requires Copy
+};
+
+/// Who owns the bytes of a delivered frame.
+enum class DeliveryOwnership : std::uint32_t
+{
+    /// The frame is its receive slot. The slot's credit returns when the last
+    /// view of the frame is released, so every retained frame withholds one.
+    Borrow = 0,
+    /// The frame is a copy made on the engine thread before it is queued. The
+    /// slot's credit returns at delivery, so retention never reaches the
+    /// publisher; the copy pool falls back to the heap, counted, when the
+    /// application retains more frames than it holds.
+    Copy = 1,
 };
 
 /// What the caller expects the granted Geometry to describe. Every term is
@@ -127,6 +140,9 @@ struct SubscriptionOptions
 
     RecoveryPolicy recovery_policy{RecoveryPolicy::Reconnect};
     QueuePolicy queue_policy{QueuePolicy::PreserveOrder};
+    /// Copy is refused with a device receive region: the copy destination
+    /// would have to be host memory the caller has no way to supply.
+    DeliveryOwnership ownership{DeliveryOwnership::Borrow};
     GeometryExpectation expect;
 
     /// Optional complete upper plan, intersected with discovery and the pinned

@@ -93,14 +93,16 @@ namespace detail
 {
 class ReceiveSlotLease;
 struct FrameFields;
-class DetachedFrameFactory;
+class CopiedFrameFactory;
 } // namespace detail
 
 /// Read-only, reference-counted view of one delivered frame.
 ///
-/// Every copy keeps the receive slot alive, and the credit for that slot is
-/// withheld until the last copy is destroyed.  Applications needing unbounded
-/// ownership MUST copy the bytes out and release the view.
+/// A borrowed view keeps its receive slot alive, and the credit for that slot
+/// is withheld until the last copy of the view is destroyed; an application
+/// needing unbounded ownership of a borrowed frame MUST copy the bytes out and
+/// release the view.  A copied view owns a copy of the payload and withholds
+/// nothing.  `borrowed()` tells the two apart; everything else reads the same.
 ///
 /// The shared_ptr control block *is* the credit interlock.  Destruction and
 /// reset() are the only ways a credit returns; there is deliberately no
@@ -137,12 +139,17 @@ class FrameView
     MemoryKind memory_kind() const noexcept;
     Endian endian() const noexcept;
 
+    /// True when the bytes are the receive slot itself and holding this view
+    /// withholds its credit; false for a copied frame, whose credit returned
+    /// at delivery. A disengaged view is not borrowed.
+    bool borrowed() const noexcept;
+
     long use_count() const noexcept; ///< diagnostics/tests only
     void reset() noexcept;           ///< release early; returns the credit
 
   private:
     friend class detail::ReceiveSlotLease;
-    friend class detail::DetachedFrameFactory;
+    friend class detail::CopiedFrameFactory;
 
     FrameView(std::shared_ptr<detail::ReceiveSlotLease> lease,
               const std::byte *data,
