@@ -5,13 +5,13 @@
 #ifndef TANGO_BULK_SUBSCRIBER_H
 #define TANGO_BULK_SUBSCRIBER_H
 
-#include <tango-bulk/counters.h>
 #include <tango-bulk/errors.h>
 #include <tango-bulk/frame.h>
 #include <tango-bulk/geometry.h>
 
-#include <cstddef>
+#include <array>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -34,7 +34,7 @@ const char *to_string(SubscriberState state) noexcept;
 
 /// The receive dimensions selected for a subscription.
 ///
-/// A value supplied in SubscriberConfig is a complete upper limit. A value
+/// A value supplied in SubscriptionOptions is a complete upper limit. A value
 /// returned by Subscription::plan() is the actual grant-backed plan. The byte
 /// count is derived so it cannot disagree with the dimensions.
 struct ReceivePlan
@@ -50,58 +50,98 @@ struct ReceivePlan
 bool operator==(const ReceivePlan &left, const ReceivePlan &right) noexcept;
 bool operator!=(const ReceivePlan &left, const ReceivePlan &right) noexcept;
 
-enum class DeliveryMode : std::uint32_t
-{
-    Push = 0, ///< a dedicated library thread invokes the callback (default)
-    Pull = 1, ///< the application claims frames with Subscription::read_for()
-};
-
 enum class RecoveryPolicy : std::uint32_t
 {
     Fail = 0,
     Reconnect = 1,
 };
 
-struct SubscriberConfig
+/// Which delivered frame a Subscription preserves when its delivery queue is
+/// full. Local to the Subscription; it never changes the Session's flow.
+enum class QueuePolicy : std::uint32_t
 {
-    std::string stream_name;
-    std::uint32_t delivery_queue_depth{64};
-    DeliveryMode delivery_mode{DeliveryMode::Push};
-    DropPolicy drop_policy{DropPolicy::DropNewest};
-    RecoveryPolicy recovery_policy{RecoveryPolicy::Reconnect};
-    std::uint32_t command_timeout_ms{5'000}; ///< one Tango command round trip
-    std::uint32_t establishment_timeout_ms{30'000}; ///< total initial subscribe budget
-
-    /// How long to wait for the publisher's `Probe` after `Open` is granted.
-    ///
-    /// Split from `command_timeout_ms`, which it used to share: one bounds a
-    /// Tango call, the other bounds a UCX round trip that the publisher
-    /// initiates, and they are only alike in having had the same default. A
-    /// client whose UCX endpoint the publisher cannot reach spends this budget
-    /// once per reconnect attempt before it is told, so lowering it is what
-    /// makes an unreachable fabric quick to diagnose rather than slow.
-    std::uint32_t probe_timeout_ms{5'000};
-    std::uint64_t pinned_memory_limit_bytes{1ull << 30};
-    std::string ucx_tls;
-    int engine_cpu_affinity{-1};
-
-    /// Optional caller-owned receive ring. When null, the subscriber allocates
-    /// its usual host ring. For CUDA/ROCm, supply a shared_ptr whose get() is the
-    /// device pointer and whose deleter releases it. The allocation must contain
-    /// at least max_frame_bytes * ring_depth bytes. Shared ownership keeps it
-    /// alive until every FrameView has been released, even after stop().
-    std::shared_ptr<void> receive_buffer;
-    std::uint64_t receive_buffer_bytes{0};
-    MemoryKind receive_memory_kind{MemoryKind::Host};
-
-    /// Optional complete upper plan, intersected with discovery and the pinned
-    /// budget before Open. When absent those dimensions are derived entirely
-    /// from discovery and the pinned budget.
-    std::optional<ReceivePlan> receive_plan;
-    Status validate() const noexcept;
+    PreserveOrder = 0, ///< keep the frames already queued; refuse the new one
+    PreferFresh = 1,   ///< evict the oldest queued frame; copied delivery only
 };
 
-using FrameCallback = std::function<void(FrameView)>;
+/// What the caller expects the granted Geometry to describe. Every term is
+/// optional and only the supplied terms are checked; a mismatch fails
+/// establishment, and a mismatch on reopen ends the Subscription.
+struct GeometryExpectation
+{
+    std::optional<ElementType> element_type;
+    std::optional<std::uint32_t> rank;
+    std::optional<std::array<std::uint64_t, k_max_rank>> shape;   ///< requires rank
+    std::optional<std::array<std::uint64_t, k_max_rank>> strides; ///< requires rank
+
+    Status validate() const noexcept;
+
+    /// Ok, or GeometryMismatch naming the first term that differs.
+    Status check(const Geometry &granted) const noexcept;
+};
+
+/// Caller-owned receive storage, as the receive allocator returns it.
+///
+/// `owner` keeps the memory alive: the library holds a copy for as long as UCX
+/// or any delivered frame can refer to the region, so releasing the caller's
+/// copy never frees memory still in use. For CUDA or ROCm, `owner.get()` is the
+/// device pointer.
+struct ReceiveRegion
+{
+    std::shared_ptr<void> owner;
+    std::uint64_t bytes{0};
+    MemoryKind memory_kind{MemoryKind::Host};
+};
+
+/// Asked for at most once, during initial establishment, with the number of
+/// bytes the receive plan needs. A region smaller than that fails establishment
+/// with ResourceExhausted. Reconnect reuses the region only while nothing else
+/// refers to it, and never asks again.
+using ReceiveAllocator = std::function<ReceiveRegion(std::uint64_t bytes)>;
+
+/// What a push callback receives: one delivered frame, or the terminal outcome
+/// of the Subscription. `error` is set exactly once, on the last event, and
+/// holds the same typed exception a pull reader would have caught.
+struct FrameEvent
+{
+    FrameView frame;
+    std::exception_ptr error;
+
+    bool terminal() const noexcept
+    {
+        return error != nullptr;
+    }
+};
+
+using FrameCallback = std::function<void(FrameEvent)>;
+
+/// Everything a caller decides about a Subscription. Supplying `on_frame`
+/// selects push delivery; leaving it empty selects pull.
+struct SubscriptionOptions
+{
+    std::string stream_name;
+
+    /// How much registered memory this Subscription may hold, including rings
+    /// retained from earlier Sessions. Ring depth and frame size derive from it.
+    std::uint64_t pinned_budget_bytes{1ull << 30};
+
+    RecoveryPolicy recovery_policy{RecoveryPolicy::Reconnect};
+    QueuePolicy queue_policy{QueuePolicy::PreserveOrder};
+    GeometryExpectation expect;
+
+    /// Optional complete upper plan, intersected with discovery and the pinned
+    /// budget before Open. When absent those dimensions derive entirely from
+    /// discovery and the budget.
+    std::optional<ReceivePlan> receive_plan;
+
+    ReceiveAllocator receive_allocator;
+    FrameCallback on_frame;
+
+    /// One deadline for discovery, allocation, Open, Probe and transient retries.
+    std::uint32_t establishment_timeout_ms{30'000};
+
+    Status validate() const noexcept;
+};
 
 } // namespace TangoBulk
 

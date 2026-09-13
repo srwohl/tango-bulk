@@ -56,43 +56,49 @@ int main(int argc, char *argv[])
         // keeping it alive, and the subscriber never copies it.
         Tango::DeviceProxy proxy(device);
 
-        // BulkOpen can clamp a request downward, but it cannot make an
-        // undersized receive slot larger. Until StreamOffer discovery is
-        // available, use an explicit complete upper plan rather than relying on discovery
-        // shaped preflight. This is conservative but safe for any valid peer.
-        TangoBulk::SubscriberConfig config;
-        config.stream_name = stream;
-        config.receive_plan = TangoBulk::ReceivePlan{
-            TangoBulk::k_max_frame_bytes_hard_cap, TangoBulk::k_min_ring_depth, 2};
+        // The stream's geometry and sizing come from the device's BulkStreams
+        // attribute; the receive ring is derived from that and the pinned budget.
+        TangoBulk::SubscriptionOptions options;
+        options.stream_name = stream;
 
-        // The default Push mode. A library-owned dispatch thread invokes the callback, so
-        // it never runs on the UCX engine thread (5.2) -- which is what lets a
-        // slow consumer be slow without stalling the transport.  Swap in
-        // Pull mode and call read_for() to own frame reads yourself.
-        config.delivery_mode = TangoBulk::DeliveryMode::Push;
-
-        // 4.1: keep trying when the link drops, up to ten times with an
-        // exponential backoff capped at the lease TTL.
-        config.recovery_policy = TangoBulk::RecoveryPolicy::Reconnect;
+        // Keep trying when the link drops, with a bounded backoff.
+        options.recovery_policy = TangoBulk::RecoveryPolicy::Reconnect;
 
         std::atomic<std::uint64_t> frames{0};
         std::atomic<std::uint64_t> bytes{0};
 
-        TangoBulk::SubscriptionCallbacks callbacks;
-
-        callbacks.on_frame =
-            [&frames, &bytes](TangoBulk::FrameView view)
+        // Supplying a callback selects push delivery: a library-owned dispatch
+        // thread invokes it, never the UCX engine thread, so a slow consumer
+        // cannot stall the transport.  Leave it empty and call read_for() to
+        // own frame reads yourself.
+        options.on_frame =
+            [&frames, &bytes](TangoBulk::FrameEvent event)
             {
-                // `view.data()` points into the registered receive ring.  It is
-                // valid for as long as any copy of this view is alive, and the
-                // credit for its slot is withheld until the last one dies (5.5).
+                if(event.terminal())
+                {
+                    // The last event: the session ended and was not replaced.
+                    try
+                    {
+                        std::rethrow_exception(event.error);
+                    }
+                    catch(const TangoBulk::BulkException &e)
+                    {
+                        std::cerr << "stream ended: " << e.what() << std::endl;
+                    }
+                    running.store(false);
+                    return;
+                }
+
+                // `frame.data()` points into the registered receive ring.  It is
+                // valid for as long as any copy of the view is alive, and the
+                // credit for its slot is withheld until the last one dies.
                 // So: consume it here, or copy it -- but do not stash the view
                 // and expect the stream to keep flowing.
                 frames.fetch_add(1, std::memory_order_relaxed);
-                bytes.fetch_add(view.size(), std::memory_order_relaxed);
+                bytes.fetch_add(event.frame.size(), std::memory_order_relaxed);
             };
 
-        auto subscription = TangoBulk::subscribe(proxy, config, std::move(callbacks));
+        auto subscription = TangoBulk::subscribe(proxy, options);
         const TangoBulk::ReceivePlan actual = subscription->plan();
         std::cout << "granted receive plan: max_frame_bytes=" << actual.max_frame_bytes
                   << " ring_depth=" << actual.ring_depth
@@ -123,7 +129,7 @@ int main(int argc, char *argv[])
             last_bytes = total_bytes;
         }
 
-        const TangoBulk::SubscriberCounters counters = subscription->counters();
+        const TangoBulk::SubscriberCounters counters = subscription->snapshot().counters;
 
         subscription.reset();
         std::cout << "received=" << counters.frames_received
@@ -136,7 +142,7 @@ int main(int argc, char *argv[])
     catch(const TangoBulk::BulkException &e)
     {
         std::cerr << "bulk error (" << TangoBulk::to_string(e.error().status)
-                  << ", from " << e.error().origin << "): " << e.error().message << std::endl;
+                  << ", from " << TangoBulk::to_string(e.error().origin) << "): " << e.error().message << std::endl;
         return 1;
     }
     catch(const Tango::DevFailed &failure)

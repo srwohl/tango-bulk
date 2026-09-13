@@ -5,11 +5,14 @@
 #ifndef TANGO_BULK_SRC_TANGO_BULK_COMMANDS_H
 #define TANGO_BULK_SRC_TANGO_BULK_COMMANDS_H
 
+#include "command_discovery.h"
+
 #include <core/publisher_internal.h>
 
 #include <tango-bulk/tango.h>
 
 #include <cstddef>
+#include <optional>
 #include <vector>
 
 // Internal header of the Tango layer: the seam between the command classes

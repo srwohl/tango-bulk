@@ -47,15 +47,6 @@ enum class Endian : std::uint32_t
     Big = 1,
 };
 
-/// What to discard when a bounded queue or ring is full.
-enum class DropPolicy : std::uint32_t
-{
-    DropNewest = 0, ///< reject the frame being published (producer default)
-    DropOldest = 1, ///< delivery queue only; illegal on the producer ring
-};
-
-const char *to_string(DropPolicy policy) noexcept;
-
 const char *to_string(ElementType type) noexcept;
 const char *to_string(MemoryKind kind) noexcept;
 

@@ -5,6 +5,8 @@
 #ifndef TANGO_BULK_SRC_UCX_UCX_CONTEXT_H
 #define TANGO_BULK_SRC_UCX_UCX_CONTEXT_H
 
+#include <tango-bulk/errors.h>
+
 #include <ucp/api/ucp.h>
 
 #include <cstddef>
@@ -93,7 +95,7 @@ class UcxWorker
 };
 
 /// Throw a BulkException carrying a UCX status and the call that produced it.
-[[noreturn]] void throw_ucx_error(const char *what, ucs_status_t status, const char *origin);
+[[noreturn]] void throw_ucx_error(const char *what, ucs_status_t status, Origin origin);
 
 } // namespace TangoBulk::detail
 

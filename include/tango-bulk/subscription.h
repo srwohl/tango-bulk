@@ -10,9 +10,9 @@
 #include <tango-bulk/subscriber.h>
 
 #include <chrono>
-#include <cstddef>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace TangoBulk
 {
@@ -21,17 +21,21 @@ namespace detail
 class SubscriptionFactory;
 } // namespace detail
 
-struct SubscriptionCallbacks
-{
-    FrameCallback on_frame;
-};
-
+/// One observation of a Subscription. Sampled together and stamped with the
+/// steady-clock time it was taken; never authority for anything.
 struct SubscriptionSnapshot
 {
     SubscriberState state{SubscriberState::Closed};
+    bool interrupted{false};
     BulkError error{};
     SubscriberCounters counters{};
-    bool interrupted{false};
+
+    std::string session_id; ///< log form of the current Session, empty when none
+    std::uint32_t lease_ttl_ms{0};
+    std::uint32_t renew_interval_ms{0};
+    std::uint64_t last_renewal_steady_ns{0};   ///< 0 until a renewal succeeds
+    std::uint64_t max_renewal_lateness_ms{0};  ///< worst delay past the scheduled renewal
+    std::uint64_t sampled_at_steady_ns{0};
 };
 
 class Subscription
@@ -46,18 +50,16 @@ class Subscription
 
     void interrupt() noexcept;
 
-    /// Claim one frame without registering a callback. Returns no value only
-    /// when no frame is ready; terminal lifecycle outcomes are reported as a
-    /// BulkException. Only available for DeliveryMode::Pull.
+    /// Claim one frame without waiting. Empty only when no frame is ready;
+    /// terminal outcomes throw their typed exception. Pull delivery only.
     std::optional<FrameView> try_read();
 
-    /// Claim one frame, waiting up to `timeout`. A timeout is represented by
-    /// an empty optional and is distinct from close, interruption, and failure.
-    /// Only available for DeliveryMode::Pull.
+    /// Claim one frame, waiting up to `timeout`. Empty only on expiry, which is
+    /// distinct from close, interruption and failure. Pull delivery only.
     std::optional<FrameView> read_for(std::chrono::milliseconds timeout);
 
-    SubscriberState state() const noexcept;
-
+    /// Advisory readiness descriptor for pull delivery, stable across
+    /// reconnects; -1 for push delivery.
     int fd() const noexcept;
 
     Geometry geometry() const noexcept;
@@ -65,8 +67,6 @@ class Subscription
     ReceivePlan plan() const noexcept;
 
     SubscriptionSnapshot snapshot() const noexcept;
-
-    SubscriberCounters counters() const noexcept;
 
   private:
     friend class detail::SubscriptionFactory;

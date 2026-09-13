@@ -444,12 +444,12 @@ int run_publisher(const Options &options)
 
 int run_subscriber(const Options &options)
 {
-    SubscriberConfig config;
+    SubscriptionOptions config;
     config.stream_name = options.stream;
     config.receive_plan = ReceivePlan{options.size, options.ring_depth, options.credit_window};
-    config.delivery_queue_depth = std::max<std::uint32_t>(64, options.ring_depth * 2);
-    config.delivery_mode = DeliveryMode::Pull;
-    config.ucx_tls = options.tls;
+
+    detail::TransportOptions transport_options;
+    transport_options.ucx_tls = options.tls;
 
     const OobChannel oob = OobChannel::connect_to(options.host, options.port);
 
@@ -491,7 +491,8 @@ int run_subscriber(const Options &options)
     offer.geometry.shape[0] = options.size;
     offer.geometry.strides[0] = 1;
 
-    detail::TransportFactory transport = detail::make_subscriber_transport_factory(config);
+    detail::TransportFactory transport =
+        detail::make_subscriber_transport_factory(config.pinned_budget_bytes, transport_options);
     auto subscription = detail::SubscriptionFactory::open(
         config,
         std::move(offer),
@@ -503,7 +504,6 @@ int run_subscriber(const Options &options)
             return oob.recv(deadline);
         },
         std::move(transport),
-        SubscriptionCallbacks{},
         std::chrono::steady_clock::time_point::max());
 
     const ReceivePlan plan = subscription->plan();
@@ -542,7 +542,7 @@ int run_subscriber(const Options &options)
                                ? 0.0
                                : std::chrono::duration<double>(Clock::now() - start).count();
 
-    const SubscriberCounters counters = subscription->counters();
+    const SubscriberCounters counters = subscription->snapshot().counters;
 
     const std::uint64_t dropped_queue_full = counters.frames_dropped_queue_full;
 
@@ -617,7 +617,7 @@ int main(int argc, char **argv)
                      "tango-bulk-bench: %s (%s, from %s)\n",
                      e.error().message.c_str(),
                      to_string(e.error().status),
-                     e.error().origin.c_str());
+                     to_string(e.error().origin));
         return 2;
     }
     catch(const std::exception &e)

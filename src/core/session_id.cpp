@@ -23,7 +23,7 @@ namespace
 {
     BulkError error;
     error.status = Status::Internal;
-    error.origin = "protocol";
+    error.origin = Origin::Protocol;
     error.message = std::string{"cannot obtain cryptographic randomness: "} + what +
                     ": " + std::strerror(err);
     throw BulkException{std::move(error)};

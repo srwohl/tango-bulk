@@ -80,7 +80,7 @@ class RegisteredMemory
     static RegisteredMemory ucx_allocated(UcxContext &context,
                                           std::uint64_t bytes,
                                           std::uint64_t pinned_limit,
-                                          const char *origin = "publisher");
+                                          Origin origin = Origin::Publisher);
 
     /// Register caller-owned memory, including CUDA and ROCm device memory.
     /// The shared owner is retained for as long as UCX or any FrameView can

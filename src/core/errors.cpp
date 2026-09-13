@@ -54,20 +54,32 @@ const char *to_string(Status status) noexcept
     return "Unknown";
 }
 
+const char *to_string(Origin origin) noexcept
+{
+    switch(origin)
+    {
+    case Origin::Publisher:
+        return "publisher";
+    case Origin::Subscriber:
+        return "subscriber";
+    case Origin::Protocol:
+        return "protocol";
+    case Origin::Tango:
+        return "tango";
+    case Origin::Transport:
+        return "transport";
+    }
+
+    return "unknown";
+}
+
 namespace
 {
 
 std::string describe(const BulkError &err)
 {
-    std::string text;
-    text.reserve(err.origin.size() + err.message.size() + 24);
-
-    if(!err.origin.empty())
-    {
-        text += err.origin;
-        text += ": ";
-    }
-
+    std::string text = to_string(err.origin);
+    text += ": ";
     text += to_string(err.status);
 
     if(!err.message.empty())

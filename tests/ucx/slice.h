@@ -45,15 +45,16 @@ inline PublisherConfig publisher_config()
     return config;
 }
 
-inline SubscriberConfig subscriber_config()
+inline SubscriptionOptions subscription_options()
 {
-    SubscriberConfig config;
-    config.stream_name = "bulk.slice";
-    config.receive_plan = ReceivePlan{k_frame_bytes, k_ring_depth, k_credit_window};
-    config.delivery_queue_depth = 32;
-    config.delivery_mode = DeliveryMode::Pull;
-    return config;
+    SubscriptionOptions options;
+    options.stream_name = "bulk.slice";
+    options.receive_plan = ReceivePlan{k_frame_bytes, k_ring_depth, k_credit_window};
+    return options;
 }
+
+/// What a test does with one frame it drained.
+using FrameSink = std::function<void(FrameView)>;
 
 template <typename Predicate>
 bool eventually(Predicate predicate, std::chrono::milliseconds budget = 5s)
@@ -77,14 +78,15 @@ using CoordinationReplyTransform =
 
 inline std::unique_ptr<Subscription> open_subscription(
     BulkPublisher &publisher,
-    SubscriberConfig config = subscriber_config(),
+    SubscriptionOptions options = subscription_options(),
     CoordinationObserver observer = {},
     CoordinationReplyTransform transform = {})
 {
-    config.delivery_mode = DeliveryMode::Pull;
-    detail::TransportFactory transport = detail::make_subscriber_transport_factory(config);
+    options.on_frame = nullptr; // every slice reads for itself
+    detail::TransportFactory transport =
+        detail::make_subscriber_transport_factory(options.pinned_budget_bytes);
     return detail::SubscriptionFactory::open(
-        std::move(config),
+        std::move(options),
         publisher.snapshot().stream_offer(),
         [&publisher, observer = std::move(observer), transform = std::move(transform)](
             Protocol::CoordType type,
@@ -104,13 +106,12 @@ inline std::unique_ptr<Subscription> open_subscription(
             return reply;
         },
         std::move(transport),
-        SubscriptionCallbacks{},
         std::chrono::steady_clock::time_point::max());
 }
 
 inline std::size_t drain(Subscription &subscription,
                          std::chrono::milliseconds timeout,
-                         const FrameCallback &callback,
+                         const FrameSink &callback,
                          std::size_t max_frames = 0)
 {
     std::size_t drained = 0;
@@ -199,7 +200,7 @@ struct Slice
     std::unique_ptr<Subscription> subscription;
 
     explicit Slice(PublisherConfig pub = publisher_config(),
-                   SubscriberConfig sub = subscriber_config()) :
+                   SubscriptionOptions sub = subscription_options()) :
         publisher(std::move(pub)),
         subscription(open_subscription(publisher, std::move(sub)))
     {

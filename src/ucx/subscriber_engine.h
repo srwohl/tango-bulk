@@ -45,13 +45,14 @@ namespace TangoBulk::detail
 class ReceiveArena : public CreditSink
 {
   public:
+    /// An empty `region.owner` allocates a host ring; otherwise the caller's
+    /// region is registered and its ownership shared for as long as any view
+    /// or in-flight receive refers to it.
     ReceiveArena(std::shared_ptr<UcxContext> context,
                  std::uint64_t slot_bytes,
                  std::uint32_t depth,
                  std::uint64_t pinned_limit,
-                 std::shared_ptr<void> receive_buffer,
-                 std::uint64_t receive_buffer_bytes,
-                 MemoryKind memory_kind);
+                 ReceiveRegion region);
 
     /// 5.5: called from the lease destructor, on any thread.  Pushes and
     /// nothing else -- no blocking, no allocation, no UCX.
@@ -116,7 +117,9 @@ class SubscriberEngine final : public SubscriberTransport
 {
   public:
     SubscriberEngine(ReceivePlan plan,
-                     const SubscriberConfig &config,
+                     ReceiveRegion region,
+                     std::uint64_t pinned_limit,
+                     TransportOptions options,
                      std::shared_ptr<DeliveryIngress> delivery);
     ~SubscriberEngine() override;
 

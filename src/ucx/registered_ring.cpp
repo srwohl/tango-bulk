@@ -18,7 +18,7 @@ constexpr std::size_t k_alias_threshold = 256u << 10;
 
 std::uint64_t checked_region_bytes(std::size_t stride,
                                    std::uint32_t depth,
-                                   const char *origin)
+                                   Origin origin)
 {
     if(depth != 0 && stride > std::numeric_limits<std::uint64_t>::max() / depth)
     {
@@ -33,7 +33,7 @@ std::uint64_t checked_region_bytes(std::size_t stride,
 std::uint64_t checked_caller_region(std::uint64_t slot_bytes,
                                     std::uint32_t depth,
                                     std::uint64_t supplied,
-                                    const char *origin)
+                                    Origin origin)
 {
     if(depth != 0 && slot_bytes > std::numeric_limits<std::uint64_t>::max() / depth)
     {
@@ -78,7 +78,7 @@ RegisteredRing::RegisteredRing(UcxContext &context,
                                std::uint32_t depth,
                                bool pad_stride,
                                std::uint64_t pinned_limit,
-                               const char *origin) :
+                               Origin origin) :
     memory_(RegisteredMemory::ucx_allocated(
         context,
         checked_region_bytes(compute_stride(slot_bytes, pad_stride), depth, origin),
@@ -103,7 +103,7 @@ RegisteredRing::RegisteredRing(UcxContext &context,
     memory_(RegisteredMemory::adopted(
         context,
         std::move(receive_buffer),
-        checked_caller_region(slot_bytes, depth, receive_buffer_bytes, "subscriber"),
+        checked_caller_region(slot_bytes, depth, receive_buffer_bytes, Origin::Subscriber),
         memory_kind,
         pinned_limit)),
     base_(memory_.base()),

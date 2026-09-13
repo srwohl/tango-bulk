@@ -11,8 +11,10 @@
 #include <tango-bulk/subscription.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace TangoBulk::detail
@@ -43,10 +45,22 @@ class SubscriberTransport
     SubscriberTransport() = default;
 };
 
-using TransportFactory = std::function<std::unique_ptr<SubscriberTransport>(
-    const ReceivePlan &, std::shared_ptr<DeliveryIngress>)>;
+/// Expert transport settings. Not part of the stable interface: tests and the
+/// benchmark reach them through this seam, applications do not.
+struct TransportOptions
+{
+    std::string ucx_tls;        ///< UCX_TLS; empty lets UCX choose
+    int engine_cpu_affinity{-1}; ///< -1 leaves the engine thread unpinned
+};
 
-TransportFactory make_subscriber_transport_factory(SubscriberConfig config);
+/// Builds one transport per Session. An empty `ReceiveRegion::owner` asks the
+/// transport to allocate its own host ring; otherwise it registers the caller's
+/// region and shares its ownership.
+using TransportFactory = std::function<std::unique_ptr<SubscriberTransport>(
+    const ReceivePlan &, ReceiveRegion, std::shared_ptr<DeliveryIngress>)>;
+
+TransportFactory make_subscriber_transport_factory(std::uint64_t pinned_budget_bytes,
+                                                   TransportOptions options = {});
 
 } // namespace TangoBulk::detail
 

@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
+#include "bulk_commands.h"
+
 #include <core/subscription_internal.h>
 
 #include <tango-bulk/protocol.h>
@@ -242,20 +244,72 @@ Status discovery_failure_status(const StreamOffer &offer) noexcept
 
 // ---------------------------------------------------------------------------
 
+/// Recognise the three bulk commands by the argument descriptions they were
+/// installed with, whatever the device named them. One `command_list_query`
+/// within the establishment deadline; a device with no bulk stream reports
+/// UnknownStream, which is what a missing publisher looks like from outside.
+CommandNames detail::discover_command_names(Tango::DeviceProxy &proxy,
+                                            std::chrono::steady_clock::time_point deadline,
+                                            std::uint32_t fallback_timeout_ms)
+{
+    const std::uint32_t timeout_ms = remaining_timeout_ms(deadline, fallback_timeout_ms);
+    if(timeout_ms == 0)
+    {
+        throw EstablishmentError(BulkError{Status::TransportFailure,
+                                           "command discovery deadline expired",
+                                           Origin::Tango});
+    }
+
+    std::vector<detail::CommandDescriptor> descriptors;
+    try
+    {
+        const ScopedTimeout guard(proxy, timeout_ms);
+        std::unique_ptr<Tango::CommandInfoList> commands(proxy.command_list_query());
+        if(commands)
+        {
+            descriptors.reserve(commands->size());
+            for(const Tango::CommandInfo &info : *commands)
+            {
+                descriptors.push_back(
+                    detail::CommandDescriptor{info.cmd_name,
+                                              info.in_type == Tango::DEVVAR_CHARARRAY,
+                                              info.out_type == Tango::DEVVAR_CHARARRAY,
+                                              info.in_type_desc,
+                                              info.out_type_desc});
+            }
+        }
+    }
+    catch(const Tango::DevFailed &failure)
+    {
+        throw EstablishmentError(
+            BulkError{Status::TransportFailure, describe(failure), Origin::Tango});
+    }
+
+    CommandNames names;
+    const Status status = detail::match_bulk_commands(descriptors, names);
+    if(status == Status::UnknownStream)
+    {
+        throw EstablishmentError(BulkError{status,
+                                           "the device does not expose the bulk commands",
+                                           Origin::Tango});
+    }
+    if(status != Status::Ok)
+    {
+        throw EstablishmentError(
+            BulkError{status, "the device exposes more than one set of bulk commands", Origin::Tango});
+    }
+    return names;
+}
+
 class CommandChannel
 {
   public:
-    CommandChannel(Tango::DeviceProxy &device_proxy,
-                   CommandNames command_names,
-                   std::uint32_t timeout_ms) :
+    CommandChannel(Tango::DeviceProxy &device_proxy, CommandNames command_names) :
         proxy(device_proxy),
-        names(std::move(command_names)),
-        command_timeout_ms(timeout_ms)
+        names(std::move(command_names))
     {
     }
 
-    ///
-    ///
     std::vector<std::byte> command(Protocol::CoordType kind,
                                    const std::vector<std::byte> &request,
                                    std::chrono::steady_clock::time_point deadline);
@@ -276,12 +330,11 @@ class CommandChannel
         }
 
         throw BulkException(BulkError{
-            Status::Internal, "no bulk command carries this coordination message", "tango"});
+            Status::Internal, "no bulk command carries this coordination message", Origin::Tango});
     }
 
     Tango::DeviceProxy &proxy; ///< BORROWED; the caller keeps it alive (7.4)
     CommandNames names;
-    std::uint32_t command_timeout_ms;
 };
 
 std::vector<std::byte> CommandChannel::command(Protocol::CoordType kind,
@@ -292,7 +345,9 @@ std::vector<std::byte> CommandChannel::command(Protocol::CoordType kind,
 
     try
     {
-        std::uint32_t timeout_ms = command_timeout_ms;
+        // The Subscription bounds every call by its deadline; the proxy's own
+        // timeout is the bound only when it gives none.
+        std::optional<ScopedTimeout> guard;
         if(deadline != std::chrono::steady_clock::time_point::max())
         {
             const auto remaining = deadline - std::chrono::steady_clock::now();
@@ -300,7 +355,7 @@ std::vector<std::byte> CommandChannel::command(Protocol::CoordType kind,
             {
                 throw BulkException(BulkError{Status::TransportFailure,
                                               "coordination deadline expired",
-                                              "tango"});
+                                              Origin::Tango});
             }
 
             auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
@@ -308,9 +363,10 @@ std::vector<std::byte> CommandChannel::command(Protocol::CoordType kind,
             {
                 ++remaining_ms;
             }
-            const auto bounded = std::max<std::int64_t>(1, remaining_ms.count());
-            timeout_ms = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                command_timeout_ms, static_cast<std::uint64_t>(bounded)));
+            guard.emplace(proxy,
+                          static_cast<std::uint32_t>(std::min<std::int64_t>(
+                              std::max<std::int64_t>(1, remaining_ms.count()),
+                              std::numeric_limits<int>::max())));
         }
 
         std::vector<unsigned char> in(request.size());
@@ -322,14 +378,13 @@ std::vector<std::byte> CommandChannel::command(Protocol::CoordType kind,
         Tango::DeviceData argument;
         argument << in;
 
-        const ScopedTimeout guard(proxy, timeout_ms);
         Tango::DeviceData reply = proxy.command_inout(name, argument);
 
         std::vector<unsigned char> out;
         if(!(reply >> out))
         {
             throw BulkException(BulkError{
-                Status::MalformedMessage, name + " did not return a DevVarCharArray", "tango"});
+                Status::MalformedMessage, name + " did not return a DevVarCharArray", Origin::Tango});
         }
 
         std::vector<std::byte> bytes(out.size());
@@ -341,7 +396,7 @@ std::vector<std::byte> CommandChannel::command(Protocol::CoordType kind,
     }
     catch(const Tango::DevFailed &failure)
     {
-        throw BulkException(BulkError{Status::TransportFailure, describe(failure), "tango"});
+        throw BulkException(BulkError{Status::TransportFailure, describe(failure), Origin::Tango});
     }
 }
 
@@ -358,50 +413,54 @@ StreamOffer discover(Tango::DeviceProxy &proxy,
     if(!offer.available())
     {
         const Status status = discovery_failure_status(offer);
-        throw BulkException(BulkError{status,
-                                      offer.message.empty() ? "BulkStreams discovery failed"
-                                                            : offer.message,
-                                      "tango"});
+        throw EstablishmentError(BulkError{status,
+                                           offer.message.empty() ? "BulkStreams discovery failed"
+                                                                 : offer.message,
+                                           Origin::Tango});
     }
     return offer;
 }
 
 // ---------------------------------------------------------------------------
 
-
-std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
-                                        SubscriberConfig config,
-                                        SubscriptionCallbacks callbacks,
-                                        const CommandNames &names)
+std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy, SubscriptionOptions options)
 {
-    const auto discovery_deadline =
-        std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(config.establishment_timeout_ms);
-    TangoStreamDiscovery discovery(proxy, config.command_timeout_ms);
-    StreamOffer offer = discovery.discover(config.stream_name, discovery_deadline);
+    if(const Status status = options.validate(); status != Status::Ok)
+    {
+        throw ConfigurationError(BulkError{status,
+                                           std::string("invalid SubscriptionOptions: ") +
+                                               to_string(status),
+                                           Origin::Tango});
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(options.establishment_timeout_ms);
+
+    TangoStreamDiscovery discovery(proxy, options.establishment_timeout_ms);
+    StreamOffer offer = discovery.discover(options.stream_name, deadline);
     if(!offer.available())
     {
         const Status status = discovery_failure_status(offer);
-        throw BulkException(BulkError{status,
-                                      offer.message.empty() ? "BulkStreams discovery failed"
-                                                            : offer.message,
-                                      "tango"});
+        throw EstablishmentError(BulkError{status,
+                                           offer.message.empty() ? "BulkStreams discovery failed"
+                                                                 : offer.message,
+                                           Origin::Tango});
     }
 
-    const auto adapter = std::make_shared<CommandChannel>(proxy, names, config.command_timeout_ms);
+    const auto adapter = std::make_shared<CommandChannel>(
+        proxy, detail::discover_command_names(proxy, deadline, options.establishment_timeout_ms));
     detail::TransportFactory transport_factory =
-        detail::make_subscriber_transport_factory(config);
+        detail::make_subscriber_transport_factory(options.pinned_budget_bytes);
 
     return detail::SubscriptionFactory::open(
-        std::move(config),
+        std::move(options),
         std::move(offer),
         [adapter](Protocol::CoordType kind,
                   const std::vector<std::byte> &request,
-                  std::chrono::steady_clock::time_point deadline)
-        { return adapter->command(kind, request, deadline); },
+                  std::chrono::steady_clock::time_point call_deadline)
+        { return adapter->command(kind, request, call_deadline); },
         std::move(transport_factory),
-        std::move(callbacks),
-        discovery_deadline);
+        deadline);
 }
 
 } // namespace TangoBulk

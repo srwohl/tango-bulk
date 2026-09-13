@@ -78,27 +78,25 @@ ReceiveArena::ReceiveArena(std::shared_ptr<UcxContext> context,
                            std::uint64_t slot_bytes,
                            std::uint32_t depth,
                            std::uint64_t pinned_limit,
-                           std::shared_ptr<void> receive_buffer,
-                           std::uint64_t receive_buffer_bytes,
-                           MemoryKind memory_kind) :
+                           ReceiveRegion region) :
     context_(std::move(context)),
     // The receive ring never pads its stride: 6.2's extra page exists to break
     // cache-set aliasing on the *copy* the receiver would otherwise do, and this
     // path lands the payload in the slot directly.  It is the publisher's ring
     // that pays that tax.
-    ring_(receive_buffer ? RegisteredRing(*context_,
-                                          slot_bytes,
-                                          depth,
-                                          std::move(receive_buffer),
-                                          receive_buffer_bytes,
-                                          memory_kind,
-                                          pinned_limit)
-                         : RegisteredRing(*context_,
-                                          slot_bytes,
-                                          depth,
-                                          false,
-                                          pinned_limit,
-                                          "subscriber")),
+    ring_(region.owner ? RegisteredRing(*context_,
+                                        slot_bytes,
+                                        depth,
+                                        std::move(region.owner),
+                                        region.bytes,
+                                        region.memory_kind,
+                                        pinned_limit)
+                       : RegisteredRing(*context_,
+                                        slot_bytes,
+                                        depth,
+                                        false,
+                                        pinned_limit,
+                                        Origin::Subscriber)),
     slots_(depth),
     credit_returns_(static_cast<std::size_t>(depth) * 2),
     lease_pool_(std::make_shared<LeasePool>(static_cast<std::size_t>(depth) + 8))
@@ -152,10 +150,12 @@ struct SubscriberEngine::Pending
 };
 
 SubscriberEngine::SubscriberEngine(ReceivePlan plan,
-                                   const SubscriberConfig &config,
+                                   ReceiveRegion region,
+                                   std::uint64_t pinned_limit,
+                                   TransportOptions options,
                                    std::shared_ptr<DeliveryIngress> delivery) :
-    memory_kind_(config.receive_memory_kind),
-    engine_cpu_affinity_(config.engine_cpu_affinity),
+    memory_kind_(region.owner ? region.memory_kind : MemoryKind::Host),
+    engine_cpu_affinity_(options.engine_cpu_affinity),
     tracker_(plan.ring_depth),
     delivery_(std::move(delivery)),
     pending_(plan.ring_depth)
@@ -163,23 +163,18 @@ SubscriberEngine::SubscriberEngine(ReceivePlan plan,
     if(!delivery_)
     {
         throw BulkException(BulkError{
-            Status::Internal, "a subscriber transport needs a delivery queue", "subscriber"});
+            Status::Internal, "a subscriber transport needs a delivery queue", Origin::Subscriber});
     }
 
 
-    context_ = std::make_shared<UcxContext>(config.ucx_tls);
+    context_ = std::make_shared<UcxContext>(options.ucx_tls);
     worker_ = std::make_unique<UcxWorker>(*context_);
 
     // 4.1, `Opening` entry action, in this order: the ring is allocated,
     // registered and armed *before* Open goes out, because the publisher may
     // send the first frame the moment it replies.
-    arena_ = std::make_shared<ReceiveArena>(context_,
-                                            plan.max_frame_bytes,
-                                            plan.ring_depth,
-                                            config.pinned_memory_limit_bytes,
-                                            config.receive_buffer,
-                                            config.receive_buffer_bytes,
-                                            config.receive_memory_kind);
+    arena_ = std::make_shared<ReceiveArena>(
+        context_, plan.max_frame_bytes, plan.ring_depth, pinned_limit, std::move(region));
     sink_ = arena_;
 
     for(std::size_t i = 0; i < pending_.size(); ++i)
@@ -253,7 +248,7 @@ void SubscriberEngine::register_am_handlers()
         const ucs_status_t status = ucp_worker_set_am_recv_handler(worker_->get(), &param);
         if(status != UCS_OK)
         {
-            throw_ucx_error(what, status, "subscriber");
+            throw_ucx_error(what, status, Origin::Subscriber);
         }
     };
 
@@ -908,7 +903,7 @@ BulkError SubscriberEngine::last_error() const noexcept
         return BulkError{};
     }
 
-    return BulkError{failure_status_.load(std::memory_order_acquire), reason, "transport"};
+    return BulkError{failure_status_.load(std::memory_order_acquire), reason, Origin::Transport};
 }
 
 void SubscriberEngine::commit(std::size_t slot_index) noexcept
@@ -958,14 +953,17 @@ SubscriberCounters SubscriberEngine::counters() const noexcept
     return out;
 }
 
-TransportFactory make_subscriber_transport_factory(SubscriberConfig config)
+TransportFactory make_subscriber_transport_factory(std::uint64_t pinned_budget_bytes,
+                                                   TransportOptions options)
 {
-    return [config = std::move(config)](
+    return [pinned_budget_bytes, options = std::move(options)](
                const ReceivePlan &plan,
+               ReceiveRegion region,
                std::shared_ptr<DeliveryIngress> delivery)
                -> std::unique_ptr<SubscriberTransport>
     {
-        return std::make_unique<SubscriberEngine>(plan, config, std::move(delivery));
+        return std::make_unique<SubscriberEngine>(
+            plan, std::move(region), pinned_budget_bytes, options, std::move(delivery));
     };
 }
 

@@ -55,7 +55,7 @@ bool readable(int fd)
 
 TEST_CASE("a pushed frame comes back out in order", "[core][delivery]")
 {
-    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(4, QueuePolicy::PreserveOrder);
 
     for(std::uint64_t sequence = 1; sequence <= 3; ++sequence)
     {
@@ -81,7 +81,7 @@ TEST_CASE("a pushed frame comes back out in order", "[core][delivery]")
 
 TEST_CASE("capacity is rounded up to a power of two, and reported", "[core][delivery]")
 {
-    detail::DeliveryQueue queue(5, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(5, QueuePolicy::PreserveOrder);
     CHECK(queue.stats().capacity == 8);
 }
 
@@ -89,7 +89,7 @@ TEST_CASE("capacity is rounded up to a power of two, and reported", "[core][deli
 TEST_CASE("DropNewest refuses the arriving frame and keeps the queued ones",
           "[core][delivery]")
 {
-    detail::DeliveryQueue queue(2, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(2, QueuePolicy::PreserveOrder);
 
     CHECK(queue.push(frame_over(storage(1), 1)));
     CHECK(queue.push(frame_over(storage(2), 2)));
@@ -108,7 +108,7 @@ TEST_CASE("DropNewest refuses the arriving frame and keeps the queued ones",
 TEST_CASE("DropOldest evicts the head to make room for the arriving frame",
           "[core][delivery]")
 {
-    detail::DeliveryQueue queue(2, DropPolicy::DropOldest);
+    detail::DeliveryQueue queue(2, QueuePolicy::PreferFresh);
 
     const auto evicted = storage(1);
     CHECK(queue.push(frame_over(evicted, 1)));
@@ -131,7 +131,7 @@ TEST_CASE("a frame the caller kept outlives the queue", "[core][delivery]")
     FrameView kept;
 
     {
-        detail::DeliveryQueue queue(2, DropPolicy::DropNewest);
+        detail::DeliveryQueue queue(2, QueuePolicy::PreserveOrder);
         CHECK(queue.push(frame_over(payload, 9)));
         REQUIRE(queue.try_take(kept));
     }
@@ -150,7 +150,7 @@ TEST_CASE("frames still queued when the queue dies return their credit",
     const auto abandoned = storage(4);
 
     {
-        detail::DeliveryQueue queue(2, DropPolicy::DropNewest);
+        detail::DeliveryQueue queue(2, QueuePolicy::PreserveOrder);
         CHECK(queue.push(frame_over(abandoned, 4)));
         CHECK(abandoned.use_count() == 2);
     }
@@ -160,7 +160,7 @@ TEST_CASE("frames still queued when the queue dies return their credit",
 
 TEST_CASE("discard() empties the queue and returns every credit", "[core][delivery]")
 {
-    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(4, QueuePolicy::PreserveOrder);
 
     const auto first = storage(1);
     const auto second = storage(2);
@@ -183,7 +183,7 @@ TEST_CASE("discard() empties the queue and returns every credit", "[core][delive
 
 TEST_CASE("discard() leaves a frame already handed over alone", "[core][delivery]")
 {
-    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(4, QueuePolicy::PreserveOrder);
 
     const auto taken = storage(3);
     CHECK(queue.push(frame_over(taken, 3)));
@@ -199,7 +199,7 @@ TEST_CASE("discard() leaves a frame already handed over alone", "[core][delivery
 
 TEST_CASE("take() waits out its deadline when nothing arrives", "[core][delivery]")
 {
-    detail::DeliveryQueue queue(2, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(2, QueuePolicy::PreserveOrder);
 
     const auto started = std::chrono::steady_clock::now();
     FrameView frame;
@@ -213,7 +213,7 @@ TEST_CASE("take() waits out its deadline when nothing arrives", "[core][delivery
 TEST_CASE("take() returns as soon as a producer pushes and notifies",
           "[core][delivery]")
 {
-    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(4, QueuePolicy::PreserveOrder);
 
     std::thread producer([&queue] {
         std::this_thread::sleep_for(20ms);
@@ -235,11 +235,11 @@ TEST_CASE("take() returns as soon as a producer pushes and notifies",
 TEST_CASE("a session failure breaks a blocked take() out with nothing queued",
           "[core][delivery]")
 {
-    detail::DeliveryQueue queue(2, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(2, QueuePolicy::PreserveOrder);
 
     std::thread stopper([&queue] {
         std::this_thread::sleep_for(20ms);
-        queue.fail(BulkError{Status::TransportFailure, "session failed", "test"});
+        queue.fail(BulkError{Status::TransportFailure, "session failed", Origin::Transport});
     });
 
     const auto started = std::chrono::steady_clock::now();
@@ -256,11 +256,11 @@ TEST_CASE("a session failure breaks a blocked take() out with nothing queued",
 TEST_CASE("a failed session hands over accepted frames, then stops waiting",
           "[core][delivery]")
 {
-    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(4, QueuePolicy::PreserveOrder);
 
     CHECK(queue.push(frame_over(storage(1), 1)));
     CHECK(queue.push(frame_over(storage(2), 2)));
-    queue.fail(BulkError{Status::TransportFailure, "session failed", "test"});
+    queue.fail(BulkError{Status::TransportFailure, "session failed", Origin::Transport});
 
     const auto started = std::chrono::steady_clock::now();
 
@@ -279,8 +279,8 @@ TEST_CASE("a failed session hands over accepted frames, then stops waiting",
 TEST_CASE("a failed session refuses new ingress and accounts it as discarded",
           "[core][delivery]")
 {
-    detail::DeliveryQueue queue(2, DropPolicy::DropNewest);
-    queue.fail(BulkError{Status::TransportFailure, "session failed", "test"});
+    detail::DeliveryQueue queue(2, QueuePolicy::PreserveOrder);
+    queue.fail(BulkError{Status::TransportFailure, "session failed", Origin::Transport});
 
     const auto payload = storage(3);
     CHECK_FALSE(queue.push(frame_over(payload, 3)));
@@ -292,7 +292,7 @@ TEST_CASE("a failed session refuses new ingress and accounts it as discarded",
 
 TEST_CASE("push() with nobody armed makes no signal at all", "[core][delivery]")
 {
-    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(4, QueuePolicy::PreserveOrder);
     REQUIRE(queue.fd() >= 0);
 
     CHECK(queue.push(frame_over(storage(1), 1)));
@@ -303,7 +303,7 @@ TEST_CASE("push() with nobody armed makes no signal at all", "[core][delivery]")
 TEST_CASE("an empty try_take() arms, so the next push() is seen",
           "[core][delivery]")
 {
-    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(4, QueuePolicy::PreserveOrder);
     REQUIRE(queue.fd() >= 0);
 
     FrameView frame;
@@ -320,7 +320,7 @@ TEST_CASE("an empty try_take() arms, so the next push() is seen",
 TEST_CASE("a frame that arrives between the look and the wait is not lost",
           "[core][delivery]")
 {
-    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(4, QueuePolicy::PreserveOrder);
 
     FrameView frame;
     CHECK_FALSE(queue.try_take(frame));
@@ -336,7 +336,7 @@ TEST_CASE("a frame that arrives between the look and the wait is not lost",
 TEST_CASE("many frames survive a producer and a consumer running at once",
           "[core][delivery]")
 {
-    detail::DeliveryQueue queue(64, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(64, QueuePolicy::PreserveOrder);
     constexpr std::uint64_t k_frames = 2'000;
 
     std::atomic<bool> refused{false};
@@ -380,11 +380,11 @@ TEST_CASE("many frames survive a producer and a consumer running at once",
 TEST_CASE("a session failure drains accepted frames before its terminal result",
           "[core][delivery]")
 {
-    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(4, QueuePolicy::PreserveOrder);
     REQUIRE(queue.push(frame_over(storage(1), 1)));
     REQUIRE(queue.push(frame_over(storage(2), 2)));
 
-    queue.fail(BulkError{Status::TransportFailure, "session failed", "test"});
+    queue.fail(BulkError{Status::TransportFailure, "session failed", Origin::Transport});
 
     auto first = queue.try_read_result();
     REQUIRE(first.kind == detail::DeliveryRead::Kind::Frame);
@@ -403,13 +403,13 @@ TEST_CASE("a session failure drains accepted frames before its terminal result",
 TEST_CASE("close and interrupt discard queued frames and report distinct outcomes",
           "[core][delivery]")
 {
-    detail::DeliveryQueue closed(2, DropPolicy::DropNewest);
+    detail::DeliveryQueue closed(2, QueuePolicy::PreserveOrder);
     REQUIRE(closed.push(frame_over(storage(1), 1)));
     closed.close();
     CHECK(closed.stats().discarded == 1);
     CHECK(closed.try_read_result().kind == detail::DeliveryRead::Kind::Closed);
 
-    detail::DeliveryQueue interrupted(2, DropPolicy::DropNewest);
+    detail::DeliveryQueue interrupted(2, QueuePolicy::PreserveOrder);
     REQUIRE(interrupted.push(frame_over(storage(2), 2)));
     interrupted.interrupt();
     CHECK(interrupted.stats().discarded == 1);
@@ -418,7 +418,7 @@ TEST_CASE("close and interrupt discard queued frames and report distinct outcome
 
 TEST_CASE("retiring an ingress rejects late transport progress", "[core][delivery]")
 {
-    detail::DeliveryQueue queue(4, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(4, QueuePolicy::PreserveOrder);
     const auto old = queue.make_ingress();
     const int descriptor = queue.fd();
 
@@ -437,13 +437,13 @@ TEST_CASE("retiring an ingress rejects late transport progress", "[core][deliver
 
 TEST_CASE("competing pull readers claim each frame at most once", "[core][delivery]")
 {
-    detail::DeliveryQueue queue(256, DropPolicy::DropNewest);
+    detail::DeliveryQueue queue(256, QueuePolicy::PreserveOrder);
     constexpr std::uint64_t frame_count = 128;
     for(std::uint64_t sequence = 1; sequence <= frame_count; ++sequence)
     {
         REQUIRE(queue.push(frame_over(storage(static_cast<std::uint16_t>(sequence)), sequence)));
     }
-    queue.fail(BulkError{Status::TransportFailure, "session failed", "test"});
+    queue.fail(BulkError{Status::TransportFailure, "session failed", Origin::Transport});
 
     std::mutex mutex;
     std::set<std::uint64_t> sequences;

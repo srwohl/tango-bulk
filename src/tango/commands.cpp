@@ -67,7 +67,7 @@ class CoordinationCommand : public Tango::Command
                        Tango::DEVVAR_CHARARRAY,
                        Tango::DEVVAR_CHARARRAY,
                        description,
-                       "Encoded tango-bulk coordination reply",
+                       k_reply_description,
                        level),
         expected_(expected)
     {
@@ -115,19 +115,54 @@ std::vector<Tango::Command *> make_bulk_commands(const CommandNames &names)
     // device server's existing Tango policy is the authority, and this is the
     // extension telling it which side of the line each command is on.
     return {
-        new CoordinationCommand(names.open,
-                                Protocol::CoordType::Open,
-                                Tango::EXPERT,
-                                "Encoded tango-bulk Open request"),
-        new CoordinationCommand(names.renew,
-                                Protocol::CoordType::Renew,
-                                Tango::EXPERT,
-                                "Encoded tango-bulk Renew request"),
-        new CoordinationCommand(names.close,
-                                Protocol::CoordType::Close,
-                                Tango::EXPERT,
-                                "Encoded tango-bulk Close request"),
+        new CoordinationCommand(
+            names.open, Protocol::CoordType::Open, Tango::EXPERT, k_open_request_description),
+        new CoordinationCommand(
+            names.renew, Protocol::CoordType::Renew, Tango::EXPERT, k_renew_request_description),
+        new CoordinationCommand(
+            names.close, Protocol::CoordType::Close, Tango::EXPERT, k_close_request_description),
     };
+}
+
+Status match_bulk_commands(const std::vector<CommandDescriptor> &commands,
+                           CommandNames &names) noexcept
+{
+    std::string *slots[3] = {&names.open, &names.renew, &names.close};
+    const char *requests[3] = {
+        k_open_request_description, k_renew_request_description, k_close_request_description};
+    bool claimed[3] = {false, false, false};
+
+    for(const CommandDescriptor &command : commands)
+    {
+        if(!command.char_array_in || !command.char_array_out ||
+           command.out_description != k_reply_description)
+        {
+            continue;
+        }
+
+        for(std::size_t role = 0; role < 3; ++role)
+        {
+            if(command.in_description != requests[role])
+            {
+                continue;
+            }
+            if(claimed[role])
+            {
+                return Status::MalformedMessage;
+            }
+            claimed[role] = true;
+            *slots[role] = command.name;
+        }
+    }
+
+    for(const bool found : claimed)
+    {
+        if(!found)
+        {
+            return Status::UnknownStream;
+        }
+    }
+    return Status::Ok;
 }
 
 } // namespace TangoBulk::detail

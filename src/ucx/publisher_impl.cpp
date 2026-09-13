@@ -425,7 +425,7 @@ struct BulkPublisher::Impl
             const ucs_status_t status = ucp_worker_set_am_recv_handler(worker->get(), &param);
             if(status != UCS_OK)
             {
-                detail::throw_ucx_error(what, status, "publisher");
+                detail::throw_ucx_error(what, status, Origin::Publisher);
             }
         };
 
@@ -1200,7 +1200,7 @@ struct BulkPublisher::Impl
         if(!completed || !task.ok)
         {
             throw BulkException(BulkError{
-                Status::TransportFailure, "could not create an endpoint to the client", "publisher"});
+                Status::TransportFailure, "could not create an endpoint to the client", Origin::Publisher});
         }
 
         return task.ep;
@@ -1327,14 +1327,14 @@ BulkPublisher::BulkPublisher(PublisherConfig config)
             throw BulkException(BulkError{geometry_status,
                                           std::string("invalid publisher frame geometry: ") +
                                               to_string(geometry_status),
-                                          "publisher"});
+                                          Origin::Publisher});
         }
     }
     const Status status = config.validate();
     if(status != Status::Ok)
     {
         throw BulkException(
-            BulkError{status, std::string("invalid PublisherConfig: ") + to_string(status), "publisher"});
+            BulkError{status, std::string("invalid PublisherConfig: ") + to_string(status), Origin::Publisher});
     }
 
     impl_ = std::make_unique<Impl>(std::move(config));
@@ -1749,7 +1749,7 @@ CoordinationReply BulkPublisher::Impl::handle_open(const Protocol::OpenRequest &
     {
         throw BulkException(BulkError{Status::MalformedMessage,
                                       "Open requested an unsupported transport",
-                                      "publisher"});
+                                      Origin::Publisher});
     }
 
     if(request.requested_memory_kind != MemoryKind::Host &&
@@ -1758,7 +1758,7 @@ CoordinationReply BulkPublisher::Impl::handle_open(const Protocol::OpenRequest &
     {
         throw BulkException(BulkError{Status::MalformedMessage,
                                       "Open requested an unsupported memory kind",
-                                      "publisher"});
+                                      Origin::Publisher});
     }
 
     // 3.5 step 2: version intersect.

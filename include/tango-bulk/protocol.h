@@ -137,6 +137,15 @@ enum class Transport : std::uint32_t
     Rma = 2,
 };
 
+/// Wire value of OpenRequest::drop_policy. The subscriber's queue policy is
+/// local (SubscriptionOptions::queue_policy) and no longer crosses the wire;
+/// clients send DropNewest and publishers ignore the field.
+enum class DropPolicy : std::uint32_t
+{
+    DropNewest = 0,
+    DropOldest = 1,
+};
+
 enum class CloseReason : std::uint32_t
 {
     Normal = 0,

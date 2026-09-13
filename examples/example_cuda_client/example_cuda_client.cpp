@@ -108,16 +108,18 @@ int main(int argc, char *argv[])
                                                  (void) cudaFree(pointer);
                                              });
 
-        TangoBulk::SubscriberConfig config;
+        TangoBulk::SubscriptionOptions config;
         config.stream_name = stream;
         config.receive_plan = TangoBulk::ReceivePlan{slot_bytes, ring_depth, credit_window};
-        config.delivery_mode = TangoBulk::DeliveryMode::Push;
         config.recovery_policy = TangoBulk::RecoveryPolicy::Reconnect;
-        config.receive_buffer = receive_buffer;
-        config.receive_buffer_bytes = ring_bytes;
-        config.receive_memory_kind = TangoBulk::MemoryKind::Cuda;
 
-        TangoBulk::SubscriptionCallbacks callbacks;
+        // The allocator is asked once, during establishment, for the bytes the
+        // plan needs; the CUDA allocation above is the answer, and it stays
+        // registered for as long as any delivered frame refers to it.
+        config.receive_allocator = [receive_buffer, ring_bytes](std::uint64_t)
+        {
+            return TangoBulk::ReceiveRegion{receive_buffer, ring_bytes, TangoBulk::MemoryKind::Cuda};
+        };
 
         std::atomic<std::uint64_t> frames{0};
         std::atomic<std::uint64_t> bytes{0};
@@ -125,10 +127,25 @@ int main(int argc, char *argv[])
         const auto buffer_begin = reinterpret_cast<std::uintptr_t>(device_memory);
         const auto buffer_end = buffer_begin + ring_bytes;
 
-        callbacks.on_frame =
-            [&frames, &bytes, gpu, buffer_begin, buffer_end](TangoBulk::FrameView view)
+        config.on_frame =
+            [&frames, &bytes, gpu, buffer_begin, buffer_end](TangoBulk::FrameEvent event)
             {
-                // DeliveryMode::Push runs this on a library thread,
+                if(event.terminal())
+                {
+                    try
+                    {
+                        std::rethrow_exception(event.error);
+                    }
+                    catch(const TangoBulk::BulkException &e)
+                    {
+                        std::cerr << "stream ended: " << e.what() << "\n";
+                    }
+                    running.store(false);
+                    return;
+                }
+                const TangoBulk::FrameView &view = event.frame;
+
+                // Push delivery runs this on a library thread,
                 // and the CUDA runtime's current device is per thread: the
                 // cudaSetDevice above bound main(), not this one, so a kernel
                 // launched below would go to device 0 whatever `gpu` says.
@@ -177,7 +194,7 @@ int main(int argc, char *argv[])
             });
 
         auto subscription =
-            TangoBulk::subscribe(proxy, config, std::move(callbacks));
+            TangoBulk::subscribe(proxy, config);
         const TangoBulk::ReceivePlan actual = subscription->plan();
         std::cout << "granted receive plan: max_frame_bytes=" << actual.max_frame_bytes
                   << " ring_depth=" << actual.ring_depth
@@ -205,7 +222,7 @@ int main(int argc, char *argv[])
             last_bytes = total_bytes;
         }
 
-        const TangoBulk::SubscriberCounters counters = subscription->counters();
+        const TangoBulk::SubscriberCounters counters = subscription->snapshot().counters;
         subscription.reset();
         std::cout << "received=" << counters.frames_received
                   << " delivered=" << counters.frames_delivered

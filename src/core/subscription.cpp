@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -22,14 +23,22 @@ namespace
 using namespace std::chrono_literals;
 
 constexpr auto k_control_quantum = 100ms;
-
 constexpr auto k_dispatch_quantum = 20ms;
 constexpr auto k_reconnect_backoff = 50ms;
 constexpr std::uint32_t k_reconnect_max_attempts = 10;
 
-ReceivePlan plan_receive(const SubscriberConfig &config, const StreamOffer &offer) noexcept
+/// ADR 0007: one total budget for close() and destruction, not one per
+/// request. A performance characteristic, not an option; its measurement is
+/// still owed.
+constexpr auto k_shutdown_budget = 5s;
+
+/// Bound on one coordination call before any lease has been granted, and the
+/// floor once one has: a call that outlasts the lease has failed by definition.
+constexpr std::uint32_t k_min_coordination_ms = 1'000;
+
+ReceivePlan plan_receive(const SubscriptionOptions &options, const StreamOffer &offer) noexcept
 {
-    if(offer.stream_name != config.stream_name || offer.validate() != Status::Ok)
+    if(offer.stream_name != options.stream_name || offer.validate() != Status::Ok)
     {
         return {};
     }
@@ -37,9 +46,9 @@ ReceivePlan plan_receive(const SubscriberConfig &config, const StreamOffer &offe
     ReceivePlan planned{offer.geometry.max_frame_bytes,
                         offer.geometry.ring_depth,
                         offer.geometry.credit_window};
-    if(config.receive_plan)
+    if(options.receive_plan)
     {
-        const ReceivePlan &upper = *config.receive_plan;
+        const ReceivePlan &upper = *options.receive_plan;
         planned.max_frame_bytes = std::min(planned.max_frame_bytes, upper.max_frame_bytes);
         planned.ring_depth = std::min(planned.ring_depth, upper.ring_depth);
         planned.credit_window = std::min(planned.credit_window, upper.credit_window);
@@ -50,15 +59,12 @@ ReceivePlan plan_receive(const SubscriberConfig &config, const StreamOffer &offe
         return {};
     }
 
-    const std::uint64_t budget_depth =
-        config.pinned_memory_limit_bytes / planned.max_frame_bytes;
-    planned.ring_depth = static_cast<std::uint32_t>(
-        std::min<std::uint64_t>(planned.ring_depth, budget_depth));
+    const std::uint64_t budget_depth = options.pinned_budget_bytes / planned.max_frame_bytes;
+    planned.ring_depth =
+        static_cast<std::uint32_t>(std::min<std::uint64_t>(planned.ring_depth, budget_depth));
     planned.credit_window = std::min(planned.credit_window, planned.ring_depth);
 
-    if(planned.validate() != Status::Ok ||
-       planned.pinned_bytes() > config.pinned_memory_limit_bytes ||
-       (config.receive_buffer && config.receive_buffer_bytes < planned.pinned_bytes()))
+    if(planned.validate() != Status::Ok || planned.pinned_bytes() > options.pinned_budget_bytes)
     {
         return {};
     }
@@ -96,37 +102,67 @@ void accumulate(SubscriberCounters &total, const SubscriberCounters &part) noexc
     total.pinned_bytes = part.pinned_bytes;
 }
 
-[[noreturn]] void throw_delivery_terminal(const detail::DeliveryRead &result)
+std::uint64_t steady_now_ns() noexcept
+{
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count());
+}
+
+/// The typed exception for a Session that ended and was not replaced.
+std::exception_ptr session_failure(BulkError error)
+{
+    switch(error.status)
+    {
+    case Status::GeometryMismatch:
+        return std::make_exception_ptr(GeometryChanged(std::move(error)));
+    case Status::ResourceExhausted:
+        return std::make_exception_ptr(ResourceExhausted(std::move(error)));
+    default:
+        return std::make_exception_ptr(SessionLost(std::move(error)));
+    }
+}
+
+/// The typed exception a delivery operation reports for a terminal read.
+std::exception_ptr terminal_exception(const detail::DeliveryRead &result)
 {
     switch(result.kind)
     {
     case detail::DeliveryRead::Kind::Closed:
-        throw BulkException(
-            BulkError{Status::Shutdown, "the subscription is closed", "subscriber"});
+        return std::make_exception_ptr(StreamClosed(
+            BulkError{Status::Shutdown, "the subscription is closed", Origin::Subscriber}));
     case detail::DeliveryRead::Kind::Interrupted:
-        throw BulkException(
-            BulkError{Status::Shutdown, "the subscription was interrupted", "subscriber"});
+        return std::make_exception_ptr(Interrupted(BulkError{
+            Status::Shutdown, "the subscription was interrupted", Origin::Subscriber}));
     case detail::DeliveryRead::Kind::SessionFailed:
-        throw BulkException(result.error.status == Status::Ok
-                                ? BulkError{Status::TransportFailure,
-                                            "the subscription failed",
-                                            "subscriber"}
-                                : result.error);
+        return session_failure(result.error.status == Status::Ok
+                                   ? BulkError{Status::TransportFailure,
+                                               "the subscription failed",
+                                               Origin::Subscriber}
+                                   : result.error);
     case detail::DeliveryRead::Kind::CallbackFailed:
-        throw BulkException(result.error.status == Status::Ok
-                                ? BulkError{Status::Internal,
-                                            "the frame callback failed",
-                                            "subscriber"}
-                                : result.error);
+        return std::make_exception_ptr(SessionLost(
+            result.error.status == Status::Ok
+                ? BulkError{Status::Internal, "the frame callback failed", Origin::Subscriber}
+                : result.error));
     case detail::DeliveryRead::Kind::Frame:
     case detail::DeliveryRead::Kind::Empty:
     case detail::DeliveryRead::Kind::Timeout:
         break;
     }
 
-    throw BulkException(BulkError{Status::Internal,
-                                  "the delivery result was not terminal",
-                                  "subscriber"});
+    return std::make_exception_ptr(SessionLost(BulkError{
+        Status::Internal, "the delivery result was not terminal", Origin::Subscriber}));
+}
+
+/// The typed exception subscribe() throws when establishment fails.
+std::exception_ptr establishment_failure(BulkError error)
+{
+    if(error.status == Status::ResourceExhausted)
+    {
+        return std::make_exception_ptr(ResourceExhausted(std::move(error)));
+    }
+    return std::make_exception_ptr(EstablishmentError(std::move(error)));
 }
 
 } // namespace
@@ -139,10 +175,10 @@ struct Subscription::Impl
     /// second lifecycle owner.
     struct SessionState
     {
-        std::vector<std::byte> make_open_request(const std::string &stream_name,
-                                                 const ReceivePlan &upper_plan,
+        std::vector<std::byte> make_open_request(const std::string &name,
+                                                 const ReceivePlan &plan,
                                                  MemoryKind memory_kind,
-                                                 DropPolicy drop_policy,
+                                                 Protocol::ClientInstanceId id,
                                                  const std::vector<std::byte> &client_address,
                                                  std::uint64_t correlation_id) const
         {
@@ -153,14 +189,16 @@ struct Subscription::Impl
             // two-ring interlock is not implemented, and claiming a capability
             // this side cannot honour is worse than not having it.
             request.requested_caps = Protocol::k_caps_credit_coalescing | Protocol::k_caps_probe;
-            request.client_instance_id = Protocol::generate_client_instance_id();
-            request.requested_max_frame_bytes = upper_plan.max_frame_bytes;
-            request.requested_ring_depth = upper_plan.ring_depth;
-            request.requested_credit_window = upper_plan.credit_window;
+            request.client_instance_id = id;
+            request.requested_max_frame_bytes = plan.max_frame_bytes;
+            request.requested_ring_depth = plan.ring_depth;
+            request.requested_credit_window = plan.credit_window;
             request.requested_memory_kind = memory_kind;
             request.requested_transport = Protocol::Transport::ActiveMessage;
-            request.drop_policy = drop_policy;
-            request.stream_name = stream_name;
+            // The queue policy is local; the wire field is a constant until the
+            // next wire revision removes it.
+            request.drop_policy = Protocol::DropPolicy::DropNewest;
+            request.stream_name = name;
             request.client_ucx_address = client_address;
 
             return Protocol::encode(request, correlation_id);
@@ -168,7 +206,7 @@ struct Subscription::Impl
 
         Status adopt_open_reply(const std::byte *data,
                                 std::size_t size,
-                                const ReceivePlan &upper_plan,
+                                const ReceivePlan &plan,
                                 std::uint64_t expected_correlation)
         {
             Protocol::Envelope envelope;
@@ -209,9 +247,9 @@ struct Subscription::Impl
             // A grant is only ever clamped downward, so a ring registered at
             // the requested geometry is large enough for the granted one.
             // Check anyway because that depends on peer behaviour.
-            if(reply.geometry.max_frame_bytes > upper_plan.max_frame_bytes ||
-               reply.geometry.ring_depth > upper_plan.ring_depth ||
-               reply.geometry.credit_window > upper_plan.credit_window)
+            if(reply.geometry.max_frame_bytes > plan.max_frame_bytes ||
+               reply.geometry.ring_depth > plan.ring_depth ||
+               reply.geometry.credit_window > plan.credit_window)
             {
                 return Status::GeometryMismatch;
             }
@@ -338,6 +376,11 @@ struct Subscription::Impl
             return stream_id;
         }
 
+        const Protocol::SessionId &session_id_value() const noexcept
+        {
+            return session_id;
+        }
+
         const Protocol::GeometryBlock &granted_geometry() const noexcept
         {
             return granted;
@@ -362,25 +405,25 @@ struct Subscription::Impl
         std::uint32_t renew_interval_ms{0};
     };
 
-    Impl(SubscriberConfig cfg,
+    Impl(SubscriptionOptions opts,
          ReceivePlan plan,
          detail::CoordinationChannel coordination,
-         detail::TransportFactory transport_factory,
-         SubscriptionCallbacks cbs) :
-        stream_name(std::move(cfg.stream_name)),
+         detail::TransportFactory transport_factory) :
+        stream_name(std::move(opts.stream_name)),
         upper_plan(plan),
-        memory_kind(cfg.receive_memory_kind),
-        drop_policy(cfg.drop_policy),
-        delivery_mode(cfg.delivery_mode),
-        recovery_policy(cfg.recovery_policy),
-        command_timeout_ms(cfg.command_timeout_ms),
-        probe_timeout_ms(cfg.probe_timeout_ms),
-        establishment_timeout_ms(cfg.establishment_timeout_ms),
+        recovery_policy(opts.recovery_policy),
+        expect(opts.expect),
+        establishment_timeout_ms(opts.establishment_timeout_ms),
+        allocator(std::move(opts.receive_allocator)),
         channel(std::move(coordination)),
         factory(std::move(transport_factory)),
-        frame_callback(std::move(cbs.on_frame)),
-        delivery(std::make_shared<detail::DeliveryQueue>(cfg.delivery_queue_depth,
-                                                         drop_policy))
+        frame_callback(std::move(opts.on_frame)),
+        // Borrowed delivery can hold at most ring_depth frames unreleased, so a
+        // queue of that capacity never refuses a frame: ADR 0008's derived
+        // queue capacity is the plan's ring depth.
+        delivery(std::make_shared<detail::DeliveryQueue>(std::max<std::uint32_t>(plan.ring_depth, 1),
+                                                         opts.queue_policy)),
+        client_id(Protocol::generate_client_instance_id())
     {
     }
 
@@ -402,17 +445,92 @@ struct Subscription::Impl
         }
     }
 
+    /// The receive region for the next transport: the allocator's, obtained
+    /// once, or empty so the transport allocates its own host ring.
+    ///
+    /// The allocator's region is reusable only while nothing else holds it.
+    /// `owner` is shared with every transport that registered it, with a
+    /// quarantined worker, and with every borrowed frame, so a use count above
+    /// one is exactly "an earlier session or a delivered frame still refers to
+    /// it" (ADR 0003 and 0005).
+    bool prepare_region(BulkError &error) noexcept
+    {
+        if(!allocator)
+        {
+            return true;
+        }
+
+        if(!allocator_used)
+        {
+            allocator_used = true;
+            try
+            {
+                region = allocator(upper_plan.pinned_bytes());
+            }
+            catch(const BulkException &e)
+            {
+                error = e.error();
+                return false;
+            }
+            catch(const std::exception &e)
+            {
+                error = BulkError{Status::ResourceExhausted, e.what(), Origin::Subscriber};
+                return false;
+            }
+
+            if(!region.owner)
+            {
+                error = BulkError{Status::ResourceExhausted,
+                                  "the receive allocator returned no storage",
+                                  Origin::Subscriber};
+                return false;
+            }
+            if(region.bytes < upper_plan.pinned_bytes())
+            {
+                error = BulkError{Status::ResourceExhausted,
+                                  "the receive allocator returned less than the receive plan "
+                                  "needs",
+                                  Origin::Subscriber};
+                region = ReceiveRegion{};
+                return false;
+            }
+        }
+
+        if(!region.owner)
+        {
+            error = BulkError{Status::ResourceExhausted,
+                              "the receive allocator did not supply usable storage",
+                              Origin::Subscriber};
+            return false;
+        }
+
+        if(region.owner.use_count() > 1)
+        {
+            error = BulkError{Status::ResourceExhausted,
+                              "the receive storage is still held by an earlier session or a "
+                              "delivered frame",
+                              Origin::Subscriber};
+            return false;
+        }
+
+        return true;
+    }
 
     bool open_subscription(
         BulkError &error,
         std::chrono::steady_clock::time_point establishment_deadline =
             std::chrono::steady_clock::time_point::max()) noexcept
     {
+        if(!prepare_region(error))
+        {
+            return false;
+        }
+
         std::unique_ptr<detail::SubscriberTransport> fresh;
 
         try
         {
-            fresh = factory(upper_plan, delivery->make_ingress());
+            fresh = factory(upper_plan, region, delivery->make_ingress());
         }
         catch(const BulkException &e)
         {
@@ -423,7 +541,7 @@ struct Subscription::Impl
         catch(const std::exception &e)
         {
             delivery->retire_ingress();
-            error = BulkError{Status::Internal, e.what(), "subscriber"};
+            error = BulkError{Status::Internal, e.what(), Origin::Subscriber};
             return false;
         }
 
@@ -431,7 +549,7 @@ struct Subscription::Impl
         {
             delivery->retire_ingress();
             error = BulkError{
-                Status::Internal, "the transport factory returned nothing", "subscriber"};
+                Status::Internal, "the transport factory returned nothing", Origin::Subscriber};
             return false;
         }
 
@@ -443,8 +561,8 @@ struct Subscription::Impl
             const std::vector<std::byte> request = candidate.make_open_request(
                 stream_name,
                 upper_plan,
-                memory_kind,
-                drop_policy,
+                region.owner ? region.memory_kind : MemoryKind::Host,
+                client_id,
                 fresh->local_address(),
                 correlation_id);
             const std::vector<std::byte> reply =
@@ -458,7 +576,7 @@ struct Subscription::Impl
                 delivery->retire_ingress();
                 error = BulkError{status,
                                   std::string("BulkOpen was refused: ") + to_string(status),
-                                  "subscriber"};
+                                  Origin::Subscriber};
                 return false;
             }
         }
@@ -471,11 +589,24 @@ struct Subscription::Impl
         catch(const std::exception &e)
         {
             delivery->retire_ingress();
-            error = BulkError{Status::TransportFailure, e.what(), "subscriber"};
+            error = BulkError{Status::TransportFailure, e.what(), Origin::Subscriber};
             return false;
         }
 
         const Geometry granted = detail::to_geometry(candidate.granted_geometry());
+
+        if(expect.check(granted) != Status::Ok)
+        {
+            error = BulkError{Status::GeometryMismatch,
+                              "the granted geometry does not match the expectation given at "
+                              "subscribe",
+                              Origin::Subscriber};
+            close_candidate(candidate, establishment_deadline);
+            delivery->retire_ingress();
+            fresh.reset();
+            return false;
+        }
+
         if(retired_geometry.generation != 0 &&
            !retired_geometry.describes_same_array(granted))
         {
@@ -484,7 +615,7 @@ struct Subscription::Impl
                               "the reopened session describes a different array than the one "
                               "that was retired; the application must open a new subscription "
                               "with the new contract in hand",
-                              "subscriber"};
+                              Origin::Subscriber};
 
             close_candidate(candidate, establishment_deadline);
             delivery->retire_ingress();
@@ -512,7 +643,7 @@ struct Subscription::Impl
             error = reported.status != Status::Ok
                         ? reported
                         : BulkError{status, "the transport could not adopt the grant",
-                                    "subscriber"};
+                                    Origin::Subscriber};
             close_candidate(candidate, establishment_deadline);
             delivery->retire_ingress();
             fresh.reset();
@@ -528,8 +659,10 @@ struct Subscription::Impl
         publish_transport(std::move(fresh));
         transition(SubscriberState::Probing, BulkError{});
 
+        // The probe budget is the lease: a session not probed within its own
+        // lease is dead by the publisher's definition too.
         const auto probe_deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(probe_timeout_ms);
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(lease_budget_ms());
         const auto deadline = std::min(probe_deadline, establishment_deadline);
 
         for(;;)
@@ -550,7 +683,7 @@ struct Subscription::Impl
                 {
                     error = BulkError{Status::TransportFailure,
                                       "the transport failed before the probe was answered",
-                                      "subscriber"};
+                                      Origin::Subscriber};
                 }
                 break;
             }
@@ -558,9 +691,9 @@ struct Subscription::Impl
             if(std::chrono::steady_clock::now() >= deadline)
             {
                 error = BulkError{Status::TransportFailure,
-                                  "no Probe arrived within probe_timeout_ms; the publisher "
-                                  "cannot reach this client's UCX endpoint",
-                                  "subscriber"};
+                                  "no Probe arrived within the lease; the publisher cannot "
+                                  "reach this client's UCX endpoint",
+                                  Origin::Subscriber};
                 break;
             }
 
@@ -623,7 +756,7 @@ struct Subscription::Impl
 
             if(!transport)
             {
-                error = BulkError{Status::Internal, "the transport disappeared", "subscriber"};
+                error = BulkError{Status::Internal, "the transport disappeared", Origin::Subscriber};
                 return false;
             }
 
@@ -639,11 +772,12 @@ struct Subscription::Impl
                             ? reported
                             : BulkError{Status::TransportFailure,
                                         "the transport reported a failure",
-                                        "subscriber"};
+                                        Origin::Subscriber};
                 return false;
             }
 
-            if(std::chrono::steady_clock::now() < next_renew)
+            const auto now = std::chrono::steady_clock::now();
+            if(now < next_renew)
             {
                 continue;
             }
@@ -651,6 +785,7 @@ struct Subscription::Impl
             const Status status = renew_once(error);
             if(status == Status::Ok)
             {
+                note_renewal(now, next_renew);
                 next_renew = std::chrono::steady_clock::now() +
                              std::chrono::milliseconds(current_renew_interval());
                 continue;
@@ -669,6 +804,21 @@ struct Subscription::Impl
         return true;
     }
 
+    void note_renewal(std::chrono::steady_clock::time_point started,
+                      std::chrono::steady_clock::time_point scheduled) noexcept
+    {
+        const auto late = started - scheduled;
+        const std::uint64_t late_ms =
+            late > std::chrono::steady_clock::duration::zero()
+                ? static_cast<std::uint64_t>(
+                      std::chrono::duration_cast<std::chrono::milliseconds>(late).count())
+                : 0;
+
+        const std::lock_guard<std::mutex> lock(observation);
+        last_renewal_steady_ns = steady_now_ns();
+        max_renewal_lateness_ms = std::max(max_renewal_lateness_ms, late_ms);
+    }
+
     Status renew_once(BulkError &error) noexcept
     {
         std::uint64_t credits_returned = 0;
@@ -676,7 +826,7 @@ struct Subscription::Impl
 
         if(!transport)
         {
-            error = BulkError{Status::Internal, "the transport disappeared", "subscriber"};
+            error = BulkError{Status::Internal, "the transport disappeared", Origin::Subscriber};
             return Status::Internal;
         }
 
@@ -706,7 +856,7 @@ struct Subscription::Impl
             {
                 error = BulkError{status,
                                   std::string("BulkRenew was refused: ") + to_string(status),
-                                  "subscriber"};
+                                  Origin::Subscriber};
             }
         }
         catch(const BulkException &e)
@@ -716,7 +866,7 @@ struct Subscription::Impl
         }
         catch(const std::exception &e)
         {
-            error = BulkError{Status::TransportFailure, e.what(), "subscriber"};
+            error = BulkError{Status::TransportFailure, e.what(), Origin::Subscriber};
             status = Status::TransportFailure;
         }
 
@@ -731,7 +881,17 @@ struct Subscription::Impl
     std::uint32_t current_renew_interval() noexcept
     {
         const std::uint32_t granted = session.renew_interval();
-        return granted == 0 ? 1'000u : granted;
+        return granted == 0 ? k_min_coordination_ms : granted;
+    }
+
+    /// The granted lease, else the last one seen, else k_min_coordination_ms.
+    std::uint32_t lease_budget_ms() noexcept
+    {
+        if(session.lease_ttl() != 0)
+        {
+            return session.lease_ttl();
+        }
+        return last_lease_ttl_ms != 0 ? last_lease_ttl_ms : k_min_coordination_ms;
     }
 
     std::chrono::steady_clock::time_point coordination_deadline() noexcept
@@ -743,10 +903,8 @@ struct Subscription::Impl
                 return shutdown_deadline;
             }
         }
-        return std::chrono::steady_clock::now() +
-               std::chrono::milliseconds(command_timeout_ms);
+        return std::chrono::steady_clock::now() + std::chrono::milliseconds(lease_budget_ms());
     }
-
 
     void control_loop() noexcept
     {
@@ -874,7 +1032,6 @@ struct Subscription::Impl
                status == Status::UnknownSession || status == Status::SessionExpired;
     }
 
-
     void publish_transport(std::unique_ptr<detail::SubscriberTransport> next,
                            bool discard_queued = true) noexcept
     {
@@ -925,7 +1082,6 @@ struct Subscription::Impl
         live = sampled;
     }
 
-
     void transition(SubscriberState next, BulkError error) noexcept
     {
         if(next == SubscriberState::Failed)
@@ -949,49 +1105,35 @@ struct Subscription::Impl
         wake.notify_all();
     }
 
-    std::size_t deliver_frames(std::chrono::milliseconds timeout,
-                               std::size_t max_frames)
+    /// Invoke the push callback with one event. False when the callback threw,
+    /// which ends delivery.
+    bool invoke(FrameEvent event) noexcept
     {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        std::size_t delivered = 0;
-
-        while(delivered < max_frames)
+        try
         {
-            detail::DeliveryRead result = delivered == 0
-                                              ? delivery->read_result(deadline)
-                                              : delivery->try_read_result();
-            if(result.kind != detail::DeliveryRead::Kind::Frame)
-            {
-                break;
-            }
-
-            ++delivered;
-
-            try
-            {
-                frame_callback(std::move(result.frame));
-            }
-            catch(...)
-            {
-                fail_delivery();
-                break;
-            }
-
-            result.frame.reset();
+            frame_callback(std::move(event));
+            return true;
         }
-
-        return delivered;
+        catch(...)
+        {
+            fail_delivery();
+            return false;
+        }
     }
 
     void fail_delivery() noexcept
     {
-        const BulkError error{Status::Internal, "the frame callback threw", "subscriber"};
+        const BulkError error{Status::Internal, "the frame callback threw", Origin::Subscriber};
         delivery->callback_failed(error);
         transition(SubscriberState::Failed, error);
         running.store(false, std::memory_order_release);
         wake.notify_all();
     }
 
+    /// ADR 0008: one dispatcher drains the authoritative queue and invokes the
+    /// callback sequentially. A terminal Session failure follows the frames the
+    /// queue accepted and reaches the callback exactly once as the last event;
+    /// close, interruption and a callback exception end dispatch silently.
     void dispatch_loop() noexcept
     {
         for(;;)
@@ -999,25 +1141,37 @@ struct Subscription::Impl
             const bool active = running.load(std::memory_order_acquire) &&
                                 !interrupted.load(std::memory_order_acquire) &&
                                 state.load(std::memory_order_acquire) != SubscriberState::Failed;
-            if(!active &&
-               (interrupted.load(std::memory_order_acquire) ||
-                state.load(std::memory_order_acquire) == SubscriberState::Closed ||
-                delivery->stats().depth == 0))
-            {
-                {
-                    std::lock_guard<std::mutex> lock(shutdown_mutex);
-                    dispatch_finished = true;
-                }
-                shutdown_wake.notify_all();
-                return;
-            }
+            const auto deadline =
+                std::chrono::steady_clock::now() + (active ? k_dispatch_quantum : 1ms);
 
-            // A terminal Session failure stops ingress but deliberately leaves
-            // accepted frames in the queue. Drain those frames before the
-            // dispatcher exits; orderly close and interrupt discard first, so
-            // they still stop immediately.
-            deliver_frames(active ? k_dispatch_quantum : std::chrono::milliseconds::zero(), 32);
+            detail::DeliveryRead result = delivery->read_result(deadline);
+            switch(result.kind)
+            {
+            case detail::DeliveryRead::Kind::Frame:
+                if(!invoke(FrameEvent{std::move(result.frame), nullptr}))
+                {
+                    break;
+                }
+                continue;
+            case detail::DeliveryRead::Kind::Empty:
+            case detail::DeliveryRead::Kind::Timeout:
+                continue;
+            case detail::DeliveryRead::Kind::SessionFailed:
+                (void)invoke(FrameEvent{FrameView{}, terminal_exception(result)});
+                break;
+            case detail::DeliveryRead::Kind::Closed:
+            case detail::DeliveryRead::Kind::Interrupted:
+            case detail::DeliveryRead::Kind::CallbackFailed:
+                break;
+            }
+            break;
         }
+
+        {
+            std::lock_guard<std::mutex> lock(shutdown_mutex);
+            dispatch_finished = true;
+        }
+        shutdown_wake.notify_all();
     }
 
     std::uint64_t next_correlation_id() noexcept
@@ -1027,8 +1181,7 @@ struct Subscription::Impl
 
     void shutdown(bool announce_closed) noexcept
     {
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(command_timeout_ms);
+        const auto deadline = std::chrono::steady_clock::now() + k_shutdown_budget;
         {
             std::unique_lock<std::mutex> lock(shutdown_mutex);
             if(shutdown_complete)
@@ -1126,16 +1279,37 @@ struct Subscription::Impl
         shutdown_wake.notify_all();
     }
 
+    SubscriberCounters sample_counters() const noexcept
+    {
+        SubscriberCounters total;
+
+        {
+            const std::lock_guard<std::mutex> lock(observation);
+            total = retired;
+            accumulate(total, live);
+        }
+
+        total.reconnects = reconnects.load(std::memory_order_relaxed);
+        total.geometry_changes += geometry_changes.load(std::memory_order_relaxed);
+
+        total.renewals_sent = renewals_sent.load(std::memory_order_relaxed);
+        total.renewals_failed = renewals_failed.load(std::memory_order_relaxed);
+
+        const detail::DeliveryQueue::Stats queue = delivery->stats();
+        total.frames_delivered = queue.taken;
+        total.frames_dropped_queue_full = queue.dropped;
+        total.delivery_queue_depth = queue.depth;
+        total.delivery_queue_high_water = queue.high_water;
+
+        return total;
+    }
 
     std::string stream_name;
     ReceivePlan upper_plan;
-    MemoryKind memory_kind;
-    DropPolicy drop_policy;
-    DeliveryMode delivery_mode;
     RecoveryPolicy recovery_policy;
-    std::uint32_t command_timeout_ms;
-    std::uint32_t probe_timeout_ms;
+    GeometryExpectation expect;
     std::uint32_t establishment_timeout_ms;
+    ReceiveAllocator allocator;
     detail::CoordinationChannel channel;
     detail::TransportFactory factory;
 
@@ -1147,6 +1321,12 @@ struct Subscription::Impl
 
     std::shared_ptr<detail::DeliveryQueue> delivery;
 
+    /// Stable across every Open this Subscription makes, as the wire promises.
+    Protocol::ClientInstanceId client_id;
+
+    ReceiveRegion region;
+    bool allocator_used{false};
+
     std::atomic<SubscriberState> state{SubscriberState::Closed};
     std::atomic<bool> running{false};
     std::atomic<bool> interrupted{false};
@@ -1156,10 +1336,12 @@ struct Subscription::Impl
 
     std::unique_ptr<detail::SubscriberTransport> transport;
 
-    std::mutex observation;
+    mutable std::mutex observation;
     SubscriberCounters retired{};
     SubscriberCounters live{};
     std::uint32_t last_lease_ttl_ms{0};
+    std::uint64_t last_renewal_steady_ns{0};
+    std::uint64_t max_renewal_lateness_ms{0};
 
     Geometry current_geometry{};
     ReceivePlan actual_plan{};
@@ -1187,7 +1369,6 @@ struct Subscription::Impl
     std::atomic<std::uint64_t> renewals_failed{0};
 };
 
-
 Subscription::Subscription(std::shared_ptr<Impl> impl) noexcept :
     impl_(std::move(impl))
 {
@@ -1211,15 +1392,27 @@ void Subscription::interrupt() noexcept
     impl_->wake.notify_all();
 }
 
+namespace
+{
+
+[[noreturn]] void throw_pull_on_push(const char *operation)
+{
+    throw DeliveryModeError(BulkError{Status::MalformedMessage,
+                                      std::string(operation) +
+                                          " is a pull operation; this Subscription delivers "
+                                          "through its callback",
+                                      Origin::Subscriber});
+}
+
+} // namespace
+
 std::optional<FrameView> Subscription::try_read()
 {
     Impl &impl = *impl_;
 
-    if(impl.delivery_mode != DeliveryMode::Pull)
+    if(impl.frame_callback)
     {
-        throw BulkException(BulkError{Status::Internal,
-                                      "try_read() requires DeliveryMode::Pull",
-                                      "subscriber"});
+        throw_pull_on_push("try_read()");
     }
 
     detail::DeliveryRead result = impl.delivery->try_read_result();
@@ -1231,18 +1424,16 @@ std::optional<FrameView> Subscription::try_read()
     {
         return std::nullopt;
     }
-    throw_delivery_terminal(result);
+    std::rethrow_exception(terminal_exception(result));
 }
 
 std::optional<FrameView> Subscription::read_for(std::chrono::milliseconds timeout)
 {
     Impl &impl = *impl_;
 
-    if(impl.delivery_mode != DeliveryMode::Pull)
+    if(impl.frame_callback)
     {
-        throw BulkException(BulkError{Status::Internal,
-                                      "read_for() requires DeliveryMode::Pull",
-                                      "subscriber"});
+        throw_pull_on_push("read_for()");
     }
 
     const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -1256,63 +1447,57 @@ std::optional<FrameView> Subscription::read_for(std::chrono::milliseconds timeou
     {
         return std::nullopt;
     }
-    throw_delivery_terminal(result);
+    std::rethrow_exception(terminal_exception(result));
 }
 
 std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
-    SubscriberConfig config,
+    SubscriptionOptions options,
     StreamOffer offer,
     detail::CoordinationChannel channel,
     detail::TransportFactory factory,
-    SubscriptionCallbacks callbacks,
     std::chrono::steady_clock::time_point establishment_deadline)
 {
-    const Status status = config.validate();
+    const Status status = options.validate();
     if(status != Status::Ok)
     {
-        throw BulkException(BulkError{
-            status, std::string("invalid SubscriberConfig: ") + to_string(status), "subscriber"});
+        throw ConfigurationError(BulkError{status,
+                                           std::string("invalid SubscriptionOptions: ") +
+                                               to_string(status),
+                                           Origin::Subscriber});
     }
 
-    if(offer.stream_name != config.stream_name)
+    if(offer.stream_name != options.stream_name)
     {
-        throw BulkException(BulkError{Status::UnknownStream,
-                                      "discovery returned a different stream",
-                                      "subscriber"});
+        throw EstablishmentError(BulkError{Status::UnknownStream,
+                                           "discovery returned a different stream",
+                                           Origin::Subscriber});
     }
     if(const Status offer_status = offer.validate(); offer_status != Status::Ok)
     {
-        throw BulkException(BulkError{offer_status,
-                                      offer.message.empty() ? "stream discovery failed"
-                                                            : std::move(offer.message),
-                                      "subscriber"});
+        throw EstablishmentError(BulkError{offer_status,
+                                           offer.message.empty() ? "stream discovery failed"
+                                                                 : std::move(offer.message),
+                                           Origin::Subscriber});
     }
 
-    const ReceivePlan upper = plan_receive(config, offer);
+    const ReceivePlan upper = plan_receive(options, offer);
     if(upper.validate() != Status::Ok)
     {
-        throw BulkException(BulkError{Status::ResourceExhausted,
-                                      "the pinned budget cannot hold a valid ReceivePlan",
-                                      "subscriber"});
+        throw ResourceExhausted(BulkError{Status::ResourceExhausted,
+                                          "the pinned budget cannot hold a valid ReceivePlan",
+                                          Origin::Subscriber});
     }
 
     if(!channel || !factory)
     {
-        throw BulkException(BulkError{Status::Internal,
-                                      "a Subscription needs both a coordination channel "
-                                      "and a transport factory",
-                                      "subscriber"});
-    }
-
-    if(config.delivery_mode == DeliveryMode::Push && !callbacks.on_frame)
-    {
-        throw BulkException(BulkError{Status::Internal,
-                                      "SubscriptionCallbacks needs on_frame",
-                                      "subscriber"});
+        throw ConfigurationError(BulkError{Status::Internal,
+                                           "a Subscription needs both a coordination channel "
+                                           "and a transport factory",
+                                           Origin::Subscriber});
     }
 
     auto impl = std::make_shared<Subscription::Impl>(
-        std::move(config), upper, std::move(channel), std::move(factory), std::move(callbacks));
+        std::move(options), upper, std::move(channel), std::move(factory));
 
     impl->running.store(true, std::memory_order_release);
 
@@ -1325,20 +1510,25 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
             std::chrono::steady_clock::now() +
             std::chrono::milliseconds(impl->establishment_timeout_ms);
     }
-    if(impl->open_subscription(error, establishment_deadline))
+
+    const auto start_threads = [&impl]
     {
-        if(impl->delivery_mode == DeliveryMode::Push)
+        if(impl->frame_callback)
         {
             impl->dispatch = std::thread([worker = impl] { worker->dispatch_loop(); });
         }
         impl->control_started = true;
         impl->control = std::thread([worker = impl] { worker->control_loop(); });
-        return std::unique_ptr<Subscription>(new Subscription(std::move(impl)));
+        return std::unique_ptr<Subscription>(new Subscription(impl));
+    };
+
+    if(impl->open_subscription(error, establishment_deadline))
+    {
+        return start_threads();
     }
 
     if(impl->recovery_policy == RecoveryPolicy::Reconnect)
     {
-        bool opened = false;
         for(std::uint32_t attempt = 0; attempt < k_reconnect_max_attempts; ++attempt)
         {
             if(!Subscription::Impl::retryable_establishment(error.status) ||
@@ -1354,40 +1544,23 @@ std::unique_ptr<Subscription> detail::SubscriptionFactory::open(
             impl->transition(SubscriberState::Opening, BulkError{});
             if(impl->open_subscription(error, establishment_deadline))
             {
-                opened = true;
-                break;
+                return start_threads();
             }
             if(!Subscription::Impl::retryable_establishment(error.status))
             {
                 break;
             }
         }
-
-        if(opened)
-        {
-            if(impl->delivery_mode == DeliveryMode::Push)
-            {
-                impl->dispatch = std::thread([worker = impl] { worker->dispatch_loop(); });
-            }
-            impl->control_started = true;
-            impl->control = std::thread([worker = impl] { worker->control_loop(); });
-            return std::unique_ptr<Subscription>(new Subscription(std::move(impl)));
-        }
     }
 
     impl->transition(SubscriberState::Failed, error);
     impl->shutdown(false);
-    throw BulkException(error);
-}
-
-SubscriberState Subscription::state() const noexcept
-{
-    return impl_->state.load(std::memory_order_acquire);
+    std::rethrow_exception(establishment_failure(std::move(error)));
 }
 
 int Subscription::fd() const noexcept
 {
-    return impl_->delivery_mode == DeliveryMode::Pull ? impl_->delivery->fd() : -1;
+    return impl_->frame_callback ? -1 : impl_->delivery->fd();
 }
 
 Geometry Subscription::geometry() const noexcept
@@ -1404,40 +1577,26 @@ ReceivePlan Subscription::plan() const noexcept
 
 SubscriptionSnapshot Subscription::snapshot() const noexcept
 {
+    const Impl &impl = *impl_;
+
     SubscriptionSnapshot out;
-    out.state = state();
-    out.counters = counters();
-    out.interrupted = impl_->interrupted.load(std::memory_order_acquire);
+    out.state = impl.state.load(std::memory_order_acquire);
+    out.interrupted = impl.interrupted.load(std::memory_order_acquire);
+    out.counters = impl.sample_counters();
     {
-        const std::lock_guard<std::mutex> lock(impl_->observation);
-        out.error = impl_->last_error;
+        const std::lock_guard<std::mutex> lock(impl.observation);
+        out.error = impl.last_error;
+        if(!impl.session.session_id_value().is_zero())
+        {
+            out.session_id = Protocol::to_log_string(impl.session.session_id_value());
+            out.lease_ttl_ms = impl.session.lease_ttl();
+            out.renew_interval_ms = impl.session.renew_interval();
+        }
+        out.last_renewal_steady_ns = impl.last_renewal_steady_ns;
+        out.max_renewal_lateness_ms = impl.max_renewal_lateness_ms;
     }
+    out.sampled_at_steady_ns = steady_now_ns();
     return out;
-}
-
-SubscriberCounters Subscription::counters() const noexcept
-{
-    SubscriberCounters total;
-
-    {
-        const std::lock_guard<std::mutex> lock(impl_->observation);
-        total = impl_->retired;
-        accumulate(total, impl_->live);
-    }
-
-    total.reconnects = impl_->reconnects.load(std::memory_order_relaxed);
-    total.geometry_changes += impl_->geometry_changes.load(std::memory_order_relaxed);
-
-    total.renewals_sent = impl_->renewals_sent.load(std::memory_order_relaxed);
-    total.renewals_failed = impl_->renewals_failed.load(std::memory_order_relaxed);
-
-    const detail::DeliveryQueue::Stats queue = impl_->delivery->stats();
-    total.frames_delivered = queue.taken;
-    total.frames_dropped_queue_full = queue.dropped;
-    total.delivery_queue_depth = queue.depth;
-    total.delivery_queue_high_water = queue.high_water;
-
-    return total;
 }
 
 } // namespace TangoBulk

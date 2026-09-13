@@ -17,7 +17,7 @@ namespace
 
 PinnedLedger::Reservation acquire(std::uint64_t bytes,
                                    std::uint64_t limit,
-                                   const char *origin)
+                                   Origin origin)
 {
     PinnedLedger::Reservation reservation =
         PinnedLedger::Reservation::try_acquire(bytes, limit);
@@ -40,7 +40,7 @@ PinnedLedger::Reservation acquire(std::uint64_t bytes,
 RegisteredMemory RegisteredMemory::ucx_allocated(UcxContext &context,
                                                  std::uint64_t bytes,
                                                  std::uint64_t pinned_limit,
-                                                 const char *origin)
+                                                 Origin origin)
 {
     RegisteredMemory memory;
     memory.context_ = context.get();
@@ -115,7 +115,7 @@ RegisteredMemory RegisteredMemory::adopted(UcxContext &context,
     memory.context_ = context.get();
     memory.bytes_ = bytes;
     memory.owner_ = std::move(owner);
-    memory.reservation_ = acquire(bytes, pinned_limit, "subscriber");
+    memory.reservation_ = acquire(bytes, pinned_limit, Origin::Subscriber);
 
     ucp_mem_map_params_t params;
     std::memset(&params, 0, sizeof(params));
@@ -129,7 +129,7 @@ RegisteredMemory RegisteredMemory::adopted(UcxContext &context,
     if(status != UCS_OK)
     {
         memory.release();
-        throw_ucx_error("ucp_mem_map(adopted receive buffer)", status, "subscriber");
+        throw_ucx_error("ucp_mem_map(adopted receive buffer)", status, Origin::Subscriber);
     }
 
     memory.base_ = static_cast<std::byte *>(memory.owner_.get());

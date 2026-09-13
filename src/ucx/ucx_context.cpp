@@ -13,7 +13,7 @@
 namespace TangoBulk::detail
 {
 
-void throw_ucx_error(const char *what, ucs_status_t status, const char *origin)
+void throw_ucx_error(const char *what, ucs_status_t status, Origin origin)
 {
     std::string message = what;
     message += ": ";
@@ -31,7 +31,7 @@ UcxContext::UcxContext(const std::string &tls)
     ucs_status_t status = ucp_config_read(nullptr, nullptr, &config);
     if(status != UCS_OK)
     {
-        throw_ucx_error("ucp_config_read", status, "publisher");
+        throw_ucx_error("ucp_config_read", status, Origin::Publisher);
     }
 
     if(!tls.empty())
@@ -40,7 +40,7 @@ UcxContext::UcxContext(const std::string &tls)
         if(status != UCS_OK)
         {
             ucp_config_release(config);
-            throw_ucx_error("ucp_config_modify(TLS)", status, "publisher");
+            throw_ucx_error("ucp_config_modify(TLS)", status, Origin::Publisher);
         }
     }
 
@@ -56,7 +56,7 @@ UcxContext::UcxContext(const std::string &tls)
 
     if(status != UCS_OK)
     {
-        throw_ucx_error("ucp_init", status, "publisher");
+        throw_ucx_error("ucp_init", status, Origin::Publisher);
     }
 }
 
@@ -78,7 +78,7 @@ UcxWorker::UcxWorker(UcxContext &context)
     ucs_status_t status = ucp_worker_create(context.get(), &params, &worker_);
     if(status != UCS_OK)
     {
-        throw_ucx_error("ucp_worker_create", status, "publisher");
+        throw_ucx_error("ucp_worker_create", status, Origin::Publisher);
     }
 
     ucp_worker_attr_t attr;
@@ -90,7 +90,7 @@ UcxWorker::UcxWorker(UcxContext &context)
     {
         ucp_worker_destroy(worker_);
         worker_ = nullptr;
-        throw_ucx_error("ucp_worker_query", status, "publisher");
+        throw_ucx_error("ucp_worker_query", status, Origin::Publisher);
     }
 
     address_.resize(attr.address_length);
@@ -105,7 +105,7 @@ UcxWorker::UcxWorker(UcxContext &context)
         throw BulkException(BulkError{Status::Internal,
                                       "UCX worker address is " + std::to_string(address_.size()) +
                                           " bytes, above the protocol's 4096-byte field",
-                                      "publisher"});
+                                      Origin::Publisher});
     }
 
     // 3.10: query max_am_header at startup and fail construction if it is below
@@ -121,7 +121,7 @@ UcxWorker::UcxWorker(UcxContext &context)
                       "transport reports max_am_header " + std::to_string(got) +
                           ", below the " + std::to_string(Protocol::k_frame_header_bytes) +
                           "-byte frame header; this transport cannot carry the protocol",
-                      "publisher"});
+                      Origin::Publisher});
     }
 }
 
@@ -138,7 +138,7 @@ ucp_ep_h UcxWorker::create_endpoint(const std::byte *peer_address, std::size_t s
     if(peer_address == nullptr || size == 0 || size > k_max_ucx_address_bytes)
     {
         throw BulkException(
-            BulkError{Status::MalformedMessage, "peer UCX address is empty or oversize", "protocol"});
+            BulkError{Status::MalformedMessage, "peer UCX address is empty or oversize", Origin::Protocol});
     }
 
     ucp_ep_params_t params;
@@ -151,7 +151,7 @@ ucp_ep_h UcxWorker::create_endpoint(const std::byte *peer_address, std::size_t s
     const ucs_status_t status = ucp_ep_create(worker_, &params, &ep);
     if(status != UCS_OK)
     {
-        throw_ucx_error("ucp_ep_create", status, "publisher");
+        throw_ucx_error("ucp_ep_create", status, Origin::Publisher);
     }
 
     return ep;

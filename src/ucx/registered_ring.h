@@ -40,7 +40,7 @@ class RegisteredRing
                    std::uint32_t depth,
                    bool pad_stride,
                    std::uint64_t pinned_limit,
-                   const char *origin = "publisher");
+                   Origin origin = Origin::Publisher);
 
     RegisteredRing(UcxContext &context,
                    std::uint64_t slot_bytes,

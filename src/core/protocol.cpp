@@ -55,7 +55,7 @@ bool is_known_coord_type(std::uint16_t raw) noexcept
 {
     BulkError error;
     error.status = Status::MalformedMessage;
-    error.origin = "protocol";
+    error.origin = Origin::Protocol;
     error.message = std::move(message);
     throw BulkException{std::move(error)};
 }

@@ -232,7 +232,7 @@ void reject_collisions(Tango::DeviceClass &device_class, const CommandNames &nam
         if(wanted[i].empty())
         {
             throw BulkException(BulkError{
-                Status::MalformedMessage, "a bulk command name is empty", "tango"});
+                Status::MalformedMessage, "a bulk command name is empty", Origin::Tango});
         }
 
         for(std::size_t j = i + 1; j < wanted.size(); ++j)
@@ -242,7 +242,7 @@ void reject_collisions(Tango::DeviceClass &device_class, const CommandNames &nam
                 throw BulkException(BulkError{Status::MalformedMessage,
                                               "two bulk commands share the name '" + wanted[i] +
                                                   "'",
-                                              "tango"});
+                                              Origin::Tango});
             }
         }
     }
@@ -263,7 +263,7 @@ void reject_collisions(Tango::DeviceClass &device_class, const CommandNames &nam
                     BulkError{Status::MalformedMessage,
                               "the device class already has a command named '" + name +
                                   "'; pass CommandNames::with_prefix() to move the bulk commands",
-                              "tango"});
+                              Origin::Tango});
             }
         }
     }

@@ -57,7 +57,7 @@ struct DeliveryQueue::Ingress
 
 struct DeliveryQueue::State
 {
-    State(std::size_t capacity, DropPolicy drop_policy) : queue(capacity), policy(drop_policy)
+    State(std::size_t capacity, QueuePolicy drop_policy) : queue(capacity), policy(drop_policy)
     {
         wakeup_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC | EFD_SEMAPHORE);
     }
@@ -71,7 +71,7 @@ struct DeliveryQueue::State
     }
 
     BoundedQueue<FrameView> queue;
-    DropPolicy policy;
+    QueuePolicy policy;
     int wakeup_fd{-1};
 
     // A producer enters this barrier before observing accepting. Terminal
@@ -96,7 +96,7 @@ struct DeliveryQueue::State
     std::atomic<std::uint64_t> high_water{0};
 };
 
-DeliveryQueue::DeliveryQueue(std::size_t capacity, DropPolicy policy) :
+DeliveryQueue::DeliveryQueue(std::size_t capacity, QueuePolicy policy) :
     state_(std::make_shared<State>(capacity, policy))
 {
 }
@@ -207,7 +207,7 @@ bool push_frame(std::shared_ptr<DeliveryQueue::State> const &state,
     {
         queued = state->queue.try_push(std::move(frame));
 
-        if(!queued && state->policy == DropPolicy::DropOldest)
+        if(!queued && state->policy == QueuePolicy::PreferFresh)
         {
             FrameView oldest;
             if(state->queue.try_pop(oldest))

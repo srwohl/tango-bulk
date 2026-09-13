@@ -61,11 +61,11 @@ TEST_CASE("engine_cpu_affinity is reflected by the transport placement report",
         return;
     }
 
-    SubscriberConfig config = subscriber_config();
-    config.engine_cpu_affinity = 1;
+    detail::TransportOptions pinned;
+    pinned.engine_cpu_affinity = 1;
 
     BulkPublisher publisher(publisher_config());
-    TransportFixture transport(config);
+    TransportFixture transport(subscription_options(), pinned);
     transport.open(publisher);
 
     const detail::Locality &where = transport.engine.locality();

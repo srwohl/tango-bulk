@@ -25,17 +25,22 @@ namespace TangoBulkTests
 /// It does not own lifecycle policy; all lifecycle assertions use Slice.
 struct TransportFixture
 {
-    SubscriberConfig config;
+    SubscriptionOptions config;
     std::shared_ptr<detail::DeliveryQueue> delivery;
     std::shared_ptr<detail::DeliveryIngress> ingress;
     detail::SubscriberEngine engine;
 
-    explicit TransportFixture(SubscriberConfig cfg = subscriber_config()) :
-        config(std::move(cfg)),
-        delivery(std::make_shared<detail::DeliveryQueue>(config.delivery_queue_depth,
-                                                         config.drop_policy)),
+    explicit TransportFixture(SubscriptionOptions opts = subscription_options(),
+                              detail::TransportOptions transport = {}) :
+        config(std::move(opts)),
+        delivery(std::make_shared<detail::DeliveryQueue>(config.receive_plan->ring_depth,
+                                                         config.queue_policy)),
         ingress(delivery->make_ingress()),
-        engine(*config.receive_plan, config, ingress)
+        engine(*config.receive_plan,
+               ReceiveRegion{},
+               config.pinned_budget_bytes,
+               std::move(transport),
+               ingress)
     {
     }
 
@@ -51,9 +56,9 @@ struct TransportFixture
         request.requested_max_frame_bytes = config.receive_plan->max_frame_bytes;
         request.requested_ring_depth = config.receive_plan->ring_depth;
         request.requested_credit_window = config.receive_plan->credit_window;
-        request.requested_memory_kind = config.receive_memory_kind;
+        request.requested_memory_kind = MemoryKind::Host;
         request.requested_transport = Protocol::Transport::ActiveMessage;
-        request.drop_policy = config.drop_policy;
+        request.drop_policy = Protocol::DropPolicy::DropNewest;
         request.stream_name = config.stream_name;
         request.client_ucx_address = engine.local_address();
 

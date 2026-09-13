@@ -38,13 +38,27 @@ enum class Status : std::uint16_t
 
 const char *to_string(Status status) noexcept;
 
+/// Which half of the system reported a failure.
+enum class Origin : std::uint8_t
+{
+    Publisher = 0,
+    Subscriber = 1,
+    Protocol = 2,
+    Tango = 3,
+    Transport = 4,
+};
+
+const char *to_string(Origin origin) noexcept;
+
 struct BulkError
 {
     Status status{Status::Ok};
     std::string message; ///< human-readable; never contains addresses or keys
-    std::string origin;  ///< "publisher" | "subscriber" | "protocol" | "tango"
+    Origin origin{Origin::Subscriber};
 };
 
+/// The base of every exception this library throws. Catch a subclass when the
+/// caller's action differs; catch this when it does not.
 class BulkException : public std::runtime_error
 {
   public:
@@ -54,6 +68,68 @@ class BulkException : public std::runtime_error
 
   private:
     BulkError err_;
+};
+
+/// The options or metadata supplied by the caller are not acceptable.
+class ConfigurationError : public BulkException
+{
+  public:
+    using BulkException::BulkException;
+};
+
+/// Initial establishment did not produce an active Subscription. The error
+/// carries the last failure; for a deadline expiry that is the last transient
+/// one.
+class EstablishmentError : public BulkException
+{
+  public:
+    using BulkException::BulkException;
+};
+
+/// A delivery operation on a Subscription that was closed in an orderly way.
+class StreamClosed : public BulkException
+{
+  public:
+    using BulkException::BulkException;
+};
+
+/// A delivery operation after `interrupt()`. Sticky: every later operation
+/// reports it again.
+class Interrupted : public BulkException
+{
+  public:
+    using BulkException::BulkException;
+};
+
+/// The Session ended and the recovery policy did not replace it.
+class SessionLost : public BulkException
+{
+  public:
+    using BulkException::BulkException;
+};
+
+/// A replacement Session described a different array than the one the
+/// application accepted. The Subscription is closed; open a new one with the
+/// new contract in hand.
+class GeometryChanged : public BulkException
+{
+  public:
+    using BulkException::BulkException;
+};
+
+/// Registered memory could not be obtained within the pinned budget.
+class ResourceExhausted : public BulkException
+{
+  public:
+    using BulkException::BulkException;
+};
+
+/// A pull operation on a push Subscription: caller misuse, not a failure of
+/// the stream.
+class DeliveryModeError : public BulkException
+{
+  public:
+    using BulkException::BulkException;
 };
 
 } // namespace TangoBulk

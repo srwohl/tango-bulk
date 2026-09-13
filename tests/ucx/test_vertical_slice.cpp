@@ -66,7 +66,7 @@ TEST_CASE("Publisher uses the credit window negotiated for a smaller client ring
     pub.ring_depth = 8;
     pub.credit_window = 4;
 
-    SubscriberConfig sub = subscriber_config();
+    SubscriptionOptions sub = subscription_options();
     sub.receive_plan = ReceivePlan{k_frame_bytes, 2, 2};
 
     Slice slice(pub, sub);
@@ -112,7 +112,7 @@ TEST_CASE("A retained view withholds exactly one credit", "[m2][slice]")
     std::vector<FrameView> held = collect(*slice.subscription, k_credit_window);
     REQUIRE(held.size() == k_credit_window);
     REQUIRE(eventually(
-        [&] { return slice.subscription->counters().views_outstanding == k_credit_window; }));
+        [&] { return slice.subscription->snapshot().counters.views_outstanding == k_credit_window; }));
 
     // The window is full and every view is retained, so the publisher stalls.
     {
@@ -130,7 +130,7 @@ TEST_CASE("A retained view withholds exactly one credit", "[m2][slice]")
 
     REQUIRE(eventually([&] { return slice.publisher.counters().frames_credited == 1; }));
     CHECK(eventually(
-        [&] { return slice.subscription->counters().views_outstanding == k_credit_window - 1; }));
+        [&] { return slice.subscription->snapshot().counters.views_outstanding == k_credit_window - 1; }));
 
     // ...and the publisher resumes, which is the other half of the criterion:
     // the stall must be a stall, not a wedge.
@@ -169,8 +169,8 @@ TEST_CASE("Out-of-order release advances the ack only across the contiguous pref
 
     // One Credit message carried both releases: that ratio is the coalescing
     // measurement 2.5 asks for, not a log line.
-    CHECK(slice.subscription->counters().credit_messages_sent <=
-          slice.subscription->counters().credits_returned);
+    CHECK(slice.subscription->snapshot().counters.credit_messages_sent <=
+          slice.subscription->snapshot().counters.credits_returned);
 }
 
 TEST_CASE("With every view retained, publish reports CreditStalled and never blocks",
@@ -255,7 +255,7 @@ TEST_CASE("A full publish queue returns QueueFull and leaves the lease usable", 
     pub.credit_window = 64;
     pub.publish_queue_depth = 8;
 
-    SubscriberConfig sub = subscriber_config();
+    SubscriptionOptions sub = subscription_options();
     sub.receive_plan = ReceivePlan{k_frame_bytes, 64, 64};
 
     Slice slice(pub, sub);
@@ -374,7 +374,7 @@ TEST_CASE("A drained Pull descriptor is not signalled until another frame arrive
                 PublishResult::Accepted);
     }
 
-    REQUIRE(eventually([&] { return subscription->counters().frames_received >= 4; }));
+    REQUIRE(eventually([&] { return subscription->snapshot().counters.frames_received >= 4; }));
 
     pollfd pfd{};
     pfd.fd = subscription->fd();
@@ -409,13 +409,13 @@ TEST_CASE("Pull reads one frame at a time and withholds only retained credit",
     }
 
     REQUIRE(eventually(
-        [&] { return subscription->counters().frames_received >= k_published; }));
+        [&] { return subscription->snapshot().counters.frames_received >= k_published; }));
 
     for(int i = 0; i < k_published; ++i)
     {
         const std::optional<FrameView> frame = subscription->read_for(50ms);
         REQUIRE(frame);
-        CHECK(subscription->counters().frames_delivered == static_cast<std::uint64_t>(i) + 1);
+        CHECK(subscription->snapshot().counters.frames_delivered == static_cast<std::uint64_t>(i) + 1);
     }
 
     CHECK(subscription->try_read() == std::nullopt);
@@ -432,7 +432,7 @@ TEST_CASE("Pull reads one frame at a time and withholds only retained credit",
     }
 
     REQUIRE(eventually([&] {
-        return subscription->counters().frames_received >= 2 * k_published;
+        return subscription->snapshot().counters.frames_received >= 2 * k_published;
     }));
 
     for(int i = 0; i < k_published; ++i)
@@ -476,7 +476,7 @@ TEST_CASE("A publisher refuses to send an array it did not declare", "[m2][slice
 
     CHECK(publisher.counters().dropped_bad_metadata == 1);
 
-    CHECK(subscription->state() == SubscriberState::Active);
+    CHECK(subscription->snapshot().state == SubscriberState::Active);
     CHECK(publisher.session_count() == 1);
 }
 
@@ -490,7 +490,7 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
     config.frame_metadata.shape[0] = k_frame_bytes;
 
     BulkPublisher publisher(config);
-    SubscriberConfig subscriber = subscriber_config();
+    SubscriptionOptions subscriber = subscription_options();
     subscriber.recovery_policy = RecoveryPolicy::Fail;
     std::unique_ptr<Subscription> subscription = open_subscription(
         publisher,
@@ -523,11 +523,11 @@ TEST_CASE("A frame that contradicts the granted geometry retires the session",
                 PublishResult::Accepted);
     }
 
-    REQUIRE(eventually([&] { return subscription->state() == SubscriberState::Failed; }));
+    REQUIRE(eventually([&] { return subscription->snapshot().state == SubscriberState::Failed; }));
 
-    CHECK(subscription->counters().frames_dropped_geometry_mismatch == 1);
-    CHECK(subscription->counters().frames_dropped_bad_header == 0);
-    CHECK(subscription->counters().frames_delivered == 0);
+    CHECK(subscription->snapshot().counters.frames_dropped_geometry_mismatch == 1);
+    CHECK(subscription->snapshot().counters.frames_dropped_bad_header == 0);
+    CHECK(subscription->snapshot().counters.frames_delivered == 0);
 
     const BulkError why = subscription->snapshot().error;
     CHECK(why.status == Status::GeometryMismatch);

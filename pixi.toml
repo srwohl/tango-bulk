@@ -39,6 +39,7 @@ pytango = ">=10.0"
 # The conda cpptango package ships libraries only, so tango_admin -- the tool the
 # registration step is written against -- comes from its own package.
 tango-admin = "*"
+pybind11 = ">=3.1.0,<4"
 
 [pypi-dependencies]
 pytango-db = "*"

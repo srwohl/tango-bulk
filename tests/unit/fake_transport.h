@@ -66,6 +66,7 @@ struct Script
     std::vector<std::byte> server_address{std::byte{9}, std::byte{8}, std::byte{7}};
 
     std::atomic<int> transports_built{0};
+    std::atomic<int> regions_supplied{0}; ///< transports built over a caller region
 
     std::atomic<int> activations{0};
     std::atomic<int> opens{0};
@@ -75,6 +76,7 @@ struct Script
     std::set<std::thread::id> channel_threads;
     std::vector<std::pair<Protocol::CoordType, std::chrono::steady_clock::time_point>>
         channel_deadlines;
+    std::vector<Protocol::ClientInstanceId> client_ids; ///< one per Open seen
     std::atomic<int> channel_inside{0};
     std::atomic<int> channel_max_concurrent{0};
 
@@ -194,12 +196,18 @@ struct Script
 
     std::shared_ptr<detail::DeliveryIngress> delivery;
 
+    /// The caller region the live transport registered, if any. Weak so the
+    /// script itself never keeps the region alive: only transports and the
+    /// frames delivered from it do, which is what the reuse rule counts.
+    std::weak_ptr<void> region_owner;
+
     std::deque<ScriptedFrame> staged;
 
-    void attach(std::shared_ptr<detail::DeliveryIngress> ingress)
+    void attach(std::shared_ptr<detail::DeliveryIngress> ingress, const std::shared_ptr<void> &region)
     {
         std::lock_guard<std::mutex> lock(mutex);
         delivery = std::move(ingress);
+        region_owner = region;
 
         for(ScriptedFrame &frame : staged)
         {
@@ -236,21 +244,38 @@ struct Script
     }
 
   private:
+    /// A delivered frame keeps its payload alive and, like a real borrowed
+    /// frame keeps its receive ring alive, the caller region it came from.
+    struct Hold
+    {
+        std::shared_ptr<std::vector<std::uint16_t>> payload;
+        std::shared_ptr<void> region;
+    };
+
     void deliver_locked(ScriptedFrame &frame)
     {
-        delivery->push(
-            detail::DetachedFrameFactory::make(frame.payload, frame.bytes(), frame.fields));
+        auto hold = std::make_shared<Hold>();
+        hold->payload = frame.payload;
+        hold->region = region_owner.lock();
+        delivery->push(detail::DetachedFrameFactory::make(hold, frame.bytes(), frame.fields));
     }
 };
 
 class FakeTransport final : public detail::SubscriberTransport
 {
   public:
-    FakeTransport(Script &script, std::shared_ptr<detail::DeliveryIngress> delivery) :
-        script_(script)
+    FakeTransport(Script &script,
+                  ReceiveRegion region,
+                  std::shared_ptr<detail::DeliveryIngress> delivery) :
+        script_(script),
+        region_(std::move(region.owner))
     {
         script_.transports_built.fetch_add(1, std::memory_order_relaxed);
-        script_.attach(std::move(delivery));
+        if(region_)
+        {
+            script_.regions_supplied.fetch_add(1, std::memory_order_relaxed);
+        }
+        script_.attach(std::move(delivery), region_);
     }
 
 
@@ -272,7 +297,9 @@ class FakeTransport final : public detail::SubscriberTransport
 
     BulkError last_error() const noexcept override
     {
-        return failed_ ? BulkError{Status::TransportFailure, "the fake was told to fail", "transport"}
+        return failed_ ? BulkError{Status::TransportFailure,
+                                   "the fake was told to fail",
+                                   Origin::Transport}
                        : BulkError{};
     }
 
@@ -299,16 +326,19 @@ class FakeTransport final : public detail::SubscriberTransport
         std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
 
     Script &script_;
+    std::shared_ptr<void> region_; ///< held like a registration would hold it
     std::atomic<SubscriberState> state_{SubscriberState::Opening};
     std::atomic<bool> failed_{false};
 };
 
 inline detail::TransportFactory fake_factory(Script &script)
 {
-    return [&script](const ReceivePlan &, std::shared_ptr<detail::DeliveryIngress> delivery)
+    return [&script](const ReceivePlan &,
+                     ReceiveRegion region,
+                     std::shared_ptr<detail::DeliveryIngress> delivery)
         -> std::unique_ptr<detail::SubscriberTransport>
     {
-        return std::make_unique<FakeTransport>(script, std::move(delivery));
+        return std::make_unique<FakeTransport>(script, std::move(region), std::move(delivery));
     };
 }
 
@@ -341,7 +371,7 @@ inline detail::CoordinationChannel fake_channel(Script &script)
             {
                 --script.channel_throws;
                 throw BulkException(
-                    BulkError{Status::TransportFailure, "the device is unreachable", "tango"});
+                    BulkError{Status::TransportFailure, "the device is unreachable", Origin::Tango});
             }
         }
 
@@ -351,14 +381,22 @@ inline detail::CoordinationChannel fake_channel(Script &script)
         if(Protocol::decode_envelope(request.data(), request.size(), envelope) != Status::Ok)
         {
             throw BulkException(BulkError{
-                Status::MalformedMessage, "the client sent something undecodable", "tango"});
+                Status::MalformedMessage, "the client sent something undecodable", Origin::Tango});
         }
 
         switch(kind)
         {
         case Protocol::CoordType::Open:
+        {
+            Protocol::OpenRequest open;
+            if(Protocol::decode(request.data(), request.size(), open) == Status::Ok)
+            {
+                std::lock_guard<std::mutex> lock(script.mutex);
+                script.client_ids.push_back(open.client_instance_id);
+            }
             script.opens.fetch_add(1, std::memory_order_relaxed);
             return script.open_reply(envelope.correlation_id);
+        }
         case Protocol::CoordType::Renew:
             script.renews.fetch_add(1, std::memory_order_relaxed);
             return script.renew_reply(envelope.correlation_id);
@@ -376,16 +414,26 @@ inline detail::CoordinationChannel fake_channel(Script &script)
     };
 }
 
-inline SubscriberConfig subscription_config()
+/// Pull options: no callback.
+inline SubscriptionOptions subscription_options()
 {
-    SubscriberConfig config;
-    config.stream_name = "bulk.unit";
-    config.receive_plan = ReceivePlan{64u << 10, 4, 2};
-    config.delivery_queue_depth = 8;
-    config.delivery_mode = DeliveryMode::Push;
-    config.command_timeout_ms = 500;
-    config.probe_timeout_ms = 60;
-    return config;
+    SubscriptionOptions options;
+    options.stream_name = "bulk.unit";
+    options.receive_plan = ReceivePlan{64u << 10, 4, 2};
+    return options;
+}
+
+inline FrameCallback noop_callback()
+{
+    return [](FrameEvent) {};
+}
+
+/// Push options: the same, delivering through `callback`.
+inline SubscriptionOptions push_options(FrameCallback callback = noop_callback())
+{
+    SubscriptionOptions options = subscription_options();
+    options.on_frame = std::move(callback);
+    return options;
 }
 
 inline StreamOffer subscription_offer(const std::string &stream_name = "bulk.unit")
@@ -406,27 +454,18 @@ inline StreamOffer subscription_offer(const std::string &stream_name = "bulk.uni
 }
 
 inline std::unique_ptr<Subscription> open_test_subscription(
-    SubscriberConfig config,
+    SubscriptionOptions options,
     detail::CoordinationChannel channel,
     detail::TransportFactory factory,
-    SubscriptionCallbacks callbacks,
     std::chrono::steady_clock::time_point establishment_deadline =
         std::chrono::steady_clock::time_point::max())
 {
-    StreamOffer offer = subscription_offer(config.stream_name);
-    return detail::SubscriptionFactory::open(std::move(config),
+    StreamOffer offer = subscription_offer(options.stream_name);
+    return detail::SubscriptionFactory::open(std::move(options),
                                              std::move(offer),
                                              std::move(channel),
                                              std::move(factory),
-                                             std::move(callbacks),
                                              establishment_deadline);
-}
-
-inline SubscriptionCallbacks noop_callbacks()
-{
-    SubscriptionCallbacks callbacks;
-    callbacks.on_frame = [](FrameView) {};
-    return callbacks;
 }
 
 template <typename Predicate>

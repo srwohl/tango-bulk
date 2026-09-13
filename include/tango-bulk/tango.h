@@ -10,6 +10,7 @@
 #include <tango-bulk/subscription.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -17,7 +18,6 @@
 // layering check has an explicit exception for it.  Note what is *not* here:
 // no ucp/*, and no UCX type in any signature.  A device server that links the
 // adapter never inherits UCX headers.
-#include <memory>
 
 namespace Tango
 {
@@ -34,6 +34,8 @@ namespace TangoBulk
 ///
 /// Unprefixed is the normal path: the names are discoverable and match the
 /// documentation.  The override exists for collisions, not as a style choice.
+/// Clients never need them: `subscribe()` recognises the three commands by
+/// their fixed argument descriptions, whatever they are called.
 struct CommandNames
 {
     std::string open{"BulkOpen"};
@@ -74,15 +76,17 @@ void detach_publisher(Tango::DeviceImpl &device) noexcept;
 ///
 /// The returned offer is suitable for preparing caller-owned receive storage.
 /// OpenReply remains authoritative for the established Geometry and ReceivePlan.
-/// Missing, stale, malformed, or unavailable discovery throws BulkException.
+/// Missing, stale, malformed, or unavailable discovery throws EstablishmentError.
 StreamOffer discover(Tango::DeviceProxy &proxy,
                      const std::string &stream_name,
                      std::uint32_t timeout_ms = 5'000);
 
-std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy,
-                                        SubscriberConfig config,
-                                        SubscriptionCallbacks callbacks,
-                                        const CommandNames &names = {});
+/// One bounded establishment over a borrowed proxy, which must outlive the
+/// Subscription. Discovers the stream offer and the bulk command names,
+/// plans the receive ring, opens and probes, and returns an active
+/// Subscription, or throws ConfigurationError, EstablishmentError or
+/// ResourceExhausted with no attempt left running.
+std::unique_ptr<Subscription> subscribe(Tango::DeviceProxy &proxy, SubscriptionOptions options);
 
 } // namespace TangoBulk
 

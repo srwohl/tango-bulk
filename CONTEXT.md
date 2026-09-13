@@ -99,6 +99,12 @@ are named separately for that reason — the publisher's wire-level view of a se
 client's view of its subscription.
 _Avoid_: subscriber (that is the party, not the thing it holds)
 
+**Frame event**:
+What push delivery hands to the application's callback: one delivered frame, or, exactly once
+and last, the terminal outcome that ended the subscription. Orderly close and interruption end
+push delivery without an event.
+_Avoid_: callback argument, message, notification
+
 **Probe**:
 The publisher's first message to a newly granted session, proving it can reach that
 subscriber's UCX endpoint. No frame flows until it is answered.
@@ -136,6 +142,19 @@ How much registered memory one subscription may hold, including receive rings re
 from earlier sessions. Ring depth and maximum frame size are derived from it.
 _Avoid_: memory limit, quota
 
+**Receive allocator**:
+The application's one chance to supply the receive ring's memory instead of letting the
+subscription allocate it. Asked once, during initial establishment, for the bytes the receive
+plan needs; a replacement session reuses that memory only while nothing else refers to it, and
+never asks again.
+_Avoid_: buffer callback, custom allocator, memory hook
+
+**Geometry expectation**:
+What a subscribing application says the granted geometry must describe — any of element
+type, rank, shape and strides, each optional. A grant that differs fails establishment; a
+replacement session that differs ends the subscription.
+_Avoid_: schema check, require, assertion
+
 ### The control plane's structure
 
 **Coordination channel**:
@@ -144,9 +163,10 @@ carries it. Tango commands carry it today; a Python callable carries it in the b
 _Avoid_: command callback, RPC, proxy, transport (that is the data plane)
 
 **Session supervisor**:
-The module that keeps one session alive — opening it, renewing its lease, reconnecting when it
-is lost, and closing it when asked. It owns the policy and owns neither a transport nor a
-control system.
+The part of a subscription that keeps one session alive — opening it, renewing its lease,
+reconnecting when it is lost, and closing it when asked. It owns the policy and the current
+transport, taking a fresh transport from the transport factory on every reconnect; it owns no
+control system. It is a role within a subscription, not a thing an application holds.
 _Avoid_: session manager, controller, runner, client
 
 **Transport**:

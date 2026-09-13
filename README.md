@@ -293,18 +293,21 @@ A client. Construct a Subscription and provide its frame callback:
 ```cpp
 Tango::DeviceProxy proxy("bulk/example/1");   // BORROWED; you keep it alive
 
-TangoBulk::SubscriberConfig config;
-config.stream_name = "image";
-
-TangoBulk::SubscriptionCallbacks callbacks;
-callbacks.on_frame = [](TangoBulk::FrameView f) { process(f); };
-auto subscription = TangoBulk::subscribe(proxy, config, std::move(callbacks));
+TangoBulk::SubscriptionOptions options;
+options.stream_name = "image";
+options.on_frame = [](TangoBulk::FrameEvent event)
+{
+    if(event.terminal()) { report(event.error); return; }   // the last event
+    process(event.frame);
+};
+auto subscription = TangoBulk::subscribe(proxy, std::move(options));
 ```
 
-The frame callback runs on a library-owned dispatch thread — never the UCX engine thread, so a
-slow consumer cannot stall the transport, and never a Tango thread, so a stuck `command_inout`
-cannot stall delivery. Select `DeliveryMode::Pull` and use `read_for()` when the application
-should own frame reads.
+Supplying a callback selects push delivery. It runs on a library-owned dispatch thread — never
+the UCX engine thread, so a slow consumer cannot stall the transport, and never a Tango thread,
+so a stuck `command_inout` cannot stall delivery. Leave `on_frame` empty and use `read_for()` or
+`try_read()` when the application should own frame reads; a pull operation on a push
+Subscription throws `DeliveryModeError`.
 
 Working versions of all of the above, including the decimated preview attribute for legacy
 visibility, are in [examples/](examples/) with instructions for running them with or without a

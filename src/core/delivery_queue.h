@@ -8,6 +8,7 @@
 #include <core/bounded_queue.h>
 
 #include <tango-bulk/frame.h>
+#include <tango-bulk/subscriber.h>
 
 #include <chrono>
 #include <cstddef>
@@ -50,7 +51,7 @@ class DeliveryQueue
         std::uint64_t high_water{0};
     };
 
-    DeliveryQueue(std::size_t capacity, DropPolicy policy);
+    DeliveryQueue(std::size_t capacity, QueuePolicy policy);
     ~DeliveryQueue();
 
     DeliveryQueue(const DeliveryQueue &) = delete;

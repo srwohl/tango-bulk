@@ -25,7 +25,7 @@
 /// rejected field to a status is fixed here and documented rather than invented
 /// per call site:
 ///
-///   stream_name, lease TTL, DropOldest-on-producer  -> MalformedMessage
+///   stream_name, lease TTL, queue policy, expectation shape -> MalformedMessage / GeometryMismatch
 ///   max_frame_bytes                                 -> FrameTooLarge
 ///   ring_depth, credit_window, queue depths         -> DepthTooLarge
 ///   pinned_memory_limit_bytes                       -> ResourceExhausted
@@ -169,7 +169,54 @@ Status PublisherConfig::validate() const noexcept
     return Status::Ok;
 }
 
-Status SubscriberConfig::validate() const noexcept
+Status GeometryExpectation::validate() const noexcept
+{
+    if(rank && *rank > k_max_rank)
+    {
+        return Status::GeometryMismatch;
+    }
+
+    if((shape || strides) && !rank)
+    {
+        return Status::GeometryMismatch;
+    }
+
+    if(rank)
+    {
+        for(std::size_t i = *rank; i < k_max_rank; ++i)
+        {
+            if((shape && (*shape)[i] != 0) || (strides && (*strides)[i] != 0))
+            {
+                return Status::GeometryMismatch;
+            }
+        }
+    }
+
+    return Status::Ok;
+}
+
+Status GeometryExpectation::check(const Geometry &granted) const noexcept
+{
+    if(element_type && *element_type != granted.element_type)
+    {
+        return Status::GeometryMismatch;
+    }
+    if(rank && *rank != granted.rank)
+    {
+        return Status::GeometryMismatch;
+    }
+    if(shape && *shape != granted.shape)
+    {
+        return Status::GeometryMismatch;
+    }
+    if(strides && *strides != granted.strides)
+    {
+        return Status::GeometryMismatch;
+    }
+    return Status::Ok;
+}
+
+Status SubscriptionOptions::validate() const noexcept
 {
     if(receive_plan)
     {
@@ -185,15 +232,9 @@ Status SubscriberConfig::validate() const noexcept
         return Status::MalformedMessage;
     }
 
-    if(pinned_memory_limit_bytes < k_min_pinned_bytes ||
-       pinned_memory_limit_bytes > k_max_pinned_bytes)
+    if(pinned_budget_bytes < k_min_pinned_bytes || pinned_budget_bytes > k_max_pinned_bytes)
     {
         return Status::ResourceExhausted;
-    }
-
-    if(delivery_queue_depth < k_min_delivery_queue || delivery_queue_depth > k_max_delivery_queue)
-    {
-        return Status::DepthTooLarge;
     }
 
     if(establishment_timeout_ms == 0)
@@ -201,63 +242,29 @@ Status SubscriberConfig::validate() const noexcept
         return Status::MalformedMessage;
     }
 
-    if(command_timeout_ms == 0 || probe_timeout_ms == 0)
+    if(recovery_policy != RecoveryPolicy::Fail && recovery_policy != RecoveryPolicy::Reconnect)
     {
         return Status::MalformedMessage;
     }
 
-
-    // A negative value other than -1 is not "unpinned", it is a typo. Rejecting
-    // it is the difference between a field that is off and a field that is
-    // ignored -- see docs/EXTRACTION.md on engine_cpu_affinity.
-    if(engine_cpu_affinity < -1)
+    // PreferFresh replaces the oldest queued *copied* frame.  Every delivered
+    // frame is borrowed today, and evicting a borrowed frame would return the
+    // credit for a frame the application never saw, so the policy is refused
+    // until copied delivery exists.
+    if(queue_policy != QueuePolicy::PreserveOrder)
     {
         return Status::MalformedMessage;
     }
 
-    const bool has_receive_buffer = static_cast<bool>(receive_buffer);
-    if(has_receive_buffer != (receive_buffer_bytes != 0))
+    if(const Status expectation = expect.validate(); expectation != Status::Ok)
     {
-        return Status::MalformedMessage;
+        return expectation;
     }
 
-    if(!has_receive_buffer && receive_memory_kind != MemoryKind::Host)
-    {
-        return Status::MalformedMessage;
-    }
-
-    if(receive_memory_kind != MemoryKind::Host && receive_memory_kind != MemoryKind::Cuda &&
-       receive_memory_kind != MemoryKind::Rocm)
-    {
-        return Status::MalformedMessage;
-    }
-
-    if(recovery_policy != RecoveryPolicy::Fail &&
-       recovery_policy != RecoveryPolicy::Reconnect)
-    {
-        return Status::MalformedMessage;
-    }
-
-    const std::uint64_t requested_bytes =
-        receive_plan ? receive_plan->pinned_bytes() : 0;
-    if(receive_plan && requested_bytes > pinned_memory_limit_bytes)
+    if(receive_plan && receive_plan->pinned_bytes() > pinned_budget_bytes)
     {
         return Status::ResourceExhausted;
     }
-
-    if(has_receive_buffer && receive_plan && receive_buffer_bytes < requested_bytes)
-    {
-        return Status::ResourceExhausted;
-    }
-
-    if(has_receive_buffer && receive_buffer_bytes > pinned_memory_limit_bytes)
-    {
-        return Status::ResourceExhausted;
-    }
-
-    // Both drop policies are legal here: the delivery queue holds views the
-    // application has not taken yet, and dropping the oldest of those is a
-    // choice about which frames matter, not a memory-safety question.
 
     return Status::Ok;
 }

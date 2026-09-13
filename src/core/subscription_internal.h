@@ -35,11 +35,10 @@ class SubscriptionFactory
 {
   public:
     static std::unique_ptr<Subscription> open(
-        SubscriberConfig config,
+        SubscriptionOptions options,
         StreamOffer offer,
         CoordinationChannel channel,
         TransportFactory transport_factory,
-        SubscriptionCallbacks callbacks,
         std::chrono::steady_clock::time_point establishment_deadline);
 };
 

@@ -1354,10 +1354,10 @@ int main(int argc, char *argv[])
     {
         prepare_outputs(options);
         Tango::DeviceProxy proxy(options.device);
-        TangoBulk::SubscriberConfig config;
+        TangoBulk::SubscriptionOptions config;
         config.stream_name = options.stream;
         const TangoBulk::StreamOffer offer =
-            TangoBulk::discover(proxy, options.stream, config.command_timeout_ms);
+            TangoBulk::discover(proxy, options.stream, config.establishment_timeout_ms);
 
         if(options.ring_depth > offer.geometry.ring_depth)
             throw std::runtime_error("requested receive ring exceeds the discovery offer");
@@ -1370,21 +1370,20 @@ int main(int argc, char *argv[])
         const TangoBulk::ReceivePlan receive_plan{
             offer.geometry.max_frame_bytes, ring_depth, credit_window};
         config.receive_plan = receive_plan;
-        config.delivery_mode = TangoBulk::DeliveryMode::Pull;
-        config.drop_policy = TangoBulk::DropPolicy::DropNewest;
         config.recovery_policy = TangoBulk::RecoveryPolicy::Reconnect;
-        config.delivery_queue_depth = ring_depth;
         if(const TangoBulk::Status status = config.validate(); status != TangoBulk::Status::Ok)
-            throw TangoBulk::BulkException(
-                {status, "discovery geometry cannot satisfy the receive plan", "tango"});
+            throw TangoBulk::ConfigurationError({status,
+                                                 "discovery geometry cannot satisfy the receive plan",
+                                                 TangoBulk::Origin::Tango});
 
         const std::uint64_t receive_bytes = receive_plan.pinned_bytes();
         SharedReceiveRing receive_ring(receive_bytes);
-        config.receive_buffer = receive_ring.memory();
-        config.receive_buffer_bytes = receive_bytes;
-        config.receive_memory_kind = MemoryKind::Host;
+        config.receive_allocator = [&receive_ring, receive_bytes](std::uint64_t)
+        {
+            return TangoBulk::ReceiveRegion{receive_ring.memory(), receive_bytes, MemoryKind::Host};
+        };
 
-        auto subscription = TangoBulk::subscribe(proxy, config, {});
+        auto subscription = TangoBulk::subscribe(proxy, config);
         const TangoBulk::Geometry publisher = subscription->geometry();
         const Geometry geometry = geometry_from_publisher(publisher);
         const TangoBulk::ReceivePlan plan = subscription->plan();
@@ -1498,7 +1497,8 @@ int main(int argc, char *argv[])
     catch(const TangoBulk::BulkException &error)
     {
         std::cerr << "bulk error (" << TangoBulk::to_string(error.error().status) << ", from "
-                  << error.error().origin << "): " << error.error().message << std::endl;
+                  << TangoBulk::to_string(error.error().origin) << "): " << error.error().message
+                  << std::endl;
     }
     catch(const Tango::DevFailed &failure)
     {

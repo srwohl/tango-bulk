@@ -151,8 +151,8 @@ TEST_CASE("Open grants unpredictable identifiers and the negotiated lease terms"
         }
     };
 
-    std::unique_ptr<Subscription> first = open_subscription(publisher, subscriber_config(), record_open);
-    std::unique_ptr<Subscription> second = open_subscription(publisher, subscriber_config(), record_open);
+    std::unique_ptr<Subscription> first = open_subscription(publisher, subscription_options(), record_open);
+    std::unique_ptr<Subscription> second = open_subscription(publisher, subscription_options(), record_open);
     REQUIRE(grants.size() == 2);
     const Protocol::OpenReply &a = grants[0];
     const Protocol::OpenReply &b = grants[1];
@@ -199,10 +199,10 @@ TEST_CASE("A granted session carries no frame until ProbeAck arms it", "[m3][ses
     };
 
     std::unique_ptr<Subscription> subscription =
-        open_subscription(publisher, subscriber_config(), observe_open);
+        open_subscription(publisher, subscription_options(), observe_open);
 
     CHECK(observed_unarmed);
-    CHECK(subscription->state() == SubscriberState::Active);
+    CHECK(subscription->snapshot().state == SubscriberState::Active);
 
     CHECK(publish_one(publisher, 4096, 2) == PublishResult::Accepted);
     REQUIRE(collect(*subscription, 1).size() == 1);
@@ -210,7 +210,7 @@ TEST_CASE("A granted session carries no frame until ProbeAck arms it", "[m3][ses
 
 TEST_CASE("Renewal keeps a session alive past its lease", "[m3][session]")
 {
-    Slice slice(short_lease_config(), subscriber_config());
+    Slice slice(short_lease_config(), subscription_options());
 
     const auto until = std::chrono::steady_clock::now() + 1'500ms;
     while(std::chrono::steady_clock::now() < until)
@@ -220,17 +220,17 @@ TEST_CASE("Renewal keeps a session alive past its lease", "[m3][session]")
     CHECK(slice.publisher.session_count() == 1);
     CHECK(slice.publisher.counters().sessions_expired == 0);
     CHECK(slice.publisher.counters().renewals_accepted >= 4);
-    CHECK(slice.subscription->state() == SubscriberState::Active);
+    CHECK(slice.subscription->snapshot().state == SubscriberState::Active);
 }
 
 TEST_CASE("An unrenewed session expires on schedule with no frames in flight", "[m3][session]")
 {
     BulkPublisher publisher(short_lease_config());
-    SubscriberConfig config = subscriber_config();
+    SubscriptionOptions config = subscription_options();
     config.recovery_policy = RecoveryPolicy::Fail;
 
     std::vector<Protocol::OpenReply> grants;
-    detail::TransportFactory transport = detail::make_subscriber_transport_factory(config);
+    detail::TransportFactory transport = detail::make_subscriber_transport_factory(config.pinned_budget_bytes);
     std::unique_ptr<Subscription> subscription = detail::SubscriptionFactory::open(
         config,
         publisher.snapshot().stream_offer(),
@@ -251,7 +251,6 @@ TEST_CASE("An unrenewed session expires on schedule with no frames in flight", "
             return reply;
         },
         std::move(transport),
-        SubscriptionCallbacks{},
         std::chrono::steady_clock::time_point::max());
     REQUIRE(grants.size() == 1);
     const Protocol::OpenReply &granted = grants.front();
@@ -273,7 +272,7 @@ TEST_CASE("An unrenewed session expires on schedule with no frames in flight", "
 
     // The client learns from the blocked renewal that this session is over for
     // good; no second lifecycle constructor is involved.
-    REQUIRE(eventually([&] { return subscription->state() == SubscriberState::Failed; }));
+    REQUIRE(eventually([&] { return subscription->snapshot().state == SubscriberState::Failed; }));
     CHECK(subscription->snapshot().error.status == Status::SessionExpired);
 }
 
@@ -380,7 +379,7 @@ TEST_CASE("Close is idempotent and Renew tells a closed session from an unknown 
     std::vector<Protocol::OpenReply> grants;
     std::unique_ptr<Subscription> subscription = open_subscription(
         publisher,
-        subscriber_config(),
+        subscription_options(),
         [&grants](Protocol::CoordType type, const std::vector<std::byte> &reply)
         {
             if(type == Protocol::CoordType::Open)
@@ -412,7 +411,7 @@ TEST_CASE("Close is idempotent and Renew tells a closed session from an unknown 
     REQUIRE(eventually([&] { return publisher.counters().sessions_closed == 1; }));
     CHECK(publisher.counters().sessions_expired == 0);
     CHECK(publisher.session_count() == 0);
-    CHECK(subscription->state() == SubscriberState::Active);
+    CHECK(subscription->snapshot().state == SubscriberState::Active);
 
     // The seat keeps the identifier, so the answer names what happened to it.
     CHECK(renew(publisher, granted.session_id).status == Status::UnknownSession);
@@ -428,7 +427,7 @@ TEST_CASE("Renewing faster than the rate limit is refused without shortening the
     std::vector<Protocol::OpenReply> grants;
     std::unique_ptr<Subscription> subscription = open_subscription(
         publisher,
-        subscriber_config(),
+        subscription_options(),
         [&grants](Protocol::CoordType type, const std::vector<std::byte> &reply)
         {
             if(type == Protocol::CoordType::Open)
@@ -462,7 +461,7 @@ TEST_CASE("A publisher admits no more sessions than it was configured for", "[m3
     config.max_sessions = 2;
 
     BulkPublisher publisher(config);
-    SubscriberConfig subscriber = subscriber_config();
+    SubscriptionOptions subscriber = subscription_options();
     subscriber.recovery_policy = RecoveryPolicy::Fail;
     std::vector<Protocol::OpenReply> grants;
     const auto record_open = [&grants](Protocol::CoordType type,
