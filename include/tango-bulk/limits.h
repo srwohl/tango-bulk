@@ -54,6 +54,12 @@ inline constexpr std::uint32_t k_min_element_size = 1;
 inline constexpr std::size_t k_max_stream_name_bytes = 64;
 inline constexpr std::size_t k_min_stream_name_bytes = 1;
 
+/// The operator-facing session label a client supplies at Open, bounded and
+/// charset-restricted exactly like a stream name because it is untrusted input
+/// that reaches logs and a Tango attribute.  Unlike a stream name it may be
+/// empty: a client that offers no label is identified by its ordinal alone.
+inline constexpr std::size_t k_max_client_label_bytes = 64;
+
 } // namespace TangoBulk
 
 #endif // TANGO_BULK_LIMITS_H

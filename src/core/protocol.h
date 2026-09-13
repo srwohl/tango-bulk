@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-/// The tango-bulk wire protocol, major 1 minor 0.
+/// The tango-bulk wire protocol, major 2 minor 0.
 ///
 /// Two planes, deliberately different in shape:
 ///
@@ -39,7 +39,12 @@ namespace TangoBulk::Protocol
 // Versions
 // ---------------------------------------------------------------------------
 
-inline constexpr std::uint8_t k_version_major = 1;
+/// Major 2 deletes every field major 1 encoded and never read, adds byte order
+/// to the geometry block, and adds the per-session flow policy and client label
+/// to Open.  Every offset moved, so a major 1 peer is refused with
+/// UnsupportedVersion rather than misread -- which is the staged migration
+/// ADR 0001 asks for.
+inline constexpr std::uint8_t k_version_major = 2;
 inline constexpr std::uint8_t k_version_minor = 0;
 
 // ---------------------------------------------------------------------------
@@ -99,7 +104,6 @@ std::string to_hex(const ClientInstanceId &id);
 SessionId generate_session_id();
 ClientInstanceId generate_client_instance_id();
 StreamId generate_stream_id();
-std::uint64_t generate_server_epoch_id();
 std::uint64_t generate_probe_token();
 
 // ---------------------------------------------------------------------------
@@ -125,38 +129,35 @@ enum class CoordType : std::uint16_t
 
 const char *to_string(CoordType type) noexcept;
 
-/// Capability bits in Open::requested_caps / OpenReply::granted_caps.
+/// What the publisher owes this session when it has no credit, declared per
+/// session at Open because a live viewer and a file writer routinely attach to
+/// the same stream with opposite requirements.
 ///
-/// Unknown bits MUST be ignored rather than rejected: that is what lets a minor
-/// version add a capability without breaking an older server.
-inline constexpr std::uint32_t k_caps_credit_coalescing = 1u << 0;
-inline constexpr std::uint32_t k_caps_probe = 1u << 2;
-inline constexpr std::uint32_t k_caps_all = k_caps_credit_coalescing | k_caps_probe;
-
-enum class Transport : std::uint32_t
+/// Lossy is the default because it is the only one that cannot make one
+/// client's slowness another client's problem.  A publisher MAY refuse a
+/// Lossless request; it never silently downgrades one, since a writer that
+/// asked for every frame and quietly got some of them is a data-loss bug
+/// wearing a success status.
+enum class FlowPolicy : std::uint32_t
 {
-    Any = 0,
-    ActiveMessage = 1, ///< AM rendezvous
-    Rma = 2,
+    Lossy = 0,    ///< the publisher skips this subscriber when it has no credit
+    Lossless = 1, ///< the publisher withholds the frame until this subscriber can take it
 };
 
-/// Wire value of OpenRequest::drop_policy. The subscriber's queue policy is
-/// local (SubscriptionOptions::queue_policy) and no longer crosses the wire;
-/// clients send DropNewest and publishers ignore the field.
-enum class DropPolicy : std::uint32_t
-{
-    DropNewest = 0,
-    DropOldest = 1,
-};
+const char *to_string(FlowPolicy flow) noexcept;
 
 enum class CloseReason : std::uint32_t
 {
     Normal = 0,
     ClientShutdown = 1,
-    ClientError = 2,
 };
 
-/// Server-side session state, as reported in RenewReply.
+/// Publisher-side session state.
+///
+/// It is not on the wire in major 2: a client learns whether its session is
+/// alive from the Renew status, and a state word it could only ever act on by
+/// reopening told it nothing the status did not.  The publisher keeps the enum
+/// because teardown is ordered by it and `BulkSessions` reports it.
 enum class SessionState : std::uint32_t
 {
     Unknown = 0,
@@ -177,7 +178,7 @@ struct Envelope
     std::uint8_t version_minor{k_version_minor};
     std::uint16_t header_bytes{k_coord_envelope_bytes};
     CoordType msg_type{CoordType::Error};
-    std::uint16_t flags{0}; ///< 0 in major 1; reserved
+    std::uint16_t flags{0}; ///< 0 in major 2; reserved
     std::uint32_t body_bytes{0};
     std::uint64_t correlation_id{0}; ///< client-chosen; echoed unchanged
 };
@@ -189,12 +190,12 @@ struct Envelope
 Status decode_envelope(const std::byte *data, std::size_t size, Envelope &out) noexcept;
 
 // ---------------------------------------------------------------------------
-// Geometry on the wire -- 96 bytes, embedded in OpenReply and RenewReply
+// Geometry on the wire -- 104 bytes, embedded in OpenReply
 // ---------------------------------------------------------------------------
 
 /// The domain `Geometry` is the wire type: one layout, one validator, one set
 /// of bounds checks, reused verbatim by every message that carries it.
-inline constexpr std::size_t k_geometry_block_bytes = 96;
+inline constexpr std::size_t k_geometry_block_bytes = 104;
 
 // ---------------------------------------------------------------------------
 // Coordination messages
@@ -204,34 +205,33 @@ struct OpenRequest
 {
     std::uint8_t version_min{k_version_major};
     std::uint8_t version_max{k_version_major};
-    std::uint32_t requested_caps{k_caps_all};
+    FlowPolicy flow{FlowPolicy::Lossy};
     ClientInstanceId client_instance_id{};
     std::uint64_t requested_max_frame_bytes{0};
     std::uint32_t requested_ring_depth{0};
     std::uint32_t requested_credit_window{0};
     MemoryKind requested_memory_kind{MemoryKind::Host};
-    Transport requested_transport{Transport::Any};
-    DropPolicy drop_policy{DropPolicy::DropNewest};
     std::string stream_name;
+
+    /// Operator-facing identity: 0..64 bytes of [A-Za-z0-9_.-], empty when the
+    /// client offers none.  It is what `BulkSessions` shows, because the session
+    /// id is a bearer credential and must not be the label an operator reads.
+    std::string client_label;
+
     std::vector<std::byte> client_ucx_address;
 };
 
+/// The session contract: everything a client must agree to before a frame
+/// moves.  Accepting an Open means accepting exactly what was requested, so
+/// nothing the request settled is echoed back -- a reply field that only ever
+/// repeats a request field is a field nobody reads.
 struct OpenReply
 {
-    std::uint8_t version_selected{k_version_major};
     Status status{Status::Ok};
-    std::uint32_t granted_caps{0};
     SessionId session_id{};
     StreamId stream_id{0};
     std::uint32_t lease_ttl_ms{0};
     std::uint32_t renew_interval_ms{0};
-    Transport transport_selected{Transport::ActiveMessage};
-
-    /// Changes on server restart.  A client that sees a different value on
-    /// reopen knows the server restarted rather than merely dropped the session,
-    /// and MUST discard all cached geometry and sequence state.
-    std::uint64_t server_epoch_id{0};
-
     Geometry geometry{};
     std::vector<std::byte> server_ucx_address;
 };
@@ -239,23 +239,19 @@ struct OpenReply
 struct RenewRequest
 {
     SessionId session_id{};
-    std::uint64_t client_frames_delivered{0}; ///< cumulative; diagnostics only
-    std::uint64_t client_credits_returned{0}; ///< cumulative; diagnostics only
-    std::uint32_t client_state{0};            ///< SubscriberState
 };
 
+/// Renew answers one question -- is the lease still mine, and for how long.
+///
+/// It carries no geometry: a change to the array terms retires the session, so
+/// a reply that could report one would be reporting a contract the client is
+/// no longer party to.
 struct RenewReply
 {
     SessionId session_id{};
     Status status{Status::Ok};
     std::uint32_t lease_ttl_ms{0};      ///< MAY change; client MUST adopt
     std::uint32_t renew_interval_ms{0}; ///< MAY change; client MUST adopt
-    SessionState server_state{SessionState::Unknown};
-
-    /// Always the CURRENT epoch.  This is the only mandatory way a client learns
-    /// about a geometry change, because the data-plane Geometry message may be
-    /// lost or may race a reconnect.
-    Geometry geometry{};
 };
 
 struct CloseRequest
@@ -268,7 +264,6 @@ struct CloseReply
 {
     SessionId session_id{};
     Status status{Status::Ok}; ///< Ok, or UnknownSession for an already-closed id
-    std::uint32_t frames_credited_final{0}; ///< low 32 bits; diagnostics
 };
 
 struct ErrorMessage
@@ -278,10 +273,10 @@ struct ErrorMessage
 };
 
 /// Fixed body sizes, exclusive of the envelope and of any variable tail.
-inline constexpr std::size_t k_open_fixed_bytes = 56;
-inline constexpr std::size_t k_open_reply_fixed_bytes = 152;
-inline constexpr std::size_t k_renew_bytes = 40;
-inline constexpr std::size_t k_renew_reply_bytes = 128;
+inline constexpr std::size_t k_open_fixed_bytes = 48;
+inline constexpr std::size_t k_open_reply_fixed_bytes = 144;
+inline constexpr std::size_t k_renew_bytes = 16;
+inline constexpr std::size_t k_renew_reply_bytes = 32;
 inline constexpr std::size_t k_close_bytes = 24;
 inline constexpr std::size_t k_close_reply_bytes = 24;
 inline constexpr std::size_t k_error_fixed_bytes = 8;
@@ -326,6 +321,11 @@ Status decode(const std::byte *data, std::size_t size, ErrorMessage &out,
 /// Stream names are 1..64 bytes of [A-Za-z0-9_.-].
 Status validate_stream_name(const std::string &name) noexcept;
 
+/// Client labels are 0..64 bytes of the same charset.  Empty is legal; a
+/// character outside the set is not, because the label is untrusted input that
+/// reaches logs and a Tango string attribute unescaped.
+Status validate_client_label(const std::string &label) noexcept;
+
 // ---------------------------------------------------------------------------
 // Data plane
 // ---------------------------------------------------------------------------
@@ -355,15 +355,14 @@ inline constexpr unsigned k_am_id_credit = 1;
 inline constexpr unsigned k_am_id_probe = 2;
 inline constexpr unsigned k_am_id_probe_ack = 3;
 
+/// The frame header is the largest data-plane header, which is what the engine
+/// must confirm the transport can carry.  It queries ucp_worker_attr_t's
+/// max_am_header at startup and fails construction below this; discovering the
+/// limit at the first frame is not acceptable.
 inline constexpr std::size_t k_frame_header_bytes = 160;
 inline constexpr std::size_t k_credit_bytes = 32;
 inline constexpr std::size_t k_probe_bytes = 32;
 inline constexpr std::size_t k_probe_ack_bytes = 32;
-
-/// The largest data-plane header, which is what the engine must confirm the
-/// transport can carry.  The engine queries ucp_worker_attr_t.max_am_header at
-/// startup and fails construction if it is below this; discovering the limit at
-/// the first frame is not acceptable.
 
 /// Common 16-byte prefix, so an AM callback can classify and version-check
 /// before touching anything type-specific.

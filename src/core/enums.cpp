@@ -83,19 +83,6 @@ const char *to_string(MemoryKind kind) noexcept
     return "Unknown";
 }
 
-const char *to_string(FanoutMode mode) noexcept
-{
-    switch(mode)
-    {
-    case FanoutMode::BestEffort:
-        return "BestEffort";
-    case FanoutMode::AllActive:
-        return "AllActive";
-    }
-
-    return "Unknown";
-}
-
 const char *to_string(PublishResult result) noexcept
 {
     switch(result)

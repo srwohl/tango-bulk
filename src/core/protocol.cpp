@@ -151,7 +151,7 @@ Status open_coord(const std::byte *data, std::size_t size, CoordType expected,
     env.version_minor = wire::get8(data + 5);
     env.header_bytes = header_bytes;
     env.msg_type = static_cast<CoordType>(type_raw);
-    env.flags = wire::get16(data + 10); // reserved in major 1; ignored, not rejected
+    env.flags = wire::get16(data + 10); // reserved in major 2; ignored, not rejected
     env.body_bytes = body_bytes;
     env.correlation_id = wire::get64(data + 16);
 
@@ -196,6 +196,9 @@ Status check_fixed_body(std::size_t body_size, std::size_t fixed,
 // Geometry on the wire
 // ---------------------------------------------------------------------------
 
+// Byte order joins the block in major 2, and the arrays move to 40 to keep
+// every 64-bit field 8-aligned within the block.  A reserved word at 36 is
+// what a minor version spends before the block has to grow again.
 void put_geometry(std::byte *p, const Geometry &g) noexcept
 {
     wire::put32(p + 0, g.generation);
@@ -205,11 +208,13 @@ void put_geometry(std::byte *p, const Geometry &g) noexcept
     wire::put64(p + 16, g.max_frame_bytes);
     wire::put32(p + 24, g.ring_depth);
     wire::put32(p + 28, g.credit_window);
+    wire::put32(p + 32, static_cast<std::uint32_t>(g.endian));
+    wire::put32(p + 36, 0); // reserved
 
     for(std::size_t i = 0; i < k_max_rank; ++i)
     {
-        wire::put64(p + 32 + i * 8, g.shape[i]);
-        wire::put64(p + 64 + i * 8, g.strides[i]);
+        wire::put64(p + 40 + i * 8, g.shape[i]);
+        wire::put64(p + 72 + i * 8, g.strides[i]);
     }
 }
 
@@ -222,11 +227,12 @@ void get_geometry(const std::byte *p, Geometry &g) noexcept
     g.max_frame_bytes = wire::get64(p + 16);
     g.ring_depth = wire::get32(p + 24);
     g.credit_window = wire::get32(p + 28);
+    g.endian = static_cast<Endian>(wire::get32(p + 32));
 
     for(std::size_t i = 0; i < k_max_rank; ++i)
     {
-        g.shape[i] = wire::get64(p + 32 + i * 8);
-        g.strides[i] = wire::get64(p + 64 + i * 8);
+        g.shape[i] = wire::get64(p + 40 + i * 8);
+        g.strides[i] = wire::get64(p + 72 + i * 8);
     }
 }
 
@@ -426,21 +432,56 @@ const char *to_string(SessionState state) noexcept
     return "Unknown";
 }
 
-Status validate_stream_name(const std::string &name) noexcept
+const char *to_string(FlowPolicy flow) noexcept
 {
-    if(name.size() < k_min_stream_name_bytes || name.size() > k_max_stream_name_bytes)
+    switch(flow)
     {
-        return Status::MalformedMessage;
+    case FlowPolicy::Lossy:
+        return "Lossy";
+    case FlowPolicy::Lossless:
+        return "Lossless";
     }
 
-    for(const char c : name)
+    return "Unknown";
+}
+
+namespace
+{
+
+/// The one charset rule, shared by the stream name and the client label.
+bool is_label_charset(const std::string &text) noexcept
+{
+    for(const char c : text)
     {
         const bool allowed = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
                              (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
         if(!allowed)
         {
-            return Status::MalformedMessage;
+            return false;
         }
+    }
+
+    return true;
+}
+
+} // namespace
+
+Status validate_client_label(const std::string &label) noexcept
+{
+    if(label.size() > k_max_client_label_bytes || !is_label_charset(label))
+    {
+        return Status::MalformedMessage;
+    }
+
+    return Status::Ok;
+}
+
+Status validate_stream_name(const std::string &name) noexcept
+{
+    if(name.size() < k_min_stream_name_bytes || name.size() > k_max_stream_name_bytes ||
+       !is_label_charset(name))
+    {
+        return Status::MalformedMessage;
     }
 
     return Status::Ok;
@@ -479,6 +520,11 @@ std::vector<std::byte> encode(const OpenRequest &msg, std::uint64_t correlation_
         throw_encode_failure("stream_name must be 1..64 bytes of [A-Za-z0-9_.-]");
     }
 
+    if(validate_client_label(msg.client_label) != Status::Ok)
+    {
+        throw_encode_failure("client_label must be 0..64 bytes of [A-Za-z0-9_.-]");
+    }
+
     if(msg.client_ucx_address.empty() ||
        msg.client_ucx_address.size() > k_max_ucx_address_bytes)
     {
@@ -486,7 +532,8 @@ std::vector<std::byte> encode(const OpenRequest &msg, std::uint64_t correlation_
                              std::to_string(k_max_ucx_address_bytes) + " bytes");
     }
 
-    const std::size_t body_bytes = k_open_fixed_bytes + 2 + msg.stream_name.size() + 4 +
+    const std::size_t body_bytes = k_open_fixed_bytes + 2 + msg.stream_name.size() + 2 +
+                                   msg.client_label.size() + 4 +
                                    msg.client_ucx_address.size();
 
     std::vector<std::byte> out = make_message(CoordType::Open, correlation_id, body_bytes);
@@ -495,18 +542,17 @@ std::vector<std::byte> encode(const OpenRequest &msg, std::uint64_t correlation_
     wire::put8(b + 0, msg.version_min);
     wire::put8(b + 1, msg.version_max);
     wire::put16(b + 2, 0); // reserved
-    wire::put32(b + 4, msg.requested_caps);
+    wire::put32(b + 4, static_cast<std::uint32_t>(msg.flow));
     put_id16(b + 8, msg.client_instance_id.bytes);
     wire::put64(b + 24, msg.requested_max_frame_bytes);
     wire::put32(b + 32, msg.requested_ring_depth);
     wire::put32(b + 36, msg.requested_credit_window);
     wire::put32(b + 40, static_cast<std::uint32_t>(msg.requested_memory_kind));
-    wire::put32(b + 44, static_cast<std::uint32_t>(msg.requested_transport));
-    wire::put32(b + 48, static_cast<std::uint32_t>(msg.drop_policy));
-    wire::put32(b + 52, 0); // reserved
+    wire::put32(b + 44, 0); // reserved
 
     std::size_t offset = k_open_fixed_bytes;
     offset += put_string_field(b + offset, msg.stream_name);
+    offset += put_string_field(b + offset, msg.client_label);
     put_blob_field(b + offset, msg.client_ucx_address);
 
     return out;
@@ -532,19 +578,23 @@ Status decode(const std::byte *data, std::size_t size, OpenRequest &out,
     OpenRequest msg;
     msg.version_min = wire::get8(body.data + 0);
     msg.version_max = wire::get8(body.data + 1);
-    msg.requested_caps = wire::get32(body.data + 4);
+    msg.flow = static_cast<FlowPolicy>(wire::get32(body.data + 4));
     get_id16(body.data + 8, msg.client_instance_id.bytes);
     msg.requested_max_frame_bytes = wire::get64(body.data + 24);
     msg.requested_ring_depth = wire::get32(body.data + 32);
     msg.requested_credit_window = wire::get32(body.data + 36);
     msg.requested_memory_kind = static_cast<MemoryKind>(wire::get32(body.data + 40));
-    msg.requested_transport = static_cast<Transport>(wire::get32(body.data + 44));
-    msg.drop_policy = static_cast<DropPolicy>(wire::get32(body.data + 48));
 
     TailReader tail{body.data, body.size, k_open_fixed_bytes};
 
     if(const Status status = tail.read_string(k_min_stream_name_bytes,
                                              k_max_stream_name_bytes, msg.stream_name);
+       status != Status::Ok)
+    {
+        return status;
+    }
+
+    if(const Status status = tail.read_string(0, k_max_client_label_bytes, msg.client_label);
        status != Status::Ok)
     {
         return status;
@@ -565,6 +615,23 @@ Status decode(const std::byte *data, std::size_t size, OpenRequest &out,
     if(const Status status = validate_stream_name(msg.stream_name); status != Status::Ok)
     {
         return status;
+    }
+
+    // The charset is enforced on the way in, not only on the way out: the label
+    // is untrusted text that reaches a log line and a Tango string attribute,
+    // and the peer that sent it is exactly the party that cannot be trusted to
+    // have checked it.
+    if(const Status status = validate_client_label(msg.client_label); status != Status::Ok)
+    {
+        return status;
+    }
+
+    // An unknown flow policy is refused rather than defaulted. Reading an
+    // unrecognised value as Lossy would hand a client that asked for every
+    // frame a session that silently drops them.
+    if(msg.flow != FlowPolicy::Lossy && msg.flow != FlowPolicy::Lossless)
+    {
+        return Status::MalformedMessage;
     }
 
     out = std::move(msg);
@@ -599,18 +666,14 @@ std::vector<std::byte> encode(const OpenReply &msg, std::uint64_t correlation_id
         make_message(CoordType::OpenReply, correlation_id, body_bytes);
     std::byte *b = out.data() + k_coord_envelope_bytes;
 
-    wire::put8(b + 0, msg.version_selected);
-    wire::put8(b + 1, 0); // reserved
-    wire::put16(b + 2, static_cast<std::uint16_t>(msg.status));
-    wire::put32(b + 4, msg.granted_caps);
+    wire::put16(b + 0, static_cast<std::uint16_t>(msg.status));
+    wire::put16(b + 2, 0); // reserved
+    wire::put32(b + 4, 0); // reserved
     put_id16(b + 8, msg.session_id.bytes);
     wire::put64(b + 24, msg.stream_id);
     wire::put32(b + 32, msg.lease_ttl_ms);
     wire::put32(b + 36, msg.renew_interval_ms);
-    wire::put32(b + 40, static_cast<std::uint32_t>(msg.transport_selected));
-    wire::put32(b + 44, 0); // reserved
-    wire::put64(b + 48, msg.server_epoch_id);
-    put_geometry(b + 56, msg.geometry);
+    put_geometry(b + 40, msg.geometry);
 
     put_blob_field(b + k_open_reply_fixed_bytes, msg.server_ucx_address);
 
@@ -635,16 +698,12 @@ Status decode(const std::byte *data, std::size_t size, OpenReply &out,
     }
 
     OpenReply msg;
-    msg.version_selected = wire::get8(body.data + 0);
-    msg.status = static_cast<Status>(wire::get16(body.data + 2));
-    msg.granted_caps = wire::get32(body.data + 4);
+    msg.status = static_cast<Status>(wire::get16(body.data + 0));
     get_id16(body.data + 8, msg.session_id.bytes);
     msg.stream_id = wire::get64(body.data + 24);
     msg.lease_ttl_ms = wire::get32(body.data + 32);
     msg.renew_interval_ms = wire::get32(body.data + 36);
-    msg.transport_selected = static_cast<Transport>(wire::get32(body.data + 40));
-    msg.server_epoch_id = wire::get64(body.data + 48);
-    get_geometry(body.data + 56, msg.geometry);
+    get_geometry(body.data + 40, msg.geometry);
 
     TailReader tail{body.data, body.size, k_open_reply_fixed_bytes};
 
@@ -680,10 +739,6 @@ std::vector<std::byte> encode(const RenewRequest &msg, std::uint64_t correlation
     std::byte *b = out.data() + k_coord_envelope_bytes;
 
     put_id16(b + 0, msg.session_id.bytes);
-    wire::put64(b + 16, msg.client_frames_delivered);
-    wire::put64(b + 24, msg.client_credits_returned);
-    wire::put32(b + 32, msg.client_state);
-    wire::put32(b + 36, 0); // reserved
 
     return out;
 }
@@ -709,9 +764,6 @@ Status decode(const std::byte *data, std::size_t size, RenewRequest &out,
 
     RenewRequest msg;
     get_id16(body.data + 0, msg.session_id.bytes);
-    msg.client_frames_delivered = wire::get64(body.data + 16);
-    msg.client_credits_returned = wire::get64(body.data + 24);
-    msg.client_state = wire::get32(body.data + 32);
 
     out = msg;
     if(envelope != nullptr)
@@ -733,8 +785,7 @@ std::vector<std::byte> encode(const RenewReply &msg, std::uint64_t correlation_i
     wire::put16(b + 18, 0); // reserved
     wire::put32(b + 20, msg.lease_ttl_ms);
     wire::put32(b + 24, msg.renew_interval_ms);
-    wire::put32(b + 28, static_cast<std::uint32_t>(msg.server_state));
-    put_geometry(b + 32, msg.geometry);
+    wire::put32(b + 28, 0); // reserved
 
     return out;
 }
@@ -763,8 +814,6 @@ Status decode(const std::byte *data, std::size_t size, RenewReply &out,
     msg.status = static_cast<Status>(wire::get16(body.data + 16));
     msg.lease_ttl_ms = wire::get32(body.data + 20);
     msg.renew_interval_ms = wire::get32(body.data + 24);
-    msg.server_state = static_cast<SessionState>(wire::get32(body.data + 28));
-    get_geometry(body.data + 32, msg.geometry);
 
     out = msg;
     if(envelope != nullptr)
@@ -833,7 +882,7 @@ std::vector<std::byte> encode(const CloseReply &msg, std::uint64_t correlation_i
     put_id16(b + 0, msg.session_id.bytes);
     wire::put16(b + 16, static_cast<std::uint16_t>(msg.status));
     wire::put16(b + 18, 0); // reserved
-    wire::put32(b + 20, msg.frames_credited_final);
+    wire::put32(b + 20, 0); // reserved
 
     return out;
 }
@@ -860,7 +909,6 @@ Status decode(const std::byte *data, std::size_t size, CloseReply &out,
     CloseReply msg;
     get_id16(body.data + 0, msg.session_id.bytes);
     msg.status = static_cast<Status>(wire::get16(body.data + 16));
-    msg.frames_credited_final = wire::get32(body.data + 20);
 
     out = msg;
     if(envelope != nullptr)
@@ -1119,6 +1167,11 @@ Status decode(const std::byte *data, std::size_t size, FrameHeader &out) noexcep
     if(msg.payload_bytes == 0 || msg.payload_bytes > k_max_frame_bytes_hard_cap)
     {
         return Status::FrameTooLarge;
+    }
+
+    if(const Status status = detail::validate_endian(msg.endian); status != Status::Ok)
+    {
+        return status;
     }
 
     if(const Status status = detail::validate_element_size(msg.element_type,

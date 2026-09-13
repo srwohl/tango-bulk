@@ -33,6 +33,13 @@ struct PublisherCounters
     std::uint64_t sessions_opened{0};
     std::uint64_t sessions_closed{0};
     std::uint64_t sessions_expired{0};
+
+    /// Lossless sessions evicted for owing credit past their lease TTL.
+    ///
+    /// A subset of sessions_expired, counted separately because it is the one
+    /// eviction that means data the publisher promised to deliver was lost, and
+    /// RFC 7.3 requires it to be loud rather than folded into a total.
+    std::uint64_t sessions_evicted_stalled{0};
     std::uint64_t sessions_rejected{0};
     std::uint64_t renewals_accepted{0};
     std::uint64_t renewals_late{0};

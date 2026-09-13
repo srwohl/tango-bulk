@@ -39,12 +39,12 @@ struct Options
     std::string file;
     std::string dataset;
     std::uint32_t prefetch_frames{8};
-    FanoutMode fanout_mode{FanoutMode::BestEffort};
+    bool allow_lossless{false};
     std::optional<double> frame_rate;
     bool file_from_command_line{false};
     bool dataset_from_command_line{false};
     bool prefetch_from_command_line{false};
-    bool fanout_from_command_line{false};
+    bool lossless_from_command_line{false};
 };
 
 Options options;
@@ -78,14 +78,13 @@ std::string option_value(const std::string &argument,
     throw std::runtime_error(name + " requires a value");
 }
 
-FanoutMode parse_fanout_mode(const std::string &value, const char *origin)
+bool parse_boolean(const std::string &value, const char *origin)
 {
-    if(value == "best-effort" || value == "BestEffort")
-        return FanoutMode::BestEffort;
-    if(value == "all-active" || value == "AllActive")
-        return FanoutMode::AllActive;
-    throw std::runtime_error(std::string(origin) +
-                             " must be 'best-effort' or 'all-active'");
+    if(value == "true" || value == "1" || value == "yes")
+        return true;
+    if(value == "false" || value == "0" || value == "no")
+        return false;
+    throw std::runtime_error(std::string(origin) + " must be 'true' or 'false'");
 }
 
 std::vector<char *> parse_options(int argc, char *argv[])
@@ -104,9 +103,9 @@ std::vector<char *> parse_options(int argc, char *argv[])
                 << "  --hdf5-file PATH       override Hdf5File (mainly for -nodb)\n"
                 << "  --hdf5-dataset PATH    image stack; default follows NeXus default/signal\n"
                 << "  --prefetch-frames N    HDF5 frames read ahead into publisher slots (default 8)\n"
-                << "  --fanout-mode MODE     best-effort or all-active (default best-effort)\n"
+                << "  --allow-lossless BOOL  grant lossless sessions when asked (default false)\n"
                 << "  --frame-rate HZ        replay rate; 0 is unlimited (default: file timing or 100)\n"
-                << "Database mode reads Hdf5File, Hdf5Dataset, PrefetchFrames, FanoutMode,\n"
+                << "Database mode reads Hdf5File, Hdf5Dataset, PrefetchFrames, AllowLossless,\n"
                 << "and FrameRate; command-line values take precedence.\n";
             std::exit(0);
         }
@@ -133,11 +132,12 @@ std::vector<char *> parse_options(int argc, char *argv[])
             options.prefetch_frames = static_cast<std::uint32_t>(parsed);
             options.prefetch_from_command_line = true;
         }
-        else if(argument == "--fanout-mode" || argument.rfind("--fanout-mode=", 0) == 0)
+        else if(argument == "--allow-lossless" ||
+                argument.rfind("--allow-lossless=", 0) == 0)
         {
-            options.fanout_mode = parse_fanout_mode(
-                option_value(argument, "--fanout-mode", i, argc, argv), "--fanout-mode");
-            options.fanout_from_command_line = true;
+            options.allow_lossless = parse_boolean(
+                option_value(argument, "--allow-lossless", i, argc, argv), "--allow-lossless");
+            options.lossless_from_command_line = true;
         }
         else if(argument == "--frame-rate" || argument.rfind("--frame-rate=", 0) == 0)
         {
@@ -411,7 +411,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         config.ring_depth = configuration_.prefetch_frames * 2;
         config.credit_window = configuration_.prefetch_frames;
         config.max_sessions = 4;
-        config.fanout_mode = configuration_.fanout_mode;
+        config.allow_lossless = configuration_.allow_lossless;
         config.pinned_memory_limit_bytes = std::max<std::uint64_t>(
             1ull << 30, checked_multiply(config.max_frame_bytes, config.ring_depth + 1,
                                         "publisher memory budget"));
@@ -424,8 +424,8 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
         set_state(Tango::RUNNING);
         set_status("replaying " + configuration_.file + ":" + replay_->dataset_path() + "; " +
                    std::to_string(replay_->frame_count()) + " frames, " +
-                   std::to_string(configuration_.prefetch_frames) + " prefetched, fanout=" +
-                   to_string(configuration_.fanout_mode));
+                   std::to_string(configuration_.prefetch_frames) + " prefetched, lossless=" +
+                   (configuration_.allow_lossless ? "allowed" : "refused"));
         loader_thread_ = std::thread([this] { loader_loop(); });
         replay_thread_ = std::thread([this] { replay_loop(); });
         metrics_thread_ = std::thread([this] { metrics_loop(); });
@@ -503,7 +503,7 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
             properties.emplace_back("Hdf5File");
             properties.emplace_back("Hdf5Dataset");
             properties.emplace_back("PrefetchFrames");
-            properties.emplace_back("FanoutMode");
+            properties.emplace_back("AllowLossless");
             properties.emplace_back("FrameRate");
             get_db_device()->get_property(properties);
 
@@ -524,12 +524,12 @@ class Hdf5ReplayDetector : public TANGO_BASE_CLASS
                 }
                 result.prefetch_frames = static_cast<std::uint32_t>(value);
             }
-            if(!result.fanout_from_command_line && !properties[3].is_empty())
+            if(!result.lossless_from_command_line && !properties[3].is_empty())
             {
                 std::string value;
                 if(!(properties[3] >> value))
-                    throw std::runtime_error("device property FanoutMode is not a string");
-                result.fanout_mode = parse_fanout_mode(value, "device property FanoutMode");
+                    throw std::runtime_error("device property AllowLossless is not a string");
+                result.allow_lossless = parse_boolean(value, "device property AllowLossless");
             }
             if(!result.frame_rate && !properties[4].is_empty())
             {

@@ -245,7 +245,10 @@ TEST_CASE("a corrupted magic is rejected", "[protocol][malformed]")
 TEST_CASE("a foreign major is rejected as UnsupportedVersion", "[protocol][version]")
 {
     auto bytes = encode(valid_open(), 1);
-    bytes[4] = std::byte{2}; // version_major
+    // One past the major we implement, written relative to it so this stays a
+    // foreign version across the next revision instead of becoming the current
+    // one and passing vacuously.
+    bytes[4] = static_cast<std::byte>(k_version_major + 1);
 
     OpenRequest out;
     CHECK(decode(bytes.data(), bytes.size(), out) == Status::UnsupportedVersion);

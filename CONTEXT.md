@@ -82,8 +82,19 @@ _Avoid_: negotiation result, agreement, settings
 Whether one Session is lossy or lossless when it lacks credit. A lossy Session may miss frames;
 a lossless Session contributes backpressure and preserves a frame until application handoff or
 until its Lease requires eviction. For a copied frame, handoff is when the application takes it;
-for a borrowed frame, slot ownership continues until the last view is released.
-_Avoid_: loss policy, fan-out mode (that is the current publisher-wide implementation)
+for a borrowed frame, slot ownership continues until the last view is released. Declared by the
+client at open; the publisher's overall behaviour is derived from the policies of the sessions
+it has granted, never configured. A publisher may refuse a lossless request but never downgrade
+one.
+_Avoid_: loss policy, fan-out mode (deleted with protocol major 1)
+
+**Client label**:
+The operator-facing name a client supplies at open — `live-viewer`, `hdf5-writer-2`. It is what
+`BulkSessions` shows, alongside a device-assigned ordinal for when two clients pick the same
+one. Bounded and charset-restricted exactly like a stream name, because it is untrusted text
+that reaches logs and a Tango attribute. It is never the Session id, which is a bearer
+credential and appears in no attribute at all.
+_Avoid_: session name, client id, session id
 
 **Recovery policy**:
 Whether a Subscription tries to establish a replacement Session after a transient coordination

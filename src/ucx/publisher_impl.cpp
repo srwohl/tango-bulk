@@ -120,9 +120,10 @@ constexpr std::chrono::seconds k_teardown_budget{2};
 enum class EndReason : std::uint32_t
 {
     None = 0,
-    Close = 1,   ///< the client asked (3.8)
-    Expire = 2,  ///< the lease deadline passed (4.2)
-    Transport = 3 ///< a send failed on an armed session (4.4)
+    Close = 1,    ///< the client asked (3.8)
+    Expire = 2,   ///< the lease deadline passed (4.2)
+    Transport = 3, ///< a send failed on an armed session (4.4)
+    Stalled = 4   ///< a lossless session owed credit for a whole TTL (RFC 7.3)
 };
 
 /// Counters as relaxed atomics, handed out as a snapshot copy (2.5).
@@ -143,6 +144,7 @@ struct AtomicPublisherCounters
     std::atomic<std::uint64_t> sessions_opened{0};
     std::atomic<std::uint64_t> sessions_closed{0};
     std::atomic<std::uint64_t> sessions_expired{0};
+    std::atomic<std::uint64_t> sessions_evicted_stalled{0};
     std::atomic<std::uint64_t> sessions_rejected{0};
     std::atomic<std::uint64_t> renewals_accepted{0};
     std::atomic<std::uint64_t> renewals_late{0};
@@ -296,9 +298,22 @@ struct BulkPublisher::Impl
         std::uint64_t probe_token{0};
         Geometry geometry{};
         MemoryKind receive_memory_kind{MemoryKind::Host};
+        Protocol::FlowPolicy flow{Protocol::FlowPolicy::Lossy};
+        std::string client_label; ///< operator-facing; may be empty
+        std::uint64_t ordinal{0}; ///< assigned at Open, never reused; see PublisherSnapshot
 
         std::atomic<SessionState> state{SessionState::Unknown};
         std::atomic<std::uint64_t> deadline_ms{0};
+
+        /// When a lossless session that still owes credit runs out of patience.
+        ///
+        /// RFC 7.3: a lossless subscriber that stops returning credit stalls
+        /// acquisition for everyone, so it is evicted at the same TTL that
+        /// bounds a crashed one -- no second timer, no second configuration.
+        /// Refreshed whenever its acknowledged ordinal advances, and never
+        /// consulted while it owes nothing, so an idle stream cannot expire a
+        /// healthy client.
+        std::atomic<std::uint64_t> credit_deadline_ms{0};
 
         /// Why this session ended, and the claim that says who gets to end it.
         ///
@@ -328,6 +343,7 @@ struct BulkPublisher::Impl
         std::vector<InFlight> inflight;
         std::uint64_t dropped_for_session{0};
         std::uint64_t processed_ordinal{0};
+        std::uint64_t credited_ordinal{0}; ///< engine-thread; drives credit_deadline_ms
         std::size_t sends_inflight{0};
         std::atomic<std::uint64_t> observed_lag_frames{0};
 
@@ -374,8 +390,6 @@ struct BulkPublisher::Impl
             sessions.push_back(
                 std::make_unique<Session>(*this, config.ring_depth, config.credit_window));
         }
-
-        server_epoch_id = Protocol::generate_server_epoch_id();
 
         register_am_handlers();
 
@@ -943,16 +957,24 @@ struct BulkPublisher::Impl
 
     /// Publisher-wide admission headroom, recomputed on the engine.
     ///
-    /// `credited` follows the configured fan-out contract. BestEffort tracks the
-    /// fastest armed session so a laggard cannot stall its peers. AllActive
-    /// tracks the slowest, so publish() retains the caller's lease until every
-    /// armed session has room for the next frame.
+    /// There is no publisher-wide fan-out mode to follow: the behaviour is
+    /// derived from what each session asked for at Open. `credited` tracks the
+    /// fastest armed session, so a lossy laggard cannot stall its peers, while
+    /// `lossless_admission_limit` is the tightest window any *lossless* session
+    /// has left -- infinite when none is attached. A publisher whose sessions
+    /// are all lossy therefore behaves exactly as best-effort did, and one
+    /// whose sessions are all lossless exactly as all-active did, without
+    /// either being a configured fact that a single subscriber can contradict.
     void refresh_gauges() noexcept
     {
         const std::uint64_t admitted_now = admitted.load(std::memory_order_acquire);
 
+        // Read lazily: this runs on every credit message, and the clock is only
+        // needed when a session has actually made progress.
+        std::uint64_t now = 0;
+        bool have_now = false;
+
         std::uint64_t best = 0;
-        std::uint64_t worst = admitted_now;
         std::uint64_t strict_limit = std::numeric_limits<std::uint64_t>::max();
         std::uint64_t worst_outstanding = 0;
         std::uint32_t armed = 0;
@@ -975,10 +997,29 @@ struct BulkPublisher::Impl
                                                              slots->ring().depth())]
                           .ordinal;
             best = std::max(best, retired);
-            worst = std::min(worst, retired);
-            strict_limit = std::min(strict_limit,
-                                    retired + static_cast<std::uint64_t>(
-                                                  session.geometry.credit_window));
+
+            if(session.flow == Protocol::FlowPolicy::Lossless)
+            {
+                strict_limit = std::min(strict_limit,
+                                        retired + static_cast<std::uint64_t>(
+                                                      session.geometry.credit_window));
+            }
+
+            // Progress, not traffic, is what keeps a lossless session alive:
+            // its deadline moves only when the sequence it has acknowledged
+            // does. A session that owes nothing is never measured against it.
+            if(retired != session.credited_ordinal)
+            {
+                if(!have_now)
+                {
+                    now = now_steady_ms();
+                    have_now = true;
+                }
+
+                session.credited_ordinal = retired;
+                session.credit_deadline_ms.store(now + config.lease_ttl_ms,
+                                                 std::memory_order_release);
+            }
 
             // The laggard, not the last one to speak: under fan-out the useful
             // reading is how far behind the slowest consumer has fallen.
@@ -987,10 +1028,8 @@ struct BulkPublisher::Impl
             worst_outstanding = std::max(worst_outstanding, outstanding);
         }
 
-        const std::uint64_t admission_credit =
-            config.fanout_mode == FanoutMode::AllActive ? worst : best;
-        credited.store(armed != 0 ? admission_credit : admitted_now, std::memory_order_release);
-        all_active_admission_limit.store(
+        credited.store(armed != 0 ? best : admitted_now, std::memory_order_release);
+        lossless_admission_limit.store(
             armed != 0 ? strict_limit : std::numeric_limits<std::uint64_t>::max(),
             std::memory_order_release);
         armed_sessions.store(armed, std::memory_order_release);
@@ -1043,6 +1082,17 @@ struct BulkPublisher::Impl
                 if(now >= session.deadline_ms.load(std::memory_order_acquire))
                 {
                     worked |= begin_expiry(session, EndReason::Expire);
+                }
+                else if(session.flow == Protocol::FlowPolicy::Lossless &&
+                        session.window.outstanding() != 0 &&
+                        now >= session.credit_deadline_ms.load(std::memory_order_acquire))
+                {
+                    // RFC 7.3. A lossless client that has owed credit for a
+                    // whole TTL is indistinguishable from one that segfaulted,
+                    // and it is holding up acquisition for every other session,
+                    // so it is treated identically -- loudly, because eviction
+                    // loses exactly the data lossless existed to protect.
+                    worked |= begin_expiry(session, EndReason::Stalled);
                 }
             }
 
@@ -1125,7 +1175,8 @@ struct BulkPublisher::Impl
         //    is per publisher, not per session, and outlives every client.
 
         // 6. Count it, and retire the identifiers.
-        if(session.end_reason.load(std::memory_order_acquire) == EndReason::Close)
+        const EndReason reason = session.end_reason.load(std::memory_order_acquire);
+        if(reason == EndReason::Close)
         {
             counters.sessions_closed.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1134,10 +1185,19 @@ struct BulkPublisher::Impl
             counters.sessions_expired.fetch_add(1, std::memory_order_relaxed);
         }
 
+        // Counted in addition to sessions_expired, not instead of it: RFC 7.3
+        // asks for a dedicated signal because this is the one eviction that
+        // means the experiment just lost data it was promised.
+        if(reason == EndReason::Stalled)
+        {
+            counters.sessions_evicted_stalled.fetch_add(1, std::memory_order_relaxed);
+        }
+
         session.window.reset(0);
         session.probe_sent = false;
         session.dropped_for_session = 0;
         session.processed_ordinal = 0;
+        session.credited_ordinal = 0;
         session.retired_seq.store(++retire_counter, std::memory_order_relaxed);
 
         if(session.sends_inflight != 0)
@@ -1267,15 +1327,17 @@ struct BulkPublisher::Impl
     // Admission control, read by publish() on application threads.
     //
     // `admitted` counts frames publish() accepted; `credited` is the engine's
-    // view of how far the relevant armed session has got: fastest for
-    // BestEffort, slowest for AllActive. Computing the difference on the
-    // application thread lets publish() report backpressure synchronously.
+    // view of how far the fastest armed session has got. Computing the
+    // difference on the application thread lets publish() report backpressure
+    // synchronously.
     std::atomic<std::uint64_t> admitted{0};
     std::atomic<std::uint64_t> credited{0};
-    /// First publisher ordinal AllActive may not admit. This is computed from
-    /// each session's negotiated window, which may be smaller than the
-    /// publisher-wide configured window.
-    std::atomic<std::uint64_t> all_active_admission_limit{
+    /// First publisher ordinal no lossless session can take yet, computed from
+    /// each one's negotiated window, which may be smaller than the
+    /// publisher-wide configured window. Unbounded while every session is
+    /// lossy, which is what makes lossless backpressure cost nothing when
+    /// nobody asked for it.
+    std::atomic<std::uint64_t> lossless_admission_limit{
         std::numeric_limits<std::uint64_t>::max()};
     std::atomic<std::uint64_t> dropped_before_all{0};
     std::atomic_flag publish_reservation = ATOMIC_FLAG_INIT;
@@ -1301,7 +1363,7 @@ struct BulkPublisher::Impl
     std::mutex session_mutex;
     std::vector<std::unique_ptr<Session>> sessions;
     std::uint64_t retire_counter{0}; ///< engine thread; orders retired seats
-    std::uint64_t server_epoch_id{0};
+    std::uint64_t session_ordinal{0}; ///< under session_mutex; names sessions for operators
     std::uint32_t generation{1};
 };
 
@@ -1421,16 +1483,14 @@ PublishResult BulkPublisher::publish(SlotHandle &&lease, const FrameMetadata &me
 
     const std::uint64_t admitted = impl_->admitted.load(std::memory_order_acquire);
     const std::uint64_t credited = impl_->credited.load(std::memory_order_acquire);
-    if(impl_->config.fanout_mode == FanoutMode::AllActive &&
-       admitted >= impl_->all_active_admission_limit.load(std::memory_order_acquire))
+    if(admitted >= impl_->lossless_admission_limit.load(std::memory_order_acquire))
     {
-        // Strict fan-out is retryable: consuming the producer's filled slot
-        // here would make it impossible to submit this exact frame once the
+        // Lossless backpressure is retryable: consuming the producer's filled
+        // slot here would make it impossible to submit this exact frame once the
         // slow subscriber returns credit.
         return PublishResult::WouldBlock;
     }
-    if(impl_->config.fanout_mode == FanoutMode::BestEffort &&
-       admitted - credited >= impl_->config.credit_window)
+    if(admitted - credited >= impl_->config.credit_window)
     {
         impl_->counters.dropped_credit_stalled.fetch_add(1, std::memory_order_relaxed);
         impl_->dropped_before_all.fetch_add(1, std::memory_order_relaxed);
@@ -1507,6 +1567,8 @@ PublisherCounters BulkPublisher::counters() const noexcept
     out.sessions_opened = c.sessions_opened.load(std::memory_order_relaxed);
     out.sessions_closed = c.sessions_closed.load(std::memory_order_relaxed);
     out.sessions_expired = c.sessions_expired.load(std::memory_order_relaxed);
+    out.sessions_evicted_stalled =
+        c.sessions_evicted_stalled.load(std::memory_order_relaxed);
     out.sessions_rejected = c.sessions_rejected.load(std::memory_order_relaxed);
     out.renewals_accepted = c.renewals_accepted.load(std::memory_order_relaxed);
     out.renewals_late = c.renewals_late.load(std::memory_order_relaxed);
@@ -1543,8 +1605,13 @@ PublisherSnapshot BulkPublisher::snapshot() const
         }
 
         PublisherSnapshot::SessionObservation observation;
-        observation.session_id = Protocol::to_hex(session.id);
+        observation.ordinal = session.ordinal;
+        // Truncated, per protocol.h's own rule: the session id is a bearer
+        // credential, and a snapshot is copied into logs and attributes.
+        observation.session_id = Protocol::to_log_string(session.id);
+        observation.client_label = session.client_label;
         observation.state = Protocol::to_string(state);
+        observation.flow = Protocol::to_string(session.flow);
         observation.lag_frames =
             session.observed_lag_frames.load(std::memory_order_acquire);
         out.sessions.push_back(std::move(observation));
@@ -1732,12 +1799,14 @@ std::vector<std::byte> BulkPublisher::Impl::handle_encoded_coordination(
 
 CoordinationReply BulkPublisher::Impl::handle_open(const Protocol::OpenRequest &request)
 {
-    if(request.requested_transport != Protocol::Transport::Any &&
-       request.requested_transport != Protocol::Transport::ActiveMessage)
+    // RFC 7.2: refusing is the only honest answer to a lossless request this
+    // publisher is not configured to serve.  Downgrading it to lossy would hand
+    // a writer a session that drops frames under exactly the load it asked to
+    // be protected from, and report success while doing it.
+    if(request.flow == Protocol::FlowPolicy::Lossless && !config.allow_lossless)
     {
-        throw BulkException(BulkError{Status::MalformedMessage,
-                                      "Open requested an unsupported transport",
-                                      Origin::Publisher});
+        return typed_reply(Protocol::ErrorMessage{
+            Status::NotAuthorized, "this publisher does not offer lossless sessions"});
     }
 
     if(request.requested_memory_kind != MemoryKind::Host &&
@@ -1836,6 +1905,9 @@ CoordinationReply BulkPublisher::Impl::handle_open(const Protocol::OpenRequest &
         session->stream_id = Protocol::generate_stream_id();
         session->probe_token = Protocol::generate_probe_token();
         session->geometry = geometry;
+        session->flow = request.flow;
+        session->client_label = request.client_label;
+        session->ordinal = ++session_ordinal;
         // CreditWindow is live transport state, not merely publisher
         // capacity.  BulkOpen may clamp both values to what this subscriber
         // requested, so retaining the server-wide defaults here would let the
@@ -1847,6 +1919,8 @@ CoordinationReply BulkPublisher::Impl::handle_open(const Protocol::OpenRequest &
         session->ep = endpoint;
         session->probe_sent = false;
         session->deadline_ms.store(now + config.lease_ttl_ms, std::memory_order_relaxed);
+        session->credit_deadline_ms.store(now + config.lease_ttl_ms,
+                                          std::memory_order_relaxed);
         session->rate_window_start_ms = now;
         session->renewals_in_window = 0;
         session->last_activity_ms = now;
@@ -1859,16 +1933,11 @@ CoordinationReply BulkPublisher::Impl::handle_open(const Protocol::OpenRequest &
     counters.sessions_opened.fetch_add(1, std::memory_order_relaxed);
 
     Protocol::OpenReply reply;
-    reply.version_selected = Protocol::k_version_major;
     reply.status = Status::Ok;
-    reply.granted_caps =
-        request.requested_caps & (Protocol::k_caps_credit_coalescing | Protocol::k_caps_probe);
     reply.session_id = session->id;
     reply.stream_id = session->stream_id;
     reply.lease_ttl_ms = config.lease_ttl_ms;
     reply.renew_interval_ms = config.renew_interval_ms;
-    reply.transport_selected = Protocol::Transport::ActiveMessage;
-    reply.server_epoch_id = server_epoch_id;
     reply.geometry = geometry;
     reply.server_ucx_address = worker->address();
 
@@ -1890,11 +1959,8 @@ CoordinationReply BulkPublisher::Impl::handle_renew(const Protocol::RenewRequest
         // 3.7: UnknownSession rather than Error, so a client can tell "you are
         // gone, reopen" from "your message was garbage".
         reply.status = Status::UnknownSession;
-        reply.server_state = SessionState::Unknown;
         return typed_reply(std::move(reply));
     }
-
-    reply.geometry = session->geometry;
 
     const SessionState state = session->state.load(std::memory_order_acquire);
     if(state == SessionState::Expiring || state == SessionState::Closed)
@@ -1908,7 +1974,6 @@ CoordinationReply BulkPublisher::Impl::handle_renew(const Protocol::RenewRequest
              session->end_reason.load(std::memory_order_acquire) == EndReason::Close)
                 ? Status::UnknownSession
                 : Status::SessionExpired;
-        reply.server_state = state;
         return typed_reply(std::move(reply));
     }
 
@@ -1927,7 +1992,6 @@ CoordinationReply BulkPublisher::Impl::handle_renew(const Protocol::RenewRequest
         // misconfigured renew interval into data loss.
         counters.renewals_rejected.fetch_add(1, std::memory_order_relaxed);
         reply.status = Status::RenewTooFrequent;
-        reply.server_state = state;
         return typed_reply(std::move(reply));
     }
 
@@ -1947,7 +2011,6 @@ CoordinationReply BulkPublisher::Impl::handle_renew(const Protocol::RenewRequest
     counters.renewals_accepted.fetch_add(1, std::memory_order_relaxed);
 
     reply.status = Status::Ok;
-    reply.server_state = state;
     return typed_reply(std::move(reply));
 }
 
@@ -1955,8 +2018,6 @@ CoordinationReply BulkPublisher::Impl::handle_close(const Protocol::CloseRequest
 {
     Protocol::CloseReply reply;
     reply.session_id = request.session_id;
-    reply.frames_credited_final =
-        static_cast<std::uint32_t>(counters.frames_credited.load(std::memory_order_relaxed));
 
     std::lock_guard<std::mutex> lock(session_mutex);
 
@@ -1993,8 +2054,6 @@ CoordinationReply BulkPublisher::Impl::handle_close(const Protocol::CloseRequest
             });
     }
 
-    reply.frames_credited_final =
-        static_cast<std::uint32_t>(counters.frames_credited.load(std::memory_order_relaxed));
     reply.status = Status::Ok;
     return typed_reply(std::move(reply));
 }

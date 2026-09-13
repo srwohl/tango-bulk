@@ -47,8 +47,10 @@ UcxContext::UcxContext(const std::string &tls)
     ucp_params_t params;
     std::memset(&params, 0, sizeof(params));
     params.field_mask = UCP_PARAM_FIELD_FEATURES;
-    // AM only.  RMA is added in M5 behind transport_selected == 2; asking for it
-    // now would change transport selection for a path that does not exist yet.
+    // AM only.  Asking for RMA would change UCX's transport selection for a path
+    // that does not exist here: there is no rkey exchange and no ucp_put
+    // anywhere in the library, and major 2 deleted the wire field that used to
+    // gesture at one.  See RFC 8.1.
     params.features = UCP_FEATURE_AM;
 
     status = ucp_init(&params, config, &context_);

@@ -42,6 +42,13 @@ Status validate_shape_and_strides(std::uint32_t rank,
 /// application.
 Status validate_element_size(ElementType type, std::uint32_t element_size) noexcept;
 
+/// Byte order must be one of the two values major 2 defines.
+///
+/// It reaches the same three call sites as the two rules above, because it is
+/// an array term: a payload whose element order a receiver cannot name is no
+/// more interpretable than one whose element type it cannot name.
+Status validate_endian(Endian endian) noexcept;
+
 } // namespace TangoBulk::detail
 
 #endif // TANGO_BULK_SRC_CORE_GEOMETRY_RULES_H

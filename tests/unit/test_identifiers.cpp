@@ -66,7 +66,6 @@ TEST_CASE("reserved sentinel values are never generated", "[core][identifiers]")
         CHECK_FALSE(generate_session_id().is_zero());
         CHECK_FALSE(generate_client_instance_id().is_zero());
         CHECK(generate_stream_id() != 0);
-        CHECK(generate_server_epoch_id() != 0);
         CHECK(generate_probe_token() != 0);
     }
 }

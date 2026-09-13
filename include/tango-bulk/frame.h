@@ -17,7 +17,7 @@ namespace TangoBulk
 
 inline constexpr std::size_t k_max_rank = 4;
 
-/// Numeric values are on the wire; fixed for protocol major 1.
+/// Numeric values are on the wire; fixed for protocol major 2.
 enum class ElementType : std::uint32_t
 {
     Unknown = 0,
@@ -56,11 +56,13 @@ std::uint32_t element_size_of(ElementType type) noexcept;
 /// The array terms: what a payload is, as far as the protocol knows. Spelled
 /// once; a stream's Geometry, a producer's FrameMetadata and a delivered
 /// frame's description all extend it, so the three never disagree about what
-/// an array is.
+/// an array is.  Byte order is one of them, which is what makes per-frame
+/// byte-order drift a geometry mismatch rather than an unpoliceable surprise.
 struct ArrayTerms
 {
     ElementType element_type{ElementType::Unknown};
     std::uint32_t element_size{0}; ///< bytes; FrameMetadata infers 0 via element_size_of()
+    Endian endian{Endian::Little}; ///< byte order of payload *elements*
     std::uint32_t rank{0};         ///< 0..k_max_rank
     std::array<std::uint64_t, k_max_rank> shape{};
     std::array<std::uint64_t, k_max_rank> strides{}; ///< bytes; FrameMetadata infers 0 as C-contiguous
@@ -85,7 +87,6 @@ struct FrameMetadata : ArrayTerms
     std::uint64_t event_counter{0};  ///< producer-defined; opaque to the protocol
     std::uint32_t quality{0};        ///< producer-defined
     MemoryKind memory_kind{MemoryKind::Host};
-    Endian endian{Endian::Little};   ///< byte order of payload *elements*
 
     /// Fill in the fields documented above as inferrable, in place.
     ///

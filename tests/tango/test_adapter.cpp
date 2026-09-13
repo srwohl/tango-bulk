@@ -245,7 +245,10 @@ TEST_CASE("A subscriber opens over DeviceProxy and receives real frames", "[tang
     std::vector<std::string> sessions;
     REQUIRE(sessions_attribute.extract_read(sessions));
     REQUIRE(sessions.size() == 1);
-    CHECK(sessions.front().find("|Active|") != std::string::npos);
+
+    // RFC 9.3 row order: ordinal|label|state|flow|lag_frames, and no session id
+    // anywhere in it.
+    CHECK(sessions.front().rfind("1||Active|Lossy|", 0) == 0);
 
     std::string transport;
     Tango::DeviceAttribute transport_attribute = proxy.read_attribute("BulkTransport");

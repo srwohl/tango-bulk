@@ -67,17 +67,16 @@ std::array<std::byte, 16> canonical_id(unsigned base)
 OpenRequest canonical_open()
 {
     OpenRequest msg;
-    msg.version_min = 1;
-    msg.version_max = 1;
-    msg.requested_caps = k_caps_all;
+    msg.version_min = 2;
+    msg.version_max = 2;
+    msg.flow = FlowPolicy::Lossless;
     msg.client_instance_id.bytes = canonical_id(0x10);
     msg.requested_max_frame_bytes = 8ull << 20;
     msg.requested_ring_depth = 32;
     msg.requested_credit_window = 16;
     msg.requested_memory_kind = MemoryKind::Host;
-    msg.requested_transport = Transport::Any;
-    msg.drop_policy = DropPolicy::DropNewest;
     msg.stream_name = "image";
+    msg.client_label = "hdf5-writer-2";
     msg.client_ucx_address = {std::byte{0xC0}, std::byte{0xFF}, std::byte{0xEE},
                               std::byte{0x00}};
     return msg;
@@ -86,15 +85,11 @@ OpenRequest canonical_open()
 OpenReply canonical_open_reply()
 {
     OpenReply msg;
-    msg.version_selected = 1;
     msg.status = Status::Ok;
-    msg.granted_caps = k_caps_all;
     msg.session_id.bytes = canonical_id(0x20);
     msg.stream_id = 0x0123'4567'89AB'CDEFull;
     msg.lease_ttl_ms = 10'000;
     msg.renew_interval_ms = 3'333;
-    msg.transport_selected = Transport::ActiveMessage;
-    msg.server_epoch_id = 0x0011'2233'4455'6677ull;
     msg.geometry = canonical_geometry();
     msg.server_ucx_address = {std::byte{0xAA}, std::byte{0xBB}};
     return msg;
@@ -104,9 +99,6 @@ RenewRequest canonical_renew()
 {
     RenewRequest msg;
     msg.session_id.bytes = canonical_id(0x20);
-    msg.client_frames_delivered = 1'000;
-    msg.client_credits_returned = 996;
-    msg.client_state = 3;
     return msg;
 }
 
@@ -117,8 +109,6 @@ RenewReply canonical_renew_reply()
     msg.status = Status::Ok;
     msg.lease_ttl_ms = 10'000;
     msg.renew_interval_ms = 3'333;
-    msg.server_state = SessionState::Active;
-    msg.geometry = canonical_geometry();
     return msg;
 }
 
@@ -135,7 +125,6 @@ CloseReply canonical_close_reply()
     CloseReply msg;
     msg.session_id.bytes = canonical_id(0x20);
     msg.status = Status::Ok;
-    msg.frames_credited_final = 996;
     return msg;
 }
 

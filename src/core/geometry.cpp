@@ -104,6 +104,16 @@ Status validate_shape_and_strides(std::uint32_t rank,
     return Status::Ok;
 }
 
+Status validate_endian(Endian endian) noexcept
+{
+    if(endian != Endian::Little && endian != Endian::Big)
+    {
+        return Status::GeometryMismatch;
+    }
+
+    return Status::Ok;
+}
+
 Status validate_element_size(ElementType type, std::uint32_t element_size) noexcept
 {
     if(element_size < k_min_element_size || element_size > k_max_element_size)
@@ -124,7 +134,8 @@ Status validate_element_size(ElementType type, std::uint32_t element_size) noexc
 bool describes_same_array(const ArrayTerms &a, const ArrayTerms &b) noexcept
 {
     return a.element_type == b.element_type && a.element_size == b.element_size &&
-           a.rank == b.rank && a.shape == b.shape && a.strides == b.strides;
+           a.endian == b.endian && a.rank == b.rank && a.shape == b.shape &&
+           a.strides == b.strides;
 }
 
 Status Geometry::validate() const noexcept
@@ -132,6 +143,11 @@ Status Geometry::validate() const noexcept
     if(generation == 0)
     {
         return Status::GeometryMismatch;
+    }
+
+    if(const Status status = detail::validate_endian(endian); status != Status::Ok)
+    {
+        return status;
     }
 
     if(const Status status = detail::validate_element_size(element_type, element_size);
@@ -543,6 +559,11 @@ Status FrameMetadata::validate(std::uint64_t max_frame_bytes) const noexcept
     if(element_type == ElementType::Unknown && rank > 0)
     {
         return Status::GeometryMismatch;
+    }
+
+    if(const Status status = detail::validate_endian(endian); status != Status::Ok)
+    {
+        return status;
     }
 
     if(const Status status = detail::validate_element_size(element_type, element_size);

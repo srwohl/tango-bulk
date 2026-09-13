@@ -57,6 +57,7 @@ endif()
 
 add_executable(tango-bulk-ucx-tests ucx/test_copied_delivery.cpp
                                     ucx/test_registered_ring.cpp
+                                    ucx/test_session_flow.cpp
                                     ucx/test_session_lifecycle.cpp
                                     ucx/test_ucx_support.cpp
                                     ucx/test_transport_invariants.cpp

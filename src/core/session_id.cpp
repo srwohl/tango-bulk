@@ -241,18 +241,6 @@ StreamId generate_stream_id()
     return id;
 }
 
-std::uint64_t generate_server_epoch_id()
-{
-    std::uint64_t id = 0;
-
-    do
-    {
-        id = random_u64();
-    } while(id == 0);
-
-    return id;
-}
-
 std::uint64_t generate_probe_token()
 {
     std::uint64_t token = 0;

@@ -366,6 +366,17 @@ TEST_CASE("describes_same_array ignores the epoch and the sizing terms",
         b.strides = {4096, 2, 0, 0};
         CHECK_FALSE(describes_same_array(a, b));
     }
+
+    SECTION("and so is a different byte order")
+    {
+        // Byte order is an array term, not a per-frame decoration. That is what
+        // makes a stream that flips endianness mid-run a geometry mismatch the
+        // engine retires the session on, rather than a surprise the application
+        // has to notice for itself.
+        b.endian = Endian::Big;
+        CHECK_FALSE(describes_same_array(a, b));
+        CHECK(a != b);
+    }
 }
 
 TEST_CASE("a frame and a grant compare through the one array comparison",
@@ -394,6 +405,12 @@ TEST_CASE("a frame and a grant compare through the one array comparison",
     SECTION("a different stride is a different array")
     {
         frame.strides[1] = 4;
+        CHECK_FALSE(describes_same_array(frame, grant));
+    }
+
+    SECTION("a frame whose byte order drifted from the grant is a different array")
+    {
+        frame.endian = Endian::Big;
         CHECK_FALSE(describes_same_array(frame, grant));
     }
 

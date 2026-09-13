@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-// Byte-level conformance to IMPLEMENTATION_SPEC.md section 3.
+// Byte-level conformance to the wire format in RFC_BULK_DATA_PLANE.md 18.
 //
 // Every offset asserted here was transcribed from the specification's tables, not
 // read out of the implementation, and every integer is checked against a
@@ -29,17 +29,16 @@ namespace
 OpenRequest sample_open()
 {
     OpenRequest msg;
-    msg.version_min = 1;
-    msg.version_max = 1;
-    msg.requested_caps = k_probe_u32;
+    msg.version_min = 2;
+    msg.version_max = 2;
+    msg.flow = FlowPolicy::Lossless;
     msg.client_instance_id.bytes = pattern_id16(0x40);
     msg.requested_max_frame_bytes = 8ull << 20;
     msg.requested_ring_depth = 32;
     msg.requested_credit_window = 16;
     msg.requested_memory_kind = MemoryKind::Cuda;
-    msg.requested_transport = Transport::Rma;
-    msg.drop_policy = DropPolicy::DropOldest;
     msg.stream_name = "image";
+    msg.client_label = "live-viewer";
     msg.client_ucx_address = {std::byte{0xDE}, std::byte{0xAD}, std::byte{0xBE},
                               std::byte{0xEF}};
     return msg;
@@ -57,16 +56,17 @@ Geometry sample_geometry()
     g.credit_window = 16;
     g.shape = {1024, 512, 0, 0};
     g.strides = {1024, 2, 0, 0};
+    g.endian = Endian::Big;
     return g;
 }
 
 } // namespace
 
 // ---------------------------------------------------------------------------
-// 3.3 Coordination envelope
+// Coordination envelope
 // ---------------------------------------------------------------------------
 
-TEST_CASE("coordination envelope matches spec 3.3 byte for byte", "[protocol][layout]")
+TEST_CASE("coordination envelope matches the wire format byte for byte", "[protocol][layout]")
 {
     const auto bytes = encode(CloseRequest{}, k_probe_u64);
 
@@ -80,7 +80,7 @@ TEST_CASE("coordination envelope matches spec 3.3 byte for byte", "[protocol][la
     CHECK(bytes[2] == std::byte{'L'});
     CHECK(bytes[3] == std::byte{'K'});
 
-    CHECK_FIELD(bytes, 4, 1, 1);                        // version_major
+    CHECK_FIELD(bytes, 4, 1, 2);                        // version_major
     CHECK_FIELD(bytes, 5, 1, 0);                        // version_minor
     CHECK_FIELD(bytes, 6, 2, 32);                       // header_bytes
     CHECK_FIELD(bytes, 8, 2, 0x0005);                   // msg_type = Close
@@ -90,7 +90,7 @@ TEST_CASE("coordination envelope matches spec 3.3 byte for byte", "[protocol][la
     CHECK_FIELD(bytes, 24, 8, 0);                       // reserved
 }
 
-TEST_CASE("every message type carries its spec msg_type", "[protocol][layout]")
+TEST_CASE("every message type carries its wire msg_type", "[protocol][layout]")
 {
     const auto type_of = [](const std::vector<std::byte> &bytes)
     {
@@ -112,20 +112,21 @@ TEST_CASE("every message type carries its spec msg_type", "[protocol][layout]")
 }
 
 // ---------------------------------------------------------------------------
-// 3.4 Geometry
+// Geometry
 // ---------------------------------------------------------------------------
 
-TEST_CASE("Geometry matches spec 3.4 at its embedded offset", "[protocol][layout]")
+TEST_CASE("Geometry matches the wire format at its embedded offset",
+          "[protocol][layout]")
 {
-    RenewReply msg;
+    // OpenReply is the only message that carries the block in major 2, which is
+    // the point: the session contract is settled once, at Open.
+    OpenReply msg;
     msg.geometry = sample_geometry();
+    msg.server_ucx_address = {std::byte{0x01}};
 
     const auto bytes = encode(msg, 0);
 
-    // RenewReply embeds the block at body offset 32, so absolute offset 64.
-    constexpr std::size_t g = k_coord_envelope_bytes + 32;
-
-    REQUIRE(bytes.size() == k_coord_envelope_bytes + k_renew_reply_bytes);
+    constexpr std::size_t g = k_coord_envelope_bytes + 40;
 
     CHECK_FIELD(bytes, g + 0, 4, 7);            // generation
     CHECK_FIELD(bytes, g + 4, 4, 3);            // element_type = UInt16
@@ -134,41 +135,41 @@ TEST_CASE("Geometry matches spec 3.4 at its embedded offset", "[protocol][layout
     CHECK_FIELD(bytes, g + 16, 8, 8ull << 20);  // max_frame_bytes
     CHECK_FIELD(bytes, g + 24, 4, 32);          // ring_depth
     CHECK_FIELD(bytes, g + 28, 4, 16);          // credit_window
-    CHECK_FIELD(bytes, g + 32, 8, 1024);        // shape[0]
-    CHECK_FIELD(bytes, g + 40, 8, 512);         // shape[1]
-    CHECK_FIELD(bytes, g + 48, 8, 0);           // shape[2]
-    CHECK_FIELD(bytes, g + 56, 8, 0);           // shape[3]
-    CHECK_FIELD(bytes, g + 64, 8, 1024);        // strides[0]
-    CHECK_FIELD(bytes, g + 72, 8, 2);           // strides[1]
-    CHECK_FIELD(bytes, g + 80, 8, 0);           // strides[2]
-    CHECK_FIELD(bytes, g + 88, 8, 0);           // strides[3]
+    CHECK_FIELD(bytes, g + 32, 4, 1);           // endian = Big
+    CHECK_FIELD(bytes, g + 36, 4, 0);           // reserved
+    CHECK_FIELD(bytes, g + 40, 8, 1024);        // shape[0]
+    CHECK_FIELD(bytes, g + 48, 8, 512);         // shape[1]
+    CHECK_FIELD(bytes, g + 56, 8, 0);           // shape[2]
+    CHECK_FIELD(bytes, g + 64, 8, 0);           // shape[3]
+    CHECK_FIELD(bytes, g + 72, 8, 1024);        // strides[0]
+    CHECK_FIELD(bytes, g + 80, 8, 2);           // strides[1]
+    CHECK_FIELD(bytes, g + 88, 8, 0);           // strides[2]
+    CHECK_FIELD(bytes, g + 96, 8, 0);           // strides[3]
 
-    // The block is exactly 96 bytes and ends the RenewReply body.
-    CHECK(g + k_geometry_block_bytes == bytes.size());
+    // The block is exactly 104 bytes and ends the OpenReply fixed body.
+    CHECK(g + k_geometry_block_bytes == k_coord_envelope_bytes + k_open_reply_fixed_bytes);
 }
 
 // ---------------------------------------------------------------------------
-// 3.5 Open
+// Open
 // ---------------------------------------------------------------------------
 
-TEST_CASE("Open body matches spec 3.5", "[protocol][layout]")
+TEST_CASE("Open body matches the wire format", "[protocol][layout]")
 {
     const OpenRequest msg = sample_open();
     const auto bytes = encode(msg, 0);
 
     constexpr std::size_t b = k_coord_envelope_bytes;
 
-    CHECK_FIELD(bytes, b + 0, 1, 1);                 // version_min
-    CHECK_FIELD(bytes, b + 1, 1, 1);                 // version_max
+    CHECK_FIELD(bytes, b + 0, 1, 2);                 // version_min
+    CHECK_FIELD(bytes, b + 1, 1, 2);                 // version_max
     CHECK_FIELD(bytes, b + 2, 2, 0);                 // reserved
-    CHECK_FIELD(bytes, b + 4, 4, k_probe_u32);       // requested_caps
+    CHECK_FIELD(bytes, b + 4, 4, 1);                 // flow = Lossless
     CHECK_FIELD(bytes, b + 24, 8, 8ull << 20);       // requested_max_frame_bytes
     CHECK_FIELD(bytes, b + 32, 4, 32);               // requested_ring_depth
     CHECK_FIELD(bytes, b + 36, 4, 16);               // requested_credit_window
     CHECK_FIELD(bytes, b + 40, 4, 1);                // requested_memory_kind = Cuda
-    CHECK_FIELD(bytes, b + 44, 4, 2);                // requested_transport = Rma
-    CHECK_FIELD(bytes, b + 48, 4, 1);                // drop_policy = DropOldest
-    CHECK_FIELD(bytes, b + 52, 4, 0);                // reserved
+    CHECK_FIELD(bytes, b + 44, 4, 0);                // reserved
 
     // client_instance_id is 16 opaque octets with no endianness, so it appears in
     // the order it was given.
@@ -179,37 +180,38 @@ TEST_CASE("Open body matches spec 3.5", "[protocol][layout]")
     }
 
     // stream_name: u16 length then exactly that many bytes, no NUL.
-    CHECK_FIELD(bytes, b + 56, 2, 5);
-    CHECK(bytes[b + 58] == std::byte{'i'});
-    CHECK(bytes[b + 59] == std::byte{'m'});
-    CHECK(bytes[b + 60] == std::byte{'a'});
-    CHECK(bytes[b + 61] == std::byte{'g'});
-    CHECK(bytes[b + 62] == std::byte{'e'});
+    CHECK_FIELD(bytes, b + 48, 2, 5);
+    CHECK(bytes[b + 50] == std::byte{'i'});
+    CHECK(bytes[b + 51] == std::byte{'m'});
+    CHECK(bytes[b + 52] == std::byte{'a'});
+    CHECK(bytes[b + 53] == std::byte{'g'});
+    CHECK(bytes[b + 54] == std::byte{'e'});
+
+    // client_label follows the name in the same u16-length form.
+    CHECK_FIELD(bytes, b + 55, 2, 11);
+    CHECK(bytes[b + 57] == std::byte{'l'});
+    CHECK(bytes[b + 67] == std::byte{'r'});
 
     // client_ucx_address: u32 length then the blob.
-    CHECK_FIELD(bytes, b + 63, 4, 4);
-    CHECK(bytes[b + 67] == std::byte{0xDE});
-    CHECK(bytes[b + 70] == std::byte{0xEF});
+    CHECK_FIELD(bytes, b + 68, 4, 4);
+    CHECK(bytes[b + 72] == std::byte{0xDE});
+    CHECK(bytes[b + 75] == std::byte{0xEF});
 
-    CHECK(bytes.size() == b + 56 + 2 + 5 + 4 + 4);
+    CHECK(bytes.size() == b + 48 + 2 + 5 + 2 + 11 + 4 + 4);
 }
 
 // ---------------------------------------------------------------------------
-// 3.6 OpenReply
+// OpenReply
 // ---------------------------------------------------------------------------
 
-TEST_CASE("OpenReply body matches spec 3.6", "[protocol][layout]")
+TEST_CASE("OpenReply body matches the wire format", "[protocol][layout]")
 {
     OpenReply msg;
-    msg.version_selected = 1;
     msg.status = Status::Ok;
-    msg.granted_caps = k_caps_all;
     msg.session_id.bytes = pattern_id16(0x10);
     msg.stream_id = k_probe_u64;
     msg.lease_ttl_ms = 10'000;
     msg.renew_interval_ms = 3'333;
-    msg.transport_selected = Transport::ActiveMessage;
-    msg.server_epoch_id = 0x1122334455667788ull;
     msg.geometry = sample_geometry();
     msg.server_ucx_address = {std::byte{0x01}, std::byte{0x02}};
 
@@ -217,92 +219,89 @@ TEST_CASE("OpenReply body matches spec 3.6", "[protocol][layout]")
 
     constexpr std::size_t b = k_coord_envelope_bytes;
 
-    CHECK_FIELD(bytes, b + 0, 1, 1);                          // version_selected
-    CHECK_FIELD(bytes, b + 1, 1, 0);                          // reserved
-    CHECK_FIELD(bytes, b + 2, 2, 0);                          // status = Ok
-    CHECK_FIELD(bytes, b + 4, 4, k_caps_all);                 // granted_caps
+    CHECK_FIELD(bytes, b + 0, 2, 0);                          // status = Ok
+    CHECK_FIELD(bytes, b + 2, 2, 0);                          // reserved
+    CHECK_FIELD(bytes, b + 4, 4, 0);                          // reserved
     CHECK_FIELD(bytes, b + 24, 8, k_probe_u64);               // stream_id
     CHECK_FIELD(bytes, b + 32, 4, 10'000);                    // lease_ttl_ms
     CHECK_FIELD(bytes, b + 36, 4, 3'333);                     // renew_interval_ms
-    CHECK_FIELD(bytes, b + 40, 4, 1);                         // transport_selected
-    CHECK_FIELD(bytes, b + 44, 4, 0);                         // reserved
-    CHECK_FIELD(bytes, b + 48, 8, 0x1122334455667788ull);     // server_epoch_id
-    CHECK_FIELD(bytes, b + 56, 4, 7);                         // geometry.generation
-    CHECK_FIELD(bytes, b + 152, 4, 2);                        // address length
+    CHECK_FIELD(bytes, b + 40, 4, 7);                         // geometry.generation
+    CHECK_FIELD(bytes, b + 144, 4, 2);                        // address length
+
+    for(std::size_t i = 0; i < 16; ++i)
+    {
+        INFO("session_id octet " << i);
+        CHECK(bytes[b + 8 + i] == msg.session_id.bytes[i]);
+    }
 
     CHECK(bytes.size() == b + k_open_reply_fixed_bytes + 4 + 2);
 }
 
 // ---------------------------------------------------------------------------
-// 3.7 / 3.8 fixed-body messages
+// fixed-body messages
 // ---------------------------------------------------------------------------
 
-TEST_CASE("Renew body matches spec 3.7", "[protocol][layout]")
+TEST_CASE("Renew body is a session id and nothing else", "[protocol][layout]")
 {
     RenewRequest msg;
     msg.session_id.bytes = pattern_id16(0x20);
-    msg.client_frames_delivered = k_probe_u64;
-    msg.client_credits_returned = 0x1111222233334444ull;
-    msg.client_state = 3; // SubscriberState::Active
 
     const auto bytes = encode(msg, 0);
     constexpr std::size_t b = k_coord_envelope_bytes;
 
-    REQUIRE(bytes.size() == b + 40);
+    REQUIRE(bytes.size() == b + 16);
 
-    CHECK_FIELD(bytes, b + 16, 8, k_probe_u64);
-    CHECK_FIELD(bytes, b + 24, 8, 0x1111222233334444ull);
-    CHECK_FIELD(bytes, b + 32, 4, 3);
-    CHECK_FIELD(bytes, b + 36, 4, 0); // reserved
+    for(std::size_t i = 0; i < 16; ++i)
+    {
+        INFO("session_id octet " << i);
+        CHECK(bytes[b + i] == msg.session_id.bytes[i]);
+    }
 }
 
-TEST_CASE("RenewReply body matches spec 3.7", "[protocol][layout]")
+TEST_CASE("RenewReply body matches the wire format", "[protocol][layout]")
 {
     RenewReply msg;
     msg.status = Status::SessionExpired;
     msg.lease_ttl_ms = 10'000;
     msg.renew_interval_ms = 3'333;
-    msg.server_state = SessionState::Expiring;
-    msg.geometry = sample_geometry();
 
     const auto bytes = encode(msg, 0);
     constexpr std::size_t b = k_coord_envelope_bytes;
 
-    REQUIRE(bytes.size() == b + 128);
+    REQUIRE(bytes.size() == b + 32);
 
     CHECK_FIELD(bytes, b + 16, 2, 4); // status = SessionExpired
     CHECK_FIELD(bytes, b + 18, 2, 0); // reserved
     CHECK_FIELD(bytes, b + 20, 4, 10'000);
     CHECK_FIELD(bytes, b + 24, 4, 3'333);
-    CHECK_FIELD(bytes, b + 28, 4, 4); // server_state = Expiring
+    CHECK_FIELD(bytes, b + 28, 4, 0); // reserved
 }
 
-TEST_CASE("Close and CloseReply bodies match spec 3.8", "[protocol][layout]")
+TEST_CASE("Close and CloseReply bodies match the wire format", "[protocol][layout]")
 {
     CloseRequest close;
     close.session_id.bytes = pattern_id16(0x30);
-    close.reason = CloseReason::ClientError;
+    close.reason = CloseReason::ClientShutdown;
 
     const auto close_bytes = encode(close, 0);
     constexpr std::size_t b = k_coord_envelope_bytes;
 
     REQUIRE(close_bytes.size() == b + 24);
-    CHECK_FIELD(close_bytes, b + 16, 4, 2); // reason = ClientError
+    CHECK_FIELD(close_bytes, b + 16, 4, 1); // reason = ClientShutdown
     CHECK_FIELD(close_bytes, b + 20, 4, 0); // reserved
 
     CloseReply reply;
     reply.status = Status::UnknownSession;
-    reply.frames_credited_final = k_probe_u32;
 
     const auto reply_bytes = encode(reply, 0);
 
     REQUIRE(reply_bytes.size() == b + 24);
     CHECK_FIELD(reply_bytes, b + 16, 2, 3); // status = UnknownSession
     CHECK_FIELD(reply_bytes, b + 18, 2, 0); // reserved
-    CHECK_FIELD(reply_bytes, b + 20, 4, k_probe_u32);
+    CHECK_FIELD(reply_bytes, b + 20, 4, 0); // reserved
 }
 
-TEST_CASE("Error body matches spec 3.8", "[protocol][layout]")
+TEST_CASE("Error body matches the wire format", "[protocol][layout]")
 {
     const ErrorMessage msg{Status::TooManySessions, "no"};
 
@@ -320,10 +319,10 @@ TEST_CASE("Error body matches spec 3.8", "[protocol][layout]")
 }
 
 // ---------------------------------------------------------------------------
-// 3.10 Data-plane common prefix
+// Data-plane common prefix
 // ---------------------------------------------------------------------------
 
-TEST_CASE("data-plane prefix matches spec 3.10 byte for byte", "[protocol][layout]")
+TEST_CASE("data-plane prefix matches the wire format byte for byte", "[protocol][layout]")
 {
     CreditMessage msg;
     msg.generation = k_probe_u32;
@@ -338,7 +337,7 @@ TEST_CASE("data-plane prefix matches spec 3.10 byte for byte", "[protocol][layou
     CHECK(bytes[2] == std::byte{'K'});
     CHECK(bytes[3] == std::byte{'1'});
 
-    CHECK_FIELD(bytes, 4, 1, 1);              // version_major
+    CHECK_FIELD(bytes, 4, 1, 2);              // version_major
     CHECK_FIELD(bytes, 5, 1, 0);              // version_minor
     CHECK_FIELD(bytes, 6, 2, 32);             // header_bytes
     CHECK_FIELD(bytes, 8, 2, 2);              // msg_type = Credit
@@ -348,7 +347,7 @@ TEST_CASE("data-plane prefix matches spec 3.10 byte for byte", "[protocol][layou
     CHECK_FIELD(bytes, 24, 8, 41);            // ack_sequence
 }
 
-TEST_CASE("data-plane header sizes and AM ids match spec 3.10", "[protocol][layout]")
+TEST_CASE("data-plane header sizes and AM ids match the wire format", "[protocol][layout]")
 {
     CHECK(k_frame_header_bytes == 160);
     CHECK(k_credit_bytes == 32);
@@ -367,10 +366,10 @@ TEST_CASE("data-plane header sizes and AM ids match spec 3.10", "[protocol][layo
 }
 
 // ---------------------------------------------------------------------------
-// 3.11 Frame header
+// Frame header
 // ---------------------------------------------------------------------------
 
-TEST_CASE("Frame header matches spec 3.11 byte for byte", "[protocol][layout]")
+TEST_CASE("Frame header matches the wire format byte for byte", "[protocol][layout]")
 {
     FrameHeader msg;
     msg.generation = 7;
@@ -429,10 +428,10 @@ TEST_CASE("Frame header matches spec 3.11 byte for byte", "[protocol][layout]")
 }
 
 // ---------------------------------------------------------------------------
-// 3.13 / 3.14
+// / 3.14
 // ---------------------------------------------------------------------------
 
-TEST_CASE("Probe and ProbeAck match spec 3.13", "[protocol][layout]")
+TEST_CASE("Probe and ProbeAck match the wire format", "[protocol][layout]")
 {
     ProbeMessage probe;
     probe.generation = 1;
@@ -459,7 +458,7 @@ TEST_CASE("Probe and ProbeAck match spec 3.13", "[protocol][layout]")
 }
 
 // ---------------------------------------------------------------------------
-// 3.0.2 -- every fixed part is a multiple of 8
+// Every fixed part is a multiple of 8
 // ---------------------------------------------------------------------------
 
 TEST_CASE("every fixed part is a multiple of eight bytes", "[protocol][layout]")

@@ -30,6 +30,12 @@ struct TransportFixture
     std::shared_ptr<detail::DeliveryIngress> ingress;
     detail::SubscriberEngine engine;
 
+    /// What this fixture asks for at Open. The C++ Subscription cannot request
+    /// either yet -- that is step 5 -- so the publisher's per-session flow and
+    /// label are driven from here, which is the layer that speaks the wire.
+    Protocol::FlowPolicy flow{Protocol::FlowPolicy::Lossy};
+    std::string client_label;
+
     explicit TransportFixture(SubscriptionOptions opts = subscription_options(),
                               detail::TransportOptions transport = {}) :
         config(std::move(opts)),
@@ -52,15 +58,14 @@ struct TransportFixture
         Protocol::OpenRequest request;
         request.version_min = Protocol::k_version_major;
         request.version_max = Protocol::k_version_major;
-        request.requested_caps = Protocol::k_caps_credit_coalescing | Protocol::k_caps_probe;
         request.client_instance_id = Protocol::generate_client_instance_id();
         request.requested_max_frame_bytes = config.receive_plan->max_frame_bytes;
         request.requested_ring_depth = config.receive_plan->ring_depth;
         request.requested_credit_window = config.receive_plan->credit_window;
         request.requested_memory_kind = MemoryKind::Host;
-        request.requested_transport = Protocol::Transport::ActiveMessage;
-        request.drop_policy = Protocol::DropPolicy::DropNewest;
+        request.flow = flow;
         request.stream_name = config.stream_name;
+        request.client_label = client_label;
         request.client_ucx_address = engine.local_address();
 
         const std::vector<std::byte> encoded = Protocol::encode(request, 1);
@@ -75,6 +80,28 @@ struct TransportFixture
                 Status::Ok);
         REQUIRE(eventually([&] { return publisher.session_count() == 1; }));
         REQUIRE(eventually([&] { return engine.state() == SubscriberState::Active; }));
+    }
+
+    /// One Renew, as a client that is alive but not consuming would send.
+    ///
+    /// It is what separates the lease deadline from the credit deadline: a
+    /// session that keeps renewing proves the process is up, and only the
+    /// credit deadline can then say it has stopped doing its job.
+    Status renew()
+    {
+        Protocol::RenewRequest request;
+        request.session_id = session_id_;
+        const std::vector<std::byte> encoded = Protocol::encode(request, 3);
+        const std::vector<std::byte> raw = detail::PublisherAccess::coordination(
+            *publisher_, encoded.data(), encoded.size(), Protocol::CoordType::Renew);
+
+        Protocol::RenewReply reply;
+        if(Protocol::decode(raw.data(), raw.size(), reply) != Status::Ok)
+        {
+            return Status::MalformedMessage;
+        }
+
+        return reply.status;
     }
 
     ~TransportFixture()

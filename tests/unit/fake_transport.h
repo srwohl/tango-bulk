@@ -144,7 +144,6 @@ struct Script
 
         reply.lease_ttl_ms = lease_ttl_ms;
         reply.renew_interval_ms = renew_interval_ms;
-        reply.geometry = last_grant;
         return Protocol::encode(reply, correlation_id);
     }
 

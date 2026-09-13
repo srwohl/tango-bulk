@@ -20,15 +20,6 @@
 namespace TangoBulk
 {
 
-/// How a publisher treats an armed subscriber that has exhausted its credit.
-enum class FanoutMode : std::uint32_t
-{
-    BestEffort = 0, ///< skip only the lagging subscriber; other clients continue
-    AllActive = 1,  ///< accept a frame only when every armed subscriber can receive it
-};
-
-const char *to_string(FanoutMode mode) noexcept;
-
 struct PublisherConfig
 {
     std::string stream_name; ///< 1..64 bytes, [A-Za-z0-9_.-]
@@ -40,7 +31,16 @@ struct PublisherConfig
     std::uint32_t ring_depth{32};
     std::uint32_t credit_window{16}; ///< MUST be <= ring_depth
     std::uint32_t max_sessions{4};
-    FanoutMode fanout_mode{FanoutMode::BestEffort};
+
+    /// Whether this publisher will grant a lossless session at all.
+    ///
+    /// How a subscriber is treated when it runs out of credit is that
+    /// subscriber's declaration at Open, not a publisher-wide mode: a live
+    /// viewer and a file writer routinely attach to the same stream and need
+    /// opposite answers. What stays with the publisher is the right to refuse,
+    /// because a lossless session can hold up acquisition for everyone. Off by
+    /// default, so no deployment grants that power by accident.
+    bool allow_lossless{false};
     std::uint32_t publish_queue_depth{256};
     std::uint32_t lease_ttl_ms{10'000};
     std::uint32_t renew_interval_ms{3'333};
@@ -73,7 +73,7 @@ enum class PublishResult : std::uint32_t
     CreditStalled = 3, ///< credit window closed; frame dropped, counted
     BadMetadata = 4,
     Shutdown = 5,
-    WouldBlock = 6, ///< AllActive subscriber lacks credit; lease returned to caller
+    WouldBlock = 6, ///< a lossless subscriber lacks credit; lease returned to caller
 };
 
 const char *to_string(PublishResult result) noexcept;
@@ -88,15 +88,23 @@ struct PublisherSnapshot
 {
     struct SessionObservation
     {
-        std::string session_id;
+        /// Assigned at Open and never reused within a publisher, so it is a
+        /// stable handle for the session's whole life -- which a position in
+        /// this vector is not, since a session closing renumbers its successors.
+        /// It is what disambiguates two clients that chose the same label.
+        std::uint64_t ordinal{0};
+
+        std::string session_id;   ///< truncated for logs; never the full credential
+        std::string client_label; ///< operator-facing; empty when none was given
         std::string state;
+        std::string flow; ///< Lossy or Lossless, as declared at Open
         std::uint64_t lag_frames{0};
     };
 
     std::string stream_name;
     Geometry geometry{};
     PublisherCounters counters{};
-    /// Live sessions; Tango renders each as session_id|state|lag_frames.
+    /// Live sessions; Tango renders each as ordinal|label|state|flow|lag_frames.
     std::vector<SessionObservation> sessions;
     std::size_t active_sessions{0};
     std::string transport; ///< selected data transport, not a discovery result

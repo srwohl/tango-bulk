@@ -57,7 +57,7 @@ struct DeliveryQueue::Ingress
 
 struct DeliveryQueue::State
 {
-    State(std::size_t capacity, QueuePolicy drop_policy) : queue(capacity), policy(drop_policy)
+    State(std::size_t capacity, QueuePolicy queue_policy) : queue(capacity), policy(queue_policy)
     {
         wakeup_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC | EFD_SEMAPHORE);
     }

@@ -119,7 +119,7 @@ TEST_CASE("encoded coordination preserves correlation on typed publisher failure
     request.requested_ring_depth = k_ring_depth;
     request.requested_credit_window = k_credit_window;
     request.client_ucx_address = {std::byte{0x01}};
-    request.requested_transport = static_cast<Protocol::Transport>(99);
+    request.requested_memory_kind = static_cast<MemoryKind>(99);
 
     constexpr std::uint64_t correlation_id = 0x0102030405060708ull;
     const std::vector<std::byte> encoded = Protocol::encode(request, correlation_id);
@@ -166,11 +166,6 @@ TEST_CASE("Open grants unpredictable identifiers and the negotiated lease terms"
     CHECK(a.stream_id != b.stream_id);
     CHECK_FALSE(a.session_id.is_zero());
     CHECK(a.stream_id != 0);
-
-    // Both sessions belong to the same server incarnation; 4.4 makes a changed
-    // value the client's signal to discard cached geometry and sequence state.
-    CHECK(a.server_epoch_id == b.server_epoch_id);
-    CHECK(a.server_epoch_id != 0);
 
     CHECK(a.lease_ttl_ms == 4'000);
     CHECK(a.renew_interval_ms == 1'000);
@@ -268,7 +263,6 @@ TEST_CASE("An unrenewed session expires on schedule with no frames in flight", "
     // SessionExpired; a session the client closed would be UnknownSession.
     const Protocol::RenewReply late = renew(publisher, granted.session_id);
     CHECK(late.status == Status::SessionExpired);
-    CHECK(late.server_state == SessionState::Closed);
 
     // The client learns from the blocked renewal that this session is over for
     // good; no second lifecycle constructor is involved.
@@ -388,11 +382,13 @@ TEST_CASE("Close is idempotent and Renew tells a closed session from an unknown 
     REQUIRE(grants.size() == 1);
     const Protocol::OpenReply &granted = grants.front();
 
-    // A live session renews, and the reply carries the server's own view of it.
+    // A live session renews, and the reply says so and nothing more: the
+    // geometry it used to echo is settled at Open, and a server-state word the
+    // client could only act on by reopening added nothing to the status.
     const Protocol::RenewReply ok = renew(publisher, granted.session_id);
     CHECK(ok.status == Status::Ok);
-    CHECK((ok.server_state == SessionState::Armed || ok.server_state == SessionState::Active));
-    CHECK(ok.geometry.ring_depth == k_ring_depth);
+    CHECK(ok.session_id == granted.session_id);
+    CHECK(ok.lease_ttl_ms == publisher_config().lease_ttl_ms);
     CHECK(publisher.counters().renewals_accepted == 1);
 
     // 3.7: an identifier nobody ever issued is UnknownSession, not Error -- the
@@ -560,7 +556,7 @@ TEST_CASE("coordination adapter preserves recoverable correlations on envelope f
     {
         std::vector<std::byte> request =
             Protocol::encode(Protocol::CloseRequest{}, correlation_id);
-        request[4] = std::byte{2};
+        request[4] = static_cast<std::byte>(Protocol::k_version_major + 1);
 
         const std::vector<std::byte> raw =
             detail::PublisherAccess::coordination(publisher, request.data(), request.size());

@@ -93,8 +93,14 @@ std::vector<std::string> session_rows(const PublisherSnapshot &snapshot)
     rows.reserve(snapshot.sessions.size());
     for(const PublisherSnapshot::SessionObservation &session : snapshot.sessions)
     {
-        // RFC fixed row order: session_id|state|lag_frames.
-        rows.push_back(session.session_id + "|" + session.state + "|" +
+        // RFC 9.3 fixed row order: ordinal|label|state|flow|lag_frames.
+        //
+        // The ordinal is the publisher's own, not this row's position, so it
+        // stays the same handle while other sessions come and go. The session
+        // id is deliberately absent: it is a bearer credential, and an attribute
+        // any Tango client can read is the last place for it.
+        rows.push_back(std::to_string(session.ordinal) + "|" + session.client_label + "|" +
+                       session.state + "|" + session.flow + "|" +
                        std::to_string(session.lag_frames));
     }
     return rows;

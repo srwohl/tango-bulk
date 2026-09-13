@@ -187,19 +187,14 @@ struct Subscription::Impl
             Protocol::OpenRequest request;
             request.version_min = Protocol::k_version_major;
             request.version_max = Protocol::k_version_major;
-            // Coalescing and probe.  Geometry re-arm is left out because the
-            // two-ring interlock is not implemented, and claiming a capability
-            // this side cannot honour is worse than not having it.
-            request.requested_caps = Protocol::k_caps_credit_coalescing | Protocol::k_caps_probe;
+            // Lossy until SubscriptionOptions carries the choice; the queue
+            // policy stays local and never crosses the wire.
+            request.flow = Protocol::FlowPolicy::Lossy;
             request.client_instance_id = id;
             request.requested_max_frame_bytes = plan.max_frame_bytes;
             request.requested_ring_depth = plan.ring_depth;
             request.requested_credit_window = plan.credit_window;
             request.requested_memory_kind = memory_kind;
-            request.requested_transport = Protocol::Transport::ActiveMessage;
-            // The queue policy is local; the wire field is a constant until the
-            // next wire revision removes it.
-            request.drop_policy = Protocol::DropPolicy::DropNewest;
             request.stream_name = name;
             request.client_ucx_address = client_address;
 
@@ -265,16 +260,10 @@ struct Subscription::Impl
             return Status::Ok;
         }
 
-        std::vector<std::byte> make_renew_request(std::uint64_t correlation_id,
-                                                  std::uint64_t frames_delivered,
-                                                  std::uint64_t credits_returned,
-                                                  std::uint32_t client_state) const
+        std::vector<std::byte> make_renew_request(std::uint64_t correlation_id) const
         {
             Protocol::RenewRequest request;
             request.session_id = session_id;
-            request.client_frames_delivered = frames_delivered;
-            request.client_credits_returned = credits_returned;
-            request.client_state = client_state;
             return Protocol::encode(request, correlation_id);
         }
 
@@ -643,8 +632,6 @@ struct Subscription::Impl
                                       granted.credit_window};
         }
 
-        delivered_at_open = delivery->stats().taken;
-
         if(const Status status = fresh->activate(session.stream_id_value(),
                                                  session.granted_geometry(),
                                                  session.server_address_value());
@@ -832,19 +819,10 @@ struct Subscription::Impl
 
     Status renew_once(BulkError &error) noexcept
     {
-        std::uint64_t credits_returned = 0;
-        std::uint32_t client_state = static_cast<std::uint32_t>(SubscriberState::Failed);
-
         if(!transport)
         {
             error = BulkError{Status::Internal, "the transport disappeared", Origin::Subscriber};
             return Status::Internal;
-        }
-
-        {
-            const SubscriberCounters sampled = transport->counters();
-            credits_returned = sampled.credits_returned;
-            client_state = static_cast<std::uint32_t>(transport->state());
         }
 
         Status status = Status::Ok;
@@ -852,11 +830,8 @@ struct Subscription::Impl
         try
         {
             const std::uint64_t correlation_id = next_correlation_id();
-            const std::vector<std::byte> request = session.make_renew_request(
-                correlation_id,
-                delivery->stats().taken - delivered_at_open,
-                credits_returned,
-                client_state);
+            const std::vector<std::byte> request =
+                session.make_renew_request(correlation_id);
 
             renewals_sent.fetch_add(1, std::memory_order_relaxed);
             const std::vector<std::byte> reply =
@@ -1328,8 +1303,6 @@ struct Subscription::Impl
     FrameCallback frame_callback;
 
     SessionState session;
-
-    std::uint64_t delivered_at_open{0};
 
     std::shared_ptr<detail::DeliveryQueue> delivery;
 

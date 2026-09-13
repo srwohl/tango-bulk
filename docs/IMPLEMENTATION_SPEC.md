@@ -589,6 +589,12 @@ struct SubscriberCounters
 
 ## 3. Exact wire protocol
 
+> **Superseded at protocol major 2.** Every table in this section describes major 1, whose
+> offsets no longer exist. The normative format is
+> [RFC_BULK_DATA_PLANE.md §18](RFC_BULK_DATA_PLANE.md). This section is kept only as the record
+> of what major 1 was, which is what makes the major 2 diff readable; do not transcribe offsets
+> from it.
+
 Two planes, deliberately different in shape:
 
 - **Coordination plane** — request/reply, over ordinary Tango commands, `DevVarCharArray` in both

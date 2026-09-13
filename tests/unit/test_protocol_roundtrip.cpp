@@ -14,6 +14,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+
 using namespace TangoBulk;
 using namespace TangoBulk::Protocol;
 using namespace TangoBulk::test;
@@ -33,6 +35,7 @@ Geometry filled_geometry()
     g.credit_window = 32;
     g.shape = {8, 256, 512, 0};
     g.strides = {524'288, 2'048, 4, 0};
+    g.endian = Endian::Big;
     return g;
 }
 
@@ -41,17 +44,16 @@ Geometry filled_geometry()
 TEST_CASE("Open round trip", "[protocol][roundtrip]")
 {
     OpenRequest sent;
-    sent.version_min = 1;
-    sent.version_max = 1;
-    sent.requested_caps = k_caps_credit_coalescing | k_caps_probe;
+    sent.version_min = 2;
+    sent.version_max = 2;
+    sent.flow = FlowPolicy::Lossless;
     sent.client_instance_id.bytes = pattern_id16(0x55);
     sent.requested_max_frame_bytes = 4ull << 20;
     sent.requested_ring_depth = 16;
     sent.requested_credit_window = 8;
     sent.requested_memory_kind = MemoryKind::Cuda;
-    sent.requested_transport = Transport::ActiveMessage;
-    sent.drop_policy = DropPolicy::DropNewest;
     sent.stream_name = "detector.image-0_9";
+    sent.client_label = "hdf5-writer-2";
     sent.client_ucx_address.assign(273, std::byte{0xAB});
 
     const auto bytes = encode(sent, 0xC0FFEEull);
@@ -62,35 +64,86 @@ TEST_CASE("Open round trip", "[protocol][roundtrip]")
 
     CHECK(env.correlation_id == 0xC0FFEEull);
     CHECK(env.msg_type == CoordType::Open);
-    CHECK(env.version_major == 1);
+    CHECK(env.version_major == 2);
     CHECK(env.version_minor == 0);
 
     CHECK(got.version_min == sent.version_min);
     CHECK(got.version_max == sent.version_max);
-    CHECK(got.requested_caps == sent.requested_caps);
+    CHECK(got.flow == sent.flow);
     CHECK(got.client_instance_id == sent.client_instance_id);
     CHECK(got.requested_max_frame_bytes == sent.requested_max_frame_bytes);
     CHECK(got.requested_ring_depth == sent.requested_ring_depth);
     CHECK(got.requested_credit_window == sent.requested_credit_window);
     CHECK(got.requested_memory_kind == sent.requested_memory_kind);
-    CHECK(got.requested_transport == sent.requested_transport);
-    CHECK(got.drop_policy == sent.drop_policy);
     CHECK(got.stream_name == sent.stream_name);
+    CHECK(got.client_label == sent.client_label);
     CHECK(got.client_ucx_address == sent.client_ucx_address);
+}
+
+TEST_CASE("an Open with no client label round trips", "[protocol][roundtrip]")
+{
+    // Empty is the one length a stream name may not have and a label may, so it
+    // is the case where the two tail fields could most easily be confused.
+    OpenRequest sent;
+    sent.stream_name = "image";
+    sent.client_ucx_address.assign(8, std::byte{0x11});
+
+    const auto bytes = encode(sent, 0);
+
+    OpenRequest got;
+    REQUIRE(decode(bytes.data(), bytes.size(), got) == Status::Ok);
+
+    CHECK(got.stream_name == "image");
+    CHECK(got.client_label.empty());
+    CHECK(got.client_ucx_address == sent.client_ucx_address);
+}
+
+TEST_CASE("a label outside the charset is refused in both directions",
+          "[protocol][roundtrip]")
+{
+    OpenRequest sent;
+    sent.stream_name = "image";
+    sent.client_label = "live viewer"; // a space is not in [A-Za-z0-9_.-]
+    sent.client_ucx_address.assign(8, std::byte{0x11});
+
+    CHECK_THROWS_AS(encode(sent, 0), BulkException);
+
+    // A peer that skipped its own check must not get the label through: build
+    // the same message with a legal label of equal length and patch one byte.
+    sent.client_label = "live-viewer";
+    auto bytes = encode(sent, 0);
+
+    const auto space = std::find(bytes.begin(), bytes.end(), std::byte{'-'});
+    REQUIRE(space != bytes.end());
+    *space = std::byte{' '};
+
+    OpenRequest got;
+    CHECK(decode(bytes.data(), bytes.size(), got) == Status::MalformedMessage);
+}
+
+TEST_CASE("an unknown flow policy is refused rather than defaulted",
+          "[protocol][roundtrip]")
+{
+    OpenRequest sent;
+    sent.stream_name = "image";
+    sent.client_ucx_address.assign(8, std::byte{0x11});
+
+    auto bytes = encode(sent, 0);
+    // flow sits at body offset 4, so absolute offset 36.
+    bytes[k_coord_envelope_bytes + 4] = std::byte{0x07};
+
+    OpenRequest got;
+    CHECK(decode(bytes.data(), bytes.size(), got) == Status::MalformedMessage);
 }
 
 TEST_CASE("OpenReply round trip", "[protocol][roundtrip]")
 {
     OpenReply sent;
-    sent.version_selected = 1;
     sent.status = Status::Ok;
-    sent.granted_caps = k_caps_all;
     sent.session_id.bytes = pattern_id16(0x66);
     sent.stream_id = 0x1234'5678'9ABC'DEF0ull;
     sent.lease_ttl_ms = 10'000;
     sent.renew_interval_ms = 3'333;
-    sent.transport_selected = Transport::Rma;
-    sent.server_epoch_id = 0xFEDC'BA98'7654'3210ull;
     sent.geometry = filled_geometry();
     sent.server_ucx_address.assign(4096, std::byte{0x5A});
 
@@ -99,16 +152,13 @@ TEST_CASE("OpenReply round trip", "[protocol][roundtrip]")
     OpenReply got;
     REQUIRE(decode(bytes.data(), bytes.size(), got) == Status::Ok);
 
-    CHECK(got.version_selected == sent.version_selected);
     CHECK(got.status == sent.status);
-    CHECK(got.granted_caps == sent.granted_caps);
     CHECK(got.session_id == sent.session_id);
     CHECK(got.stream_id == sent.stream_id);
     CHECK(got.lease_ttl_ms == sent.lease_ttl_ms);
     CHECK(got.renew_interval_ms == sent.renew_interval_ms);
-    CHECK(got.transport_selected == sent.transport_selected);
-    CHECK(got.server_epoch_id == sent.server_epoch_id);
     CHECK(got.geometry == sent.geometry);
+    CHECK(got.geometry.endian == sent.geometry.endian);
     CHECK(got.server_ucx_address == sent.server_ucx_address);
 }
 
@@ -132,9 +182,6 @@ TEST_CASE("Renew round trip", "[protocol][roundtrip]")
 {
     RenewRequest sent;
     sent.session_id.bytes = pattern_id16(0x77);
-    sent.client_frames_delivered = 1'234'567;
-    sent.client_credits_returned = 1'234'560;
-    sent.client_state = 3;
 
     const auto bytes = encode(sent, 99);
 
@@ -144,9 +191,6 @@ TEST_CASE("Renew round trip", "[protocol][roundtrip]")
 
     CHECK(env.correlation_id == 99);
     CHECK(got.session_id == sent.session_id);
-    CHECK(got.client_frames_delivered == sent.client_frames_delivered);
-    CHECK(got.client_credits_returned == sent.client_credits_returned);
-    CHECK(got.client_state == sent.client_state);
 }
 
 TEST_CASE("RenewReply round trip", "[protocol][roundtrip]")
@@ -156,8 +200,6 @@ TEST_CASE("RenewReply round trip", "[protocol][roundtrip]")
     sent.status = Status::Ok;
     sent.lease_ttl_ms = 20'000;
     sent.renew_interval_ms = 6'666;
-    sent.server_state = SessionState::Active;
-    sent.geometry = filled_geometry();
 
     const auto bytes = encode(sent, 0);
 
@@ -168,8 +210,6 @@ TEST_CASE("RenewReply round trip", "[protocol][roundtrip]")
     CHECK(got.status == sent.status);
     CHECK(got.lease_ttl_ms == sent.lease_ttl_ms);
     CHECK(got.renew_interval_ms == sent.renew_interval_ms);
-    CHECK(got.server_state == sent.server_state);
-    CHECK(got.geometry == sent.geometry);
 }
 
 TEST_CASE("Close and CloseReply round trip", "[protocol][roundtrip]")
@@ -188,7 +228,6 @@ TEST_CASE("Close and CloseReply round trip", "[protocol][roundtrip]")
     CloseReply reply;
     reply.session_id = close.session_id;
     reply.status = Status::UnknownSession;
-    reply.frames_credited_final = 4'294'967'295u;
 
     const auto reply_bytes = encode(reply, 1);
 
@@ -196,7 +235,6 @@ TEST_CASE("Close and CloseReply round trip", "[protocol][roundtrip]")
     REQUIRE(decode(reply_bytes.data(), reply_bytes.size(), got_reply) == Status::Ok);
     CHECK(got_reply.session_id == reply.session_id);
     CHECK(got_reply.status == reply.status);
-    CHECK(got_reply.frames_credited_final == reply.frames_credited_final);
 }
 
 TEST_CASE("Error round trip", "[protocol][roundtrip]")
@@ -373,7 +411,7 @@ TEST_CASE("decode_data_prefix classifies every data message", "[protocol][roundt
         REQUIRE(decode_data_prefix(bytes.data(), bytes.size(), prefix) == Status::Ok);
         CHECK(prefix.msg_type == expected);
         CHECK(prefix.generation == generation);
-        CHECK(prefix.version_major == 1);
+        CHECK(prefix.version_major == k_version_major);
     };
 
     FrameHeader frame;
