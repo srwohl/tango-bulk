@@ -135,6 +135,7 @@ class SubscriberEngine final : public SubscriberTransport
   public:
     SubscriberEngine(ReceivePlan plan,
                      DeliveryOwnership ownership,
+                     FlowPolicy flow,
                      ReceiveRegion region,
                      std::uint64_t pinned_limit,
                      TransportOptions options,
@@ -237,13 +238,21 @@ class SubscriberEngine final : public SubscriberTransport
 
     void commit(std::size_t slot_index) noexcept;
 
-    /// Copied delivery: copy the slot out, return its credit, queue the copy.
+    /// Copied delivery: copy the slot out, free it, queue the copy. When the
+    /// credit goes back with it depends on the flow; see the definition.
     void commit_copied(ReceiveSlot &slot) noexcept;
+
+    /// Whether a copied frame's credit waits for the application to take it.
+    bool defers_credit_to_handoff() const noexcept
+    {
+        return ownership_ == DeliveryOwnership::Copy && flow_ == FlowPolicy::Lossless;
+    }
 
     void fail(Status status, const char *reason) noexcept;
 
     MemoryKind memory_kind_;
     DeliveryOwnership ownership_;
+    FlowPolicy flow_;
     int engine_cpu_affinity_;
     std::shared_ptr<UcxContext> context_;
     std::unique_ptr<UcxWorker> worker_;

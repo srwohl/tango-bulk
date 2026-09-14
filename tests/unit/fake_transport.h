@@ -334,6 +334,7 @@ inline detail::TransportFactory fake_factory(Script &script)
 {
     return [&script](const ReceivePlan &,
                      DeliveryOwnership,
+                     FlowPolicy,
                      ReceiveRegion region,
                      std::shared_ptr<detail::DeliveryIngress> delivery)
         -> std::unique_ptr<detail::SubscriberTransport>

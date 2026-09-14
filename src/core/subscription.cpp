@@ -178,6 +178,8 @@ struct Subscription::Impl
     struct SessionState
     {
         std::vector<std::byte> make_open_request(const std::string &name,
+                                                 const std::string &label,
+                                                 FlowPolicy session_flow,
                                                  const ReceivePlan &plan,
                                                  MemoryKind memory_kind,
                                                  Protocol::ClientInstanceId id,
@@ -187,15 +189,18 @@ struct Subscription::Impl
             Protocol::OpenRequest request;
             request.version_min = Protocol::k_version_major;
             request.version_max = Protocol::k_version_major;
-            // Lossy until SubscriptionOptions carries the choice; the queue
-            // policy stays local and never crosses the wire.
-            request.flow = Protocol::FlowPolicy::Lossy;
+            // The queue policy stays local and never crosses the wire; the
+            // flow policy is precisely what does.
+            request.flow = session_flow == FlowPolicy::Lossless
+                               ? Protocol::FlowPolicy::Lossless
+                               : Protocol::FlowPolicy::Lossy;
             request.client_instance_id = id;
             request.requested_max_frame_bytes = plan.max_frame_bytes;
             request.requested_ring_depth = plan.ring_depth;
             request.requested_credit_window = plan.credit_window;
             request.requested_memory_kind = memory_kind;
             request.stream_name = name;
+            request.client_label = label;
             request.client_ucx_address = client_address;
 
             return Protocol::encode(request, correlation_id);
@@ -401,8 +406,10 @@ struct Subscription::Impl
          detail::CoordinationChannel coordination,
          detail::TransportFactory transport_factory) :
         stream_name(std::move(opts.stream_name)),
+        client_label(std::move(opts.client_label)),
         upper_plan(plan),
         recovery_policy(opts.recovery_policy),
+        flow(opts.flow),
         ownership(opts.ownership),
         expect(opts.expect),
         establishment_timeout_ms(opts.establishment_timeout_ms),
@@ -530,7 +537,7 @@ struct Subscription::Impl
 
         try
         {
-            fresh = factory(upper_plan, ownership, region, delivery->make_ingress());
+            fresh = factory(upper_plan, ownership, flow, region, delivery->make_ingress());
         }
         catch(const BulkException &e)
         {
@@ -560,6 +567,8 @@ struct Subscription::Impl
             const std::uint64_t correlation_id = next_correlation_id();
             const std::vector<std::byte> request = candidate.make_open_request(
                 stream_name,
+                client_label,
+                flow,
                 upper_plan,
                 region.owner ? region.memory_kind : MemoryKind::Host,
                 client_id,
@@ -1291,8 +1300,10 @@ struct Subscription::Impl
     }
 
     std::string stream_name;
+    std::string client_label;
     ReceivePlan upper_plan;
     RecoveryPolicy recovery_policy;
+    FlowPolicy flow;
     DeliveryOwnership ownership;
     GeometryExpectation expect;
     std::uint32_t establishment_timeout_ms;

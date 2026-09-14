@@ -15,6 +15,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <memory>
+#include <optional>
 #include <vector>
 
 using namespace TangoBulk;
@@ -207,6 +209,113 @@ TEST_CASE("an idle lossless session that owes nothing is never evicted for it",
 
     CHECK(publisher.counters().sessions_evicted_stalled == 0);
     CHECK(publisher.session_count() == 1);
+}
+
+TEST_CASE("a refused lossless request reaches the caller rather than being downgraded",
+          "[ucx][flow]")
+{
+    // The interface half of the publisher's refusal. A writer that asked for
+    // every frame must not be handed a Subscription that drops them and a
+    // success return; the refusal is the answer, and the caller sees it.
+    SubscriptionOptions options = subscription_options();
+    options.flow = FlowPolicy::Lossless;
+
+    BulkPublisher publisher(publisher_config()); // allow_lossless defaults false
+
+    CHECK_THROWS_AS(open_subscription(publisher, options), EstablishmentError);
+    CHECK(publisher.session_count() == 0);
+
+    // The same options against a publisher that grants lossless do open.
+    BulkPublisher granting(lossless_config());
+    std::unique_ptr<Subscription> subscription = open_subscription(granting, options);
+    REQUIRE(subscription);
+    CHECK(granting.snapshot().sessions.front().flow == "Lossless");
+}
+
+TEST_CASE("a lossless copied frame keeps withholding credit while it is queued",
+          "[ucx][flow]")
+{
+    // The one place the delivery queue and the credit path meet.
+    //
+    // Copied delivery normally returns the slot's credit at commit, so the
+    // publisher never learns how long the application keeps a frame -- which is
+    // exactly right for a lossy session and exactly wrong for a lossless one.
+    // A frame sitting in the local queue has not reached anybody; crediting it
+    // would let the publisher run ahead and the queue would then have to drop,
+    // which is the loss the session was promised would not happen. So the
+    // credit stays withheld until the application takes the frame.
+    SubscriptionOptions options = subscription_options();
+    options.flow = FlowPolicy::Lossless;
+    options.ownership = DeliveryOwnership::Copy;
+
+    BulkPublisher publisher(lossless_config());
+    std::unique_ptr<Subscription> subscription = open_subscription(publisher, options);
+
+    // Nothing is read, so every frame published lands in the local queue.
+    unsigned accepted = 0;
+    const PublishResult refusal = publish_until_refused(publisher, accepted);
+
+    CHECK(refusal == PublishResult::WouldBlock);
+    CHECK(publisher.counters().dropped_credit_stalled == 0);
+
+    // Reading one frame is the handoff, and it is what lets the publisher move.
+    // Exactly one: collect() would drain the queue and prove nothing about
+    // which claim released which credit.
+    std::optional<FrameView> taken = subscription->read_for(1s);
+    REQUIRE(taken);
+
+    REQUIRE(eventually(
+        [&]
+        {
+            BulkPublisher::SlotHandle lease = publisher.try_acquire();
+            if(!lease)
+            {
+                return false;
+            }
+            fill(lease, k_frame_bytes, 0xCD);
+            return publisher.publish(std::move(lease), meta_for(k_frame_bytes, 0xCD)) ==
+                   PublishResult::Accepted;
+        }));
+
+    // A copied frame withholds credit only while queued: the application still
+    // holds this view, and the publisher moved anyway.
+    CHECK_FALSE(taken->borrowed());
+    CHECK(static_cast<bool>(*taken));
+}
+
+TEST_CASE("a lossy copied frame returns its credit without waiting to be read",
+          "[ucx][flow]")
+{
+    // The contrast that makes the previous test about flow rather than about
+    // copying: same delivery mode, same unread queue, opposite answer.
+    SubscriptionOptions options = subscription_options();
+    options.flow = FlowPolicy::Lossy;
+    options.ownership = DeliveryOwnership::Copy;
+
+    BulkPublisher publisher(lossless_config());
+    std::unique_ptr<Subscription> subscription = open_subscription(publisher, options);
+
+    unsigned accepted = 0;
+    const PublishResult refusal = publish_until_refused(publisher, accepted);
+
+    // Never WouldBlock: a lossy session is skipped, never waited for.
+    CHECK(refusal != PublishResult::WouldBlock);
+
+    // And nothing is ever read here, yet the publisher gets past its window
+    // anyway -- because a lossy copy returns its credit at commit rather than
+    // at handoff. Asserting progress over time rather than a count from the
+    // first burst, since the credit round trip is asynchronous.
+    REQUIRE(eventually(
+        [&]
+        {
+            BulkPublisher::SlotHandle lease = publisher.try_acquire();
+            if(lease)
+            {
+                fill(lease, k_frame_bytes, 0x5A);
+                (void) publisher.publish(std::move(lease), meta_for(k_frame_bytes, 0x5A));
+            }
+            return publisher.counters().frames_published > k_credit_window;
+        }));
 }
 
 TEST_CASE("the client label and flow policy reach the session observation",

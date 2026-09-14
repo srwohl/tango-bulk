@@ -55,10 +55,12 @@ struct TransportOptions
 
 /// Builds one transport per Session. An empty `ReceiveRegion::owner` asks the
 /// transport to allocate its own host ring; otherwise it registers the caller's
-/// region and shares its ownership. The ownership decides whether the
-/// transport delivers its slots or copies of them.
+/// region and shares its ownership. The ownership decides whether the transport
+/// delivers its slots or copies of them, and the flow decides when a copy's
+/// credit goes back.
 using TransportFactory = std::function<std::unique_ptr<SubscriberTransport>(
-    const ReceivePlan &, DeliveryOwnership, ReceiveRegion, std::shared_ptr<DeliveryIngress>)>;
+    const ReceivePlan &, DeliveryOwnership, FlowPolicy, ReceiveRegion,
+    std::shared_ptr<DeliveryIngress>)>;
 
 TransportFactory make_subscriber_transport_factory(std::uint64_t pinned_budget_bytes,
                                                    TransportOptions options = {});

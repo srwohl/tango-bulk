@@ -56,6 +56,49 @@ TEST_CASE("PreferFresh needs copied delivery", "[core][subscription]")
     CHECK(options.validate() == Status::Ok);
 }
 
+TEST_CASE("PreferFresh and Lossless are individually fine and jointly a contradiction",
+          "[core][subscription]")
+{
+    // PreferFresh evicts a queued frame the application never saw; Lossless
+    // promises no frame is lost between the publisher and the application.
+    // Each is reasonable alone, so neither is silently preferred over the
+    // other -- the combination is refused and the caller decides.
+    SubscriptionOptions options = subscription_options();
+    options.ownership = DeliveryOwnership::Copy;
+
+    options.queue_policy = QueuePolicy::PreferFresh;
+    options.flow = FlowPolicy::Lossy;
+    CHECK(options.validate() == Status::Ok);
+
+    options.queue_policy = QueuePolicy::PreserveOrder;
+    options.flow = FlowPolicy::Lossless;
+    CHECK(options.validate() == Status::Ok);
+
+    options.queue_policy = QueuePolicy::PreferFresh;
+    CHECK(options.validate() == Status::MalformedMessage);
+}
+
+TEST_CASE("a client label is optional but not arbitrary", "[core][subscription]")
+{
+    SubscriptionOptions options = subscription_options();
+
+    // Empty is the default and is legal: a Subscription that offers no label is
+    // identified by the ordinal the publisher assigns it.
+    CHECK(options.client_label.empty());
+    CHECK(options.validate() == Status::Ok);
+
+    options.client_label = "hdf5-writer-2";
+    CHECK(options.validate() == Status::Ok);
+
+    // The label reaches a publisher's log line and a Tango string attribute
+    // unescaped, so the charset is checked here rather than at the far end.
+    options.client_label = "live viewer";
+    CHECK(options.validate() == Status::MalformedMessage);
+
+    options.client_label = std::string(k_max_client_label_bytes + 1, 'a');
+    CHECK(options.validate() == Status::MalformedMessage);
+}
+
 TEST_CASE("copied delivery is refused with a device receive region", "[core][subscription]")
 {
     Script script;

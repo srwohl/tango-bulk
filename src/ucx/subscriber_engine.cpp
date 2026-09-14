@@ -157,12 +157,14 @@ struct SubscriberEngine::Pending
 
 SubscriberEngine::SubscriberEngine(ReceivePlan plan,
                                    DeliveryOwnership ownership,
+                                   FlowPolicy flow,
                                    ReceiveRegion region,
                                    std::uint64_t pinned_limit,
                                    TransportOptions options,
                                    std::shared_ptr<DeliveryIngress> delivery) :
     memory_kind_(region.owner ? region.memory_kind : MemoryKind::Host),
     ownership_(ownership),
+    flow_(flow),
     engine_cpu_affinity_(options.engine_cpu_affinity),
     tracker_(plan.ring_depth),
     delivery_(std::move(delivery)),
@@ -199,6 +201,23 @@ SubscriberEngine::SubscriberEngine(ReceivePlan plan,
                                             std::move(region),
                                             copy_buffers);
     sink_ = arena_;
+
+    if(defers_credit_to_handoff())
+    {
+        // The claim handler runs on the application thread; return_credit()
+        // pushes onto the arena's MPSC queue, which the engine drains, so the
+        // credit crosses threads exactly the way a released borrowed lease
+        // does. The weak_ptr keeps a retired transport's handler inert rather
+        // than crediting a session that no longer exists.
+        delivery_->set_claim_handler(
+            [sink = std::weak_ptr<CreditSink>(sink_)](std::uint64_t sequence) noexcept
+            {
+                if(const std::shared_ptr<CreditSink> alive = sink.lock())
+                {
+                    alive->return_credit(sequence);
+                }
+            });
+    }
 
     for(std::size_t i = 0; i < pending_.size(); ++i)
     {
@@ -935,10 +954,18 @@ void SubscriberEngine::commit(std::size_t slot_index) noexcept
 
 void SubscriberEngine::commit_copied(ReceiveSlot &slot) noexcept
 {
-    // The copy runs here, on the engine thread, so the slot's credit is on its
-    // way back before the frame is queued and however long the application
-    // keeps the copy the publisher never learns of it.
+    // The copy runs here, on the engine thread, so the slot is free before the
+    // frame is queued and however long the application keeps the copy, the
+    // publisher never has to wait for the *slot*.
+    //
+    // Whether it waits for the *credit* is the flow's decision. Lossy returns
+    // it at once: retention is the application's business and must never reach
+    // the publisher. Lossless holds it until the frame is claimed, because
+    // until then the frame has reached nobody and crediting it would let the
+    // publisher run ahead of a queue that would then have to drop -- which is
+    // the loss this session was promised would not happen.
     const auto bytes = static_cast<std::size_t>(slot.fields.payload_bytes);
+    const std::uint64_t sequence = slot.fields.sequence;
     FrameView view;
     try
     {
@@ -959,10 +986,23 @@ void SubscriberEngine::commit_copied(ReceiveSlot &slot) noexcept
     frames_copied_.fetch_add(1, std::memory_order_relaxed);
     bytes_copied_.fetch_add(bytes, std::memory_order_relaxed);
 
+    // The slot itself is free either way: nothing points into it any more.
+    slot.occupied = false;
+
+    if(defers_credit_to_handoff())
+    {
+        // note_view_issued() pairs with the note_credit_returned() that the
+        // claim handler's return_credit() performs, so `views_outstanding`
+        // counts frames the publisher is still waiting on rather than frames
+        // the application happens to hold.
+        arena_->note_view_issued();
+        delivery_->push(std::move(view));
+        return;
+    }
+
     // What drain_credit_returns() does for a released lease, done at once: this
     // is the engine thread and the tracker is its own.
-    slot.occupied = false;
-    tracker_.release(slot.fields.sequence);
+    tracker_.release(sequence);
     arena_->note_credit_returned();
 
     delivery_->push(std::move(view));
@@ -1010,12 +1050,14 @@ TransportFactory make_subscriber_transport_factory(std::uint64_t pinned_budget_b
     return [pinned_budget_bytes, options = std::move(options)](
                const ReceivePlan &plan,
                DeliveryOwnership ownership,
+               FlowPolicy flow,
                ReceiveRegion region,
                std::shared_ptr<DeliveryIngress> delivery)
                -> std::unique_ptr<SubscriberTransport>
     {
         return std::make_unique<SubscriberEngine>(plan,
                                                   ownership,
+                                                  flow,
                                                   std::move(region),
                                                   pinned_budget_bytes,
                                                   options,

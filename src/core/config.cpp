@@ -45,14 +45,9 @@ namespace
 /// Bounded so a name can never push a coordination message past its own limit,
 /// and restricted so it can appear unescaped in a log line or in a `key=value;`
 /// counter blob without quoting rules.
-bool is_valid_stream_name(const std::string &name) noexcept
+bool is_label_charset(const std::string &text) noexcept
 {
-    if(name.size() < k_min_stream_name_bytes || name.size() > k_max_stream_name_bytes)
-    {
-        return false;
-    }
-
-    for(const char c : name)
+    for(const char c : text)
     {
         const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
                         (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
@@ -63,6 +58,21 @@ bool is_valid_stream_name(const std::string &name) noexcept
     }
 
     return true;
+}
+
+bool is_valid_stream_name(const std::string &name) noexcept
+{
+    return name.size() >= k_min_stream_name_bytes &&
+           name.size() <= k_max_stream_name_bytes && is_label_charset(name);
+}
+
+/// The same rule, minus the lower bound: a Subscription that offers no label is
+/// identified by its ordinal, so empty is a legal answer rather than a missing
+/// one. The charset is not optional -- the label reaches a publisher's log line
+/// and a Tango string attribute unescaped.
+bool is_valid_client_label(const std::string &label) noexcept
+{
+    return label.size() <= k_max_client_label_bytes && is_label_charset(label);
 }
 
 Status validate_common(const std::string &stream_name,
@@ -252,10 +262,29 @@ Status SubscriptionOptions::validate() const noexcept
         return Status::MalformedMessage;
     }
 
+    if(flow != FlowPolicy::Lossy && flow != FlowPolicy::Lossless)
+    {
+        return Status::MalformedMessage;
+    }
+
     // PreferFresh evicts a queued frame the application never saw. Evicting a
     // borrowed frame would return its credit behind the application's back, so
     // the policy needs copied delivery.
     if(queue_policy == QueuePolicy::PreferFresh && ownership != DeliveryOwnership::Copy)
+    {
+        return Status::MalformedMessage;
+    }
+
+    // ...and evicting any frame is a lost frame, which is the one thing
+    // Lossless exists to rule out. The two options are each individually
+    // reasonable and jointly a contradiction, so the contradiction is refused
+    // here rather than resolved silently in favour of one of them.
+    if(queue_policy == QueuePolicy::PreferFresh && flow == FlowPolicy::Lossless)
+    {
+        return Status::MalformedMessage;
+    }
+
+    if(!is_valid_client_label(client_label))
     {
         return Status::MalformedMessage;
     }

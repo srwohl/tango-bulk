@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 namespace TangoBulk::detail
@@ -49,6 +50,20 @@ class DeliveryQueue
         std::uint64_t discarded{0};  ///< let go because a session or delivery ended
         std::uint64_t high_water{0};
     };
+
+    /// Told the sequence of each frame as it is handed to the application.
+    ///
+    /// This is the one place the delivery queue and the credit path meet. A
+    /// lossless copied frame has left its receive slot but has not reached
+    /// anybody while it sits here, so its credit stays withheld until this
+    /// fires -- otherwise the publisher would run ahead of a queue that then
+    /// has to drop, which is the loss the session was promised would not
+    /// happen. Every other combination returns credit elsewhere and installs
+    /// no handler.
+    ///
+    /// Runs on the claiming thread, inside a noexcept path: it must not throw,
+    /// block or allocate.
+    using ClaimHandler = std::function<void(std::uint64_t sequence)>;
 
     DeliveryQueue(std::size_t capacity, QueuePolicy policy);
     ~DeliveryQueue();
@@ -104,6 +119,10 @@ class DeliveryIngress
 {
   public:
     bool push(FrameView frame) noexcept;
+
+    /// Install the queue's claim handler. Called once by the transport that
+    /// owns this ingress, before any frame is pushed through it.
+    void set_claim_handler(DeliveryQueue::ClaimHandler handler);
 
   private:
     friend class DeliveryQueue;

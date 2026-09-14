@@ -44,6 +44,7 @@ struct TransportFixture
         ingress(delivery->make_ingress()),
         engine(*config.receive_plan,
                config.ownership,
+               config.flow,
                ReceiveRegion{},
                config.pinned_budget_bytes,
                std::move(transport),

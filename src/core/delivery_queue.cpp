@@ -90,6 +90,17 @@ struct DeliveryQueue::State
     std::mutex ingress_mutex;
     std::shared_ptr<DeliveryQueue::Ingress> current_ingress;
 
+    /// Installed by each transport as it is built, and read on every claim.
+    ///
+    /// Reconnect builds a replacement transport on the control thread while an
+    /// application thread may still be inside a read, so the two genuinely
+    /// race and the mutex is not ceremony. The flag keeps it off everybody
+    /// else's path: only a lossless copied session installs a handler at all,
+    /// and every other session pays one relaxed load per frame.
+    std::atomic<bool> claims_watched{false};
+    std::mutex claim_mutex;
+    DeliveryQueue::ClaimHandler on_claim;
+
     std::atomic<std::uint64_t> taken{0};
     std::atomic<std::uint64_t> dropped{0};
     std::atomic<std::uint64_t> discarded{0};
@@ -272,6 +283,22 @@ DeliveryIngress::DeliveryIngress(std::shared_ptr<DeliveryQueue::Ingress> ingress
 {
 }
 
+void DeliveryIngress::set_claim_handler(DeliveryQueue::ClaimHandler handler)
+{
+    if(!ingress_)
+    {
+        return;
+    }
+
+    if(const std::shared_ptr<DeliveryQueue::State> state = ingress_->state.lock())
+    {
+        const std::lock_guard<std::mutex> lock(state->claim_mutex);
+        state->on_claim = std::move(handler);
+        state->claims_watched.store(static_cast<bool>(state->on_claim),
+                                    std::memory_order_release);
+    }
+}
+
 bool DeliveryIngress::push(FrameView frame) noexcept
 {
     if(!ingress_)
@@ -447,6 +474,19 @@ bool take_one(std::shared_ptr<DeliveryQueue::State> const &state, FrameView &out
     state->armed_reader.store(false, std::memory_order_release);
     consume_one(state);
     state->taken.fetch_add(1, std::memory_order_relaxed);
+
+    // The handoff. After this the frame is the application's, so a lossless
+    // session may tell the publisher to send the next one -- and only now,
+    // because until this moment the frame was still ours to drop.
+    if(state->claims_watched.load(std::memory_order_acquire))
+    {
+        const std::lock_guard<std::mutex> lock(state->claim_mutex);
+        if(state->on_claim)
+        {
+            state->on_claim(out.sequence());
+        }
+    }
+
     return true;
 }
 

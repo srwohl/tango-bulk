@@ -64,6 +64,27 @@ enum class QueuePolicy : std::uint32_t
     PreferFresh = 1,   ///< evict the oldest queued frame; requires Copy
 };
 
+/// What the publisher owes this Subscription when it has no credit.
+///
+/// Declared per session, because a live viewer and a file writer routinely
+/// attach to the same stream and need opposite answers. A publisher may refuse
+/// Lossless; it never silently downgrades one, so `subscribe` either returns a
+/// Subscription with the flow that was asked for or throws.
+enum class FlowPolicy : std::uint32_t
+{
+    /// The publisher skips this Subscription when it has no credit, and this
+    /// Subscription's local queue drops rather than stalls. Frames may be lost;
+    /// nobody else's stream is affected by this one being slow.
+    Lossy = 0,
+    /// No frame is lost between the publisher and the application. The
+    /// publisher withholds a frame until this Subscription can take it, and a
+    /// copied frame keeps withholding its credit for as long as it sits in the
+    /// local queue -- so a slow application becomes backpressure on the
+    /// publisher rather than a silent local drop. A Subscription that stops
+    /// reading therefore stalls acquisition, and is evicted at its lease.
+    Lossless = 1,
+};
+
 /// Who owns the bytes of a delivered frame.
 enum class DeliveryOwnership : std::uint32_t
 {
@@ -139,6 +160,7 @@ struct SubscriptionOptions
     std::uint64_t pinned_budget_bytes{1ull << 30};
 
     RecoveryPolicy recovery_policy{RecoveryPolicy::Reconnect};
+    FlowPolicy flow{FlowPolicy::Lossy};
     QueuePolicy queue_policy{QueuePolicy::PreserveOrder};
     /// Copy is refused with a device receive region: the copy destination
     /// would have to be host memory the caller has no way to supply.
@@ -152,6 +174,12 @@ struct SubscriptionOptions
 
     ReceiveAllocator receive_allocator;
     FrameCallback on_frame;
+
+    /// Operator-facing name for this Subscription's sessions, shown in the
+    /// publisher's `BulkSessions` attribute: `live-viewer`, `hdf5-writer-2`.
+    /// 0..64 bytes of [A-Za-z0-9_.-], and empty is legal -- a client that
+    /// offers no label is identified by its device-assigned ordinal alone.
+    std::string client_label;
 
     /// One deadline for discovery, allocation, Open, Probe and transient retries.
     std::uint32_t establishment_timeout_ms{30'000};
