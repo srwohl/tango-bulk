@@ -38,6 +38,10 @@ bool operator!=(const Geometry &left, const Geometry &right) noexcept;
 
 /// The conservative, pre-Open description of one bulk stream.
 ///
+/// How an offer travels is not its business: the `BulkStreams` row codec lives
+/// in the Tango adapter, because the row exists only because that attribute is
+/// a string spectrum.
+///
 /// A valid available offer is an upper bound, not a grant: the publisher may
 /// clamp every sizing field in OpenReply, but it must never require more than
 /// this value.  The generation and Geometry are discovery observations and
@@ -66,14 +70,6 @@ struct StreamOffer
     std::uint64_t age_ms{0};
     Status status{Status::UnknownStream};
     std::string message;
-
-    /// Decode the fixed BulkStreams spectrum row:
-    /// version|name|generation|element_type|element_size|rank|max_frame_bytes|
-    /// ring_depth|credit_window|shape[0..3]|strides[0..3]|age_ms.
-    static StreamOffer from_bulk_stream_row(const std::string &row);
-    /// Encode one available offer using the same fixed field order.  An
-    /// unavailable offer has no row and therefore encodes as an empty string.
-    std::string to_bulk_stream_row() const;
 
     Outcome outcome() const noexcept;
     bool available() const noexcept;

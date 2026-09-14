@@ -111,7 +111,6 @@ ReceiveArena::ReceiveArena(std::shared_ptr<UcxContext> context,
     for(std::uint32_t i = 0; i < depth; ++i)
     {
         slots_[i].data = ring_.slot(i);
-        slots_[i].capacity = ring_.slot_bytes();
     }
 }
 
@@ -971,14 +970,13 @@ void SubscriberEngine::commit_copied(ReceiveSlot &slot) noexcept
 
 // -- application thread -----------------------------------------------------
 
-bool SubscriberEngine::ring_contains(const void *p) const noexcept
+SubscriberEngine::RingPlacement SubscriberEngine::ring_placement() const noexcept
 {
-    return arena_->ring().contains(p);
-}
-
-const std::byte *SubscriberEngine::slot_address(std::size_t index) const noexcept
-{
-    return arena_->ring().slot(index);
+    RingPlacement out;
+    out.base = arena_->ring().slot(0);
+    out.slot_bytes = arena_->ring().slot_bytes();
+    out.depth = granted_.ring_depth;
+    return out;
 }
 
 SubscriberCounters SubscriberEngine::counters() const noexcept

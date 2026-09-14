@@ -9,7 +9,7 @@
 # linking it never drags UCX headers into the device server's build.
 
 add_library(tango-bulk-tango commands.cpp proxy_client.cpp registration.cpp
-                             tango_support.cpp)
+                             bulk_stream_row.cpp)
 add_library(tango-bulk::tango ALIAS tango-bulk-tango)
 
 target_include_directories(

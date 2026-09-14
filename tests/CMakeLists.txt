@@ -90,6 +90,7 @@ if(TANGO_BULK_BUILD_TANGO_ADAPTER)
     target_link_libraries(tango-bulk-fixture-device PRIVATE tango-bulk::tango)
 
     add_executable(tango-bulk-tango-tests tango/test_adapter.cpp
+                                          tango/test_bulk_stream_row.cpp
                                           tango/test_command_names.cpp)
 
     target_link_libraries(tango-bulk-tango-tests PRIVATE tango-bulk::tango

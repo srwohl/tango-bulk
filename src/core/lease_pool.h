@@ -38,9 +38,8 @@ class LeasePool
   public:
     /// Generous enough for a `_Sp_counted_ptr_inplace` around a two-word lease
     /// on every libstdc++/libc++ layout we build against.  A request that does
-    /// not fit is not a corruption risk -- it falls back to the global allocator
-    /// and is counted -- but it would mean this reasoning had gone stale, which
-    /// is why `overflows()` is visible rather than silent.
+    /// not fit is not a corruption risk: it falls back to the global allocator,
+    /// which is correct but loses the pool's placement.
     static constexpr std::size_t k_block_bytes = 128;
 
     explicit LeasePool(std::size_t block_count);
@@ -57,14 +56,6 @@ class LeasePool
 
     bool owns(const void *p) const noexcept;
 
-    /// Requests that did not fit or found the pool empty.  Expected to stay at
-    /// zero; a nonzero value means the "at most ring_depth live leases"
-    /// invariant is not holding, which is worth knowing.
-    std::uint64_t overflows() const noexcept
-    {
-        return overflows_.load(std::memory_order_relaxed);
-    }
-
     std::size_t block_count() const noexcept
     {
         return block_count_;
@@ -79,7 +70,6 @@ class LeasePool
     std::vector<Block> storage_;
     std::size_t block_count_;
     std::atomic<void *> free_head_{nullptr};
-    std::atomic<std::uint64_t> overflows_{0};
 };
 
 /// Allocator adapter so `std::allocate_shared` can be pointed at a LeasePool.

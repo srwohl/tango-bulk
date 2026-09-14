@@ -125,6 +125,25 @@ struct TransportFixture
     Protocol::SessionId session_id_{};
 };
 
+/// The zero-copy assertions of RFC 9.3, written where they are made.
+///
+/// The engine reports where its registered ring is; deciding whether a pointer
+/// landed in it, and in which slot, is the test's own arithmetic rather than a
+/// library member that exists for one caller.
+inline bool in_receive_ring(const detail::SubscriberEngine &engine, const void *p) noexcept
+{
+    const auto ring = engine.ring_placement();
+    const auto *byte = static_cast<const std::byte *>(p);
+    return byte >= ring.base && byte < ring.base + ring.depth * ring.slot_bytes;
+}
+
+inline const std::byte *receive_slot(const detail::SubscriberEngine &engine,
+                                     std::uint64_t index) noexcept
+{
+    const auto ring = engine.ring_placement();
+    return ring.base + index * ring.slot_bytes;
+}
+
 inline std::vector<FrameView> collect_transport(detail::DeliveryQueue &delivery,
                                                 std::size_t want,
                                                 std::chrono::milliseconds budget = 5s)
@@ -133,10 +152,10 @@ inline std::vector<FrameView> collect_transport(detail::DeliveryQueue &delivery,
     const auto deadline = std::chrono::steady_clock::now() + budget;
     while(views.size() < want && std::chrono::steady_clock::now() < deadline)
     {
-        FrameView view;
-        if(!delivery.take(view, deadline))
+        detail::DeliveryRead read = delivery.read_result(deadline);
+        if(read.kind != detail::DeliveryRead::Kind::Frame)
             break;
-        views.push_back(std::move(view));
+        views.push_back(std::move(read.frame));
     }
     return views;
 }

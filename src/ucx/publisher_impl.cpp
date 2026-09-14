@@ -950,8 +950,8 @@ struct BulkPublisher::Impl
             // Armed is the first moment the endpoint has settled on a transport
             // and device, so it is the earliest this can be asked.  On the engine
             // thread, which is the only thread whose CPU is worth sampling.
-            locality = observe(session->ep, slots->ring().memory().base());
-            detail::report(locality, "publisher");
+            detail::report(observe(session->ep, slots->ring().memory().base()),
+                           "publisher");
         }
     }
 
@@ -1353,10 +1353,6 @@ struct BulkPublisher::Impl
     std::condition_variable connect_done;
     std::vector<ConnectTask *> connect_queue;
 
-    /// Where this publisher's ring, NIC and engine actually landed.  Engine
-    /// thread writes it at arm; read for diagnostics only.
-    Locality locality;
-
     /// Serialises the coordination plane against itself.  Two Tango command
     /// threads may arrive at once; the engine never takes this lock on the frame
     /// path.
@@ -1532,11 +1528,6 @@ PublishResult BulkPublisher::publish(SlotHandle &&lease, const FrameMetadata &me
     impl_->counters.frames_published.fetch_add(1, std::memory_order_relaxed);
 
     return PublishResult::Accepted;
-}
-
-std::uint32_t BulkPublisher::generation() const noexcept
-{
-    return impl_->generation;
 }
 
 std::size_t BulkPublisher::session_count() const noexcept

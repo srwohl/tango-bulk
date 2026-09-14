@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include "bulk_commands.h"
+#include "bulk_stream_row.h"
 
 #include <core/subscription_internal.h>
 
@@ -178,7 +179,7 @@ class TangoStreamDiscovery
             std::optional<StreamOffer> found;
             for(const std::string &row : rows)
             {
-                StreamOffer offer = StreamOffer::from_bulk_stream_row(row);
+                StreamOffer offer = detail::stream_offer_from_row(row);
                 if(offer.outcome() == StreamOffer::Outcome::Malformed ||
                    offer.outcome() == StreamOffer::Outcome::Unavailable)
                 {

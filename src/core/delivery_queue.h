@@ -44,7 +44,6 @@ class DeliveryQueue
     struct Stats
     {
         std::size_t depth{0};
-        std::size_t capacity{0};
         std::uint64_t taken{0};      ///< handed to a consumer
         std::uint64_t dropped{0};    ///< refused or evicted by the queue policy
         std::uint64_t discarded{0};  ///< let go because a session or delivery ended
@@ -62,10 +61,6 @@ class DeliveryQueue
     DeliveryRead try_read_result();
 
     DeliveryRead read_result(std::chrono::steady_clock::time_point deadline);
-
-    bool try_take(FrameView &out) noexcept;
-
-    bool take(FrameView &out, std::chrono::steady_clock::time_point deadline) noexcept;
 
     /// Accepted frames remain claimable before a final session failure is
     /// reported. Close and interrupt instead discard queued frames first.

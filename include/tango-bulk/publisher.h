@@ -161,7 +161,6 @@ class BulkPublisher
     /// on QueueFull and WouldBlock.  Never blocks, never throws, never allocates.
     PublishResult publish(SlotHandle &&handle, const FrameMetadata &meta) noexcept;
 
-    std::uint32_t generation() const noexcept;
     std::size_t session_count() const noexcept;
     PublisherCounters counters() const noexcept;
     PublisherSnapshot snapshot() const;

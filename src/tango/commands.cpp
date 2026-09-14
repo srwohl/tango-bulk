@@ -2,8 +2,10 @@
 //
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-// Quoted and unqualified on purpose; see tango_support.cpp for why a sibling
-// header inside src/tango/ cannot be spelled <tango/...>.
+// Quoted and unqualified on purpose.  ${PROJECT_SOURCE_DIR}/src is on the
+// include path, so <tango/...> would be ambiguous between this layer's own
+// directory and cppTango's installed headers; siblings inside src/tango/ are
+// therefore included by bare name, leaving the <tango/...> spelling to cppTango.
 #include "bulk_commands.h"
 
 #include <core/protocol.h>

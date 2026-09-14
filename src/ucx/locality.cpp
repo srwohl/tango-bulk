@@ -4,6 +4,8 @@
 
 #include <ucx/locality.h>
 
+#include "ucx_support.h"
+
 #include <core/cpu_topology.h>
 
 #include <ucs/memory/numa.h>
@@ -124,6 +126,24 @@ std::string Locality::to_string() const
     out += "host_nodes=" + (host_nodes == 0 ? std::string("?") : std::to_string(host_nodes)) + ";";
     // Qualified: the member to_string() hides the free one at class scope.
     out += std::string("placement=") + detail::to_string(placement()) + ";";
+
+    // RFC 8.2 puts a floor and a four-minor skew window on UCX, and the
+    // transport a session actually got is decided by the .so the loader picked,
+    // not by the headers CMake found. Reporting the runtime version here puts
+    // both on the one line an operator already reads when a transport surprises
+    // them; the headers are named too, but only when they disagree, so the
+    // common case stays short.
+    const std::string runtime = detail::ucx_runtime_version();
+    out += "ucx=" + runtime + ";";
+
+    const std::uint32_t compiled = detail::ucx_compiled_api_version();
+    const std::string headers = std::to_string(compiled / 1'000'000u) + "." +
+                                std::to_string((compiled / 1'000u) % 1'000u);
+    if(runtime.rfind(headers + ".", 0) != 0)
+    {
+        out += "ucx_headers=" + headers + ";";
+    }
+
     return out;
 }
 

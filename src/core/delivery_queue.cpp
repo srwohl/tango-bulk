@@ -421,7 +421,6 @@ DeliveryQueue::Stats DeliveryQueue::stats() const noexcept
 {
     Stats out;
     out.depth = state_->queue.size();
-    out.capacity = state_->queue.capacity();
     out.taken = state_->taken.load(std::memory_order_relaxed);
     out.dropped = state_->dropped.load(std::memory_order_relaxed);
     out.discarded = state_->discarded.load(std::memory_order_relaxed);
@@ -436,27 +435,6 @@ DeliveryQueue::Stats DeliveryQueue::stats() const noexcept
 int DeliveryQueue::fd() const noexcept
 {
     return state_->wakeup_fd;
-}
-
-bool DeliveryQueue::try_take(FrameView &out) noexcept
-{
-    if(state_->queue.try_pop(out))
-    {
-        state_->armed_reader.store(false, std::memory_order_release);
-        consume_one(state_);
-        state_->taken.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-
-    state_->armed_reader.store(true, std::memory_order_release);
-    if(state_->queue.try_pop(out))
-    {
-        state_->armed_reader.store(false, std::memory_order_release);
-        consume_one(state_);
-        state_->taken.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-    return false;
 }
 
 bool take_one(std::shared_ptr<DeliveryQueue::State> const &state, FrameView &out) noexcept
@@ -585,24 +563,6 @@ DeliveryRead DeliveryQueue::read_result(std::chrono::steady_clock::time_point de
             state_->armed_reader.store(true, std::memory_order_release);
             result.kind = DeliveryRead::Kind::Timeout;
             return result;
-        }
-    }
-}
-
-bool DeliveryQueue::take(FrameView &out,
-                         std::chrono::steady_clock::time_point deadline) noexcept
-{
-    for(;;)
-    {
-        if(take_one(state_, out))
-        {
-            return true;
-        }
-
-        if(state_->terminal.load(std::memory_order_acquire) != Terminal::None ||
-           !await(state_, deadline))
-        {
-            return false;
         }
     }
 }

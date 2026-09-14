@@ -193,11 +193,6 @@ bool FrameView::borrowed() const noexcept
     return lease_ != nullptr && borrowed_;
 }
 
-long FrameView::use_count() const noexcept
-{
-    return lease_.use_count();
-}
-
 void FrameView::reset() noexcept
 {
     // Order matters only for readability here -- the credit goes back when the

@@ -99,24 +99,36 @@ TEST_CASE("a detached view does not alias the caller's Fields", "[frame]")
 TEST_CASE("a detached view behaves like a delivered one under copying",
           "[frame]")
 {
-    const Frame frame = make_frame(2, 2);
+    // What matters is not how many copies exist but that the payload outlives
+    // every one of them and dies with the last -- the shared_ptr control block
+    // *is* the credit interlock, so a weak_ptr observes exactly the property a
+    // returned credit depends on.
+    std::weak_ptr<const void> payload;
 
-    FrameView first = detach(frame);
-    REQUIRE(first.use_count() == 1);
+    FrameView first = [&payload]
+    {
+        const Frame frame = make_frame(2, 2);
+        payload = frame.pixels;
+        return detach(frame);
+    }();
+
+    REQUIRE_FALSE(payload.expired());
 
     {
         const FrameView second = first;
-        CHECK(first.use_count() == 2);
-        CHECK(second.use_count() == 2);
         CHECK(second.data() == first.data());
+        CHECK(second.sequence() == first.sequence());
     }
 
-    CHECK(first.use_count() == 1);
+    // One copy going out of scope releases nothing.
+    CHECK_FALSE(payload.expired());
 
     // reset() is how an application returns a credit early, so it has to be the
     // same operation on a synthetic frame as on a real one.
     first.reset();
 
+    // The last one releases everything.
+    CHECK(payload.expired());
     CHECK_FALSE(static_cast<bool>(first));
     CHECK(first.size() == 0);
     CHECK(first.data() == nullptr);
@@ -190,7 +202,7 @@ TEST_CASE("a default-constructed view is disengaged", "[frame]")
     CHECK_FALSE(static_cast<bool>(view));
     CHECK(view.data() == nullptr);
     CHECK(view.size() == 0);
-    CHECK(view.use_count() == 0);
+    CHECK_FALSE(view.borrowed());
     CHECK(view.shape()[0] == 0);
     CHECK(view.strides()[0] == 0);
 }

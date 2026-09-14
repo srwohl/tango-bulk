@@ -30,9 +30,6 @@ inline constexpr std::uint32_t k_max_sessions = 32;
 inline constexpr std::uint32_t k_max_publish_queue = 8192;
 inline constexpr std::uint32_t k_min_publish_queue = 8;
 
-inline constexpr std::uint32_t k_max_delivery_queue = 4096;
-inline constexpr std::uint32_t k_min_delivery_queue = 1;
-
 inline constexpr std::uint32_t k_max_lease_ttl_ms = 600'000;
 inline constexpr std::uint32_t k_min_lease_ttl_ms = 1'000;
 

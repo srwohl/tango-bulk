@@ -158,8 +158,7 @@ class FrameView
     /// at delivery. A disengaged view is not borrowed.
     bool borrowed() const noexcept;
 
-    long use_count() const noexcept; ///< diagnostics/tests only
-    void reset() noexcept;           ///< release early; returns the credit
+    void reset() noexcept; ///< release early; returns the credit
 
   private:
     friend class detail::ReceiveSlotLease;

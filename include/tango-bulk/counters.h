@@ -44,7 +44,6 @@ struct PublisherCounters
     std::uint64_t renewals_accepted{0};
     std::uint64_t renewals_late{0};
     std::uint64_t renewals_rejected{0};
-    std::uint64_t geometry_changes{0};
     std::uint64_t malformed_messages{0};
     std::uint64_t transport_errors{0};
     std::uint64_t pinned_bytes{0};      ///< gauge

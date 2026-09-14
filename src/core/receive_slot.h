@@ -88,9 +88,8 @@ class ReceiveSlotLease
 struct ReceiveSlot
 {
     FrameDescription fields{};
-    std::byte *data{nullptr};       ///< into the registered receive ring
-    std::size_t capacity{0};        ///< granted max_frame_bytes
-    bool occupied{false};           ///< engine thread only
+    std::byte *data{nullptr};  ///< into the registered receive ring
+    bool occupied{false};      ///< engine thread only
 };
 
 } // namespace TangoBulk::detail

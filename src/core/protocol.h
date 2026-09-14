@@ -341,8 +341,6 @@ enum class DataType : std::uint16_t
     ProbeAck = 4,
 };
 
-const char *to_string(DataType type) noexcept;
-
 /// Active-message ids.
 ///
 /// Credit and ProbeAck have *separate* ids, unlike the prototype, which shared

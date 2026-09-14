@@ -29,7 +29,6 @@ void *LeasePool::allocate(std::size_t bytes) noexcept
 {
     if(bytes > k_block_bytes)
     {
-        overflows_.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
 
@@ -49,7 +48,6 @@ void *LeasePool::allocate(std::size_t bytes) noexcept
         }
     }
 
-    overflows_.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
 }
 

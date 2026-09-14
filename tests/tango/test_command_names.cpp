@@ -5,7 +5,8 @@
 #include <tango-bulk/tango.h>
 
 #include "command_discovery.h"
-#include "tango_support.h"
+
+#include <tango/common/versions.h>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -72,7 +73,10 @@ TEST_CASE("the matcher recovers prefixed command names from their descriptions",
 
 TEST_CASE("the adapter is built against an installed cppTango", "[tango][build]")
 {
-    const std::string version = detail::tango_headers_version();
+    // Read straight from the installed header, which is the whole assertion:
+    // this translation unit resolved <tango/common/versions.h> against an
+    // installed cppTango rather than a build or source tree.
+    const std::string version = Tango::TgLibVers;
     INFO("cppTango headers: " << version);
 
     REQUIRE_FALSE(version.empty());

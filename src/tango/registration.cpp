@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 #include "bulk_commands.h"
+#include "bulk_stream_row.h"
 
 #include <core/protocol.h>
 
@@ -119,7 +120,8 @@ class BulkStreamsAttribute final : public Tango::SpectrumAttr
         const PublisherSnapshot snapshot = snapshot_for(device);
         const StreamOffer offer = snapshot.stream_offer();
         const std::vector<std::string> rows =
-            offer.status == Status::Ok ? std::vector<std::string>{offer.to_bulk_stream_row()}
+            offer.status == Status::Ok
+                ? std::vector<std::string>{detail::stream_offer_to_row(offer)}
                                        : std::vector<std::string>{};
         set_string_spectrum(attribute, rows);
     }

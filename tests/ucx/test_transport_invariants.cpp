@@ -22,8 +22,8 @@ TEST_CASE("The transport places a rendezvous payload in its registered ring",
     const std::vector<FrameView> views = collect_transport(*transport.delivery, 1);
     REQUIRE(views.size() == 1);
 
-    CHECK(transport.engine.ring_contains(views.front().data()));
-    CHECK(views.front().data() == transport.engine.slot_address(0));
+    CHECK(in_receive_ring(transport.engine, views.front().data()));
+    CHECK(views.front().data() == receive_slot(transport.engine, 0));
     CHECK(transport.engine.counters().bytes_copied == 0);
     CHECK(views.front().borrowed());
     CHECK(payload_matches(views.front(), 0x11));
@@ -36,7 +36,7 @@ TEST_CASE("The transport maps sequence numbers onto receive slots",
     TransportFixture transport;
     transport.open(publisher);
 
-    const std::uint32_t depth = transport.engine.granted_ring_depth();
+    const std::uint32_t depth = transport.engine.ring_placement().depth;
     REQUIRE(depth == k_ring_depth);
 
     for(std::size_t sequence = 0; sequence < 4u * depth; ++sequence)
@@ -46,7 +46,7 @@ TEST_CASE("The transport maps sequence numbers onto receive slots",
         const std::vector<FrameView> views = collect_transport(*transport.delivery, 1);
         REQUIRE(views.size() == 1);
         CHECK(views.front().sequence() == sequence);
-        CHECK(views.front().data() == transport.engine.slot_address(sequence % depth));
+        CHECK(views.front().data() == receive_slot(transport.engine, sequence % depth));
         CHECK(payload_matches(views.front(), seed));
     }
 

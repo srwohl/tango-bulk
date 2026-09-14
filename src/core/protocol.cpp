@@ -394,23 +394,6 @@ const char *to_string(CoordType type) noexcept
     return "Unknown";
 }
 
-const char *to_string(DataType type) noexcept
-{
-    switch(type)
-    {
-    case DataType::Frame:
-        return "Frame";
-    case DataType::Credit:
-        return "Credit";
-    case DataType::Probe:
-        return "Probe";
-    case DataType::ProbeAck:
-        return "ProbeAck";
-    }
-
-    return "Unknown";
-}
-
 const char *to_string(SessionState state) noexcept
 {
     switch(state)

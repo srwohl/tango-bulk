@@ -56,7 +56,7 @@ TEST_CASE("A copied frame lies outside the registered ring and returns its credi
 
     const FrameView &view = views.front();
     CHECK_FALSE(view.borrowed());
-    CHECK_FALSE(transport.engine.ring_contains(view.data()));
+    CHECK_FALSE(in_receive_ring(transport.engine, view.data()));
     CHECK(view.size() == k_frame_bytes);
     CHECK(view.sequence() == 0);
     CHECK(view.event_counter() == 0x21);

@@ -159,25 +159,24 @@ class SubscriberEngine final : public SubscriberTransport
 
     SubscriberCounters counters() const noexcept override;
 
-    /// Test instrumentation for 9.3's zero-copy criterion.
+    /// Where the registered receive ring actually is.
     ///
-    /// The criterion asks for the delivered payload to live inside the
-    /// registered receive ring "verified by pointer/registration
-    /// instrumentation, not by inspection".  `ring_contains()` is the pointer
-    /// half; `counters().bytes_copied` is the registration half -- it counts
-    /// bytes that went through a CPU copy, and for a borrowed rendezvous-sized
-    /// frame it must stay at zero.
-    bool ring_contains(const void *p) const noexcept;
-
-    /// Address of receive slot `index`, so a test can assert 3.11's mapping --
-    /// "the slot index is sequence % ring_depth" -- against where the payload
-    /// actually landed rather than against a number the library reports.
-    const std::byte *slot_address(std::size_t index) const noexcept;
-
-    std::uint32_t granted_ring_depth() const noexcept
+    /// The one instrumentation seam this class offers, for RFC 9.3's zero-copy
+    /// criterion: the delivered payload must live inside the registered ring,
+    /// "verified by pointer/registration instrumentation, not by inspection".
+    /// This is the pointer half; `counters().bytes_copied` is the registration
+    /// half.  It reports the ring's own geometry rather than answering
+    /// questions about it, so the assertions -- is this pointer in the ring,
+    /// does slot `sequence % depth` hold this frame -- are written where they
+    /// are made instead of as library members with one caller each.
+    struct RingPlacement
     {
-        return granted_.ring_depth;
-    }
+        const std::byte *base{nullptr};
+        std::size_t slot_bytes{0};
+        std::uint32_t depth{0};
+    };
+
+    RingPlacement ring_placement() const noexcept;
 
     /// Observed placement, valid once the state reaches `Active`.
     const Locality &locality() const noexcept
